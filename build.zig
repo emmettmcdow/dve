@@ -1,0 +1,299 @@
+pub fn build(b: *std.Build) !void {
+    const debug = b.option(bool, "debug-output", "Show debug output") orelse false;
+    const embedding_model = b.option(
+        EmbeddingModel,
+        "embedding-model",
+        "Embedding model to use (apple_nlembedding or mpnet_embedding)",
+    ) orelse .apple_nlembedding;
+    const test_filter: ?[]const u8 = b.option(
+        []const u8,
+        "test-filter",
+        "Filter to select specific tests",
+    );
+    const use_lldb = b.option(bool, "lldb", "Run tests under lldb debugger") orelse false;
+
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const real_vec_sz: usize = switch (embedding_model) {
+        .apple_nlembedding => 512,
+        .mpnet_embedding => 768,
+    };
+
+    ///////////////////////
+    // Mpnet Model Fetch //
+    ///////////////////////
+    const mpnet_model = MpnetModel.create(b);
+    const fetch_mpnet_step = b.step(
+        "fetch-mpnet-model",
+        "Generate MPNet embeddings model for CoreML",
+    );
+    fetch_mpnet_step.dependOn(mpnet_model.step);
+
+    ////////////////////
+    // Dependencies   //
+    ////////////////////
+    const objc_dep = b.dependency("zig_objc", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const tracy_enable = optimize == .Debug;
+    const tracy_dep = b.dependency("tracy", .{
+        .target = target,
+        .optimize = optimize,
+        .tracy_enable = tracy_enable,
+        .tracy_callstack = @as(u32, 62),
+    });
+
+    ////////////////////
+    // Config modules //
+    ////////////////////
+    const real_options = b.addOptions();
+    real_options.addOption(usize, "vec_sz", real_vec_sz);
+    real_options.addOption(bool, "debug", debug);
+    real_options.addOption(EmbeddingModel, "embedding_model", embedding_model);
+
+    // Fake config used for storage/util tests that don't need real embeddings.
+    const fake_options = b.addOptions();
+    fake_options.addOption(usize, "vec_sz", @as(usize, 3));
+    fake_options.addOption(bool, "debug", debug);
+    fake_options.addOption(EmbeddingModel, "embedding_model", EmbeddingModel.apple_nlembedding);
+
+    ////////////////////
+    // Public Module  //
+    ////////////////////
+    const dve_mod = b.addModule("dve", .{
+        .root_source_file = b.path("src/root.zig"),
+        .imports = &.{
+            .{ .name = "config", .module = real_options.createModule() },
+            .{ .name = "objc", .module = objc_dep.module("objc") },
+            .{ .name = "tracy", .module = tracy_dep.module("tracy") },
+        },
+    });
+    ////////////////
+    // Unit Tests //
+    ////////////////
+    const filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
+
+    const runTest = struct {
+        fn run(builder: *std.Build, artifact: *std.Build.Step.Compile, lldb: bool) *RunStep {
+            if (lldb) {
+                const r = RunStep.create(builder, "lldb test");
+                r.addArgs(&.{ "lldb", "--" });
+                r.addArtifactArg(artifact);
+                return r;
+            }
+            return builder.addRunArtifact(artifact);
+        }
+    }.run;
+
+    // Helper to wire up ObjC + tracy imports and framework/lib links for a test.
+    const addDeps = struct {
+        fn real(
+            t: *std.Build.Step.Compile,
+            cfg: *std.Build.Step.Options,
+            objc: *std.Build.Dependency,
+            tr: *std.Build.Dependency,
+            tr_enable: bool,
+        ) void {
+            t.root_module.addOptions("config", cfg);
+            t.root_module.addImport("objc", objc.module("objc"));
+            t.root_module.addImport("tracy", tr.module("tracy"));
+            t.root_module.linkFramework("NaturalLanguage", .{});
+            t.root_module.linkFramework("CoreML", .{});
+            t.root_module.linkFramework("Foundation", .{});
+            if (tr_enable) {
+                t.root_module.linkLibrary(tr.artifact("tracy"));
+                t.root_module.link_libcpp = true;
+            }
+        }
+    }.real;
+
+    // vec_storage and note_id_map tests use fake config + tracy only (no ObjC).
+    const test_vec_storage = b.step("test-vec_storage", "run tests for src/vec_storage.zig");
+    {
+        const t = b.addTest(.{
+            .root_source_file = b.path("src/vec_storage.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = if (test_filter != null) filters else &.{},
+        });
+        t.root_module.addOptions("config", fake_options);
+        t.root_module.addImport("tracy", tracy_dep.module("tracy"));
+        if (tracy_enable) {
+            t.root_module.linkLibrary(tracy_dep.artifact("tracy"));
+            t.root_module.link_libcpp = true;
+        }
+        test_vec_storage.dependOn(&runTest(b, t, use_lldb).step);
+    }
+
+    const test_note_id_map = b.step("test-note_id_map", "run tests for src/note_id_map.zig");
+    {
+        const t = b.addTest(.{
+            .root_source_file = b.path("src/note_id_map.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = if (test_filter != null) filters else &.{},
+        });
+        t.root_module.addOptions("config", fake_options);
+        t.root_module.addImport("tracy", tracy_dep.module("tracy"));
+        if (tracy_enable) {
+            t.root_module.linkLibrary(tracy_dep.artifact("tracy"));
+            t.root_module.link_libcpp = true;
+        }
+        test_note_id_map.dependOn(&runTest(b, t, use_lldb).step);
+    }
+
+    const test_util = b.step("test-util", "run tests for src/util.zig");
+    {
+        const t = b.addTest(.{
+            .root_source_file = b.path("src/util.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = if (test_filter != null) filters else &.{},
+        });
+        // util.zig has no external deps beyond std
+        test_util.dependOn(&runTest(b, t, use_lldb).step);
+    }
+
+    const test_tokenizer = b.step("test-tokenizer", "run tests for src/tokenizer.zig");
+    {
+        const t = b.addTest(.{
+            .root_source_file = b.path("src/tokenizer.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = if (test_filter != null) filters else &.{},
+        });
+        test_tokenizer.dependOn(&runTest(b, t, use_lldb).step);
+    }
+
+    const test_embed = b.step("test-embed", "run tests for src/embed.zig");
+    {
+        const t = b.addTest(.{
+            .root_source_file = b.path("src/embed.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = if (test_filter != null) filters else &.{},
+        });
+        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        const install_models = b.addInstallDirectory(.{
+            .source_dir = .{ .cwd_relative = MpnetModel.MODEL_PATH },
+            .install_dir = .{ .custom = "share" },
+            .install_subdir = "all_mpnet_base_v2.mlpackage",
+        });
+        install_models.step.dependOn(mpnet_model.step);
+        const install_tokenizer = b.addInstallFile(
+            .{ .cwd_relative = MpnetModel.TOKENIZER_PATH },
+            "share/tokenizer.json",
+        );
+        install_tokenizer.step.dependOn(mpnet_model.step);
+        const run = runTest(b, t, use_lldb);
+        run.step.dependOn(&install_models.step);
+        run.step.dependOn(&install_tokenizer.step);
+        test_embed.dependOn(&run.step);
+    }
+
+    const test_vector = b.step("test-vector", "run tests for src/vector.zig");
+    {
+        const t = b.addTest(.{
+            .root_source_file = b.path("src/vector.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = if (test_filter != null) filters else &.{},
+        });
+        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        const install_models = b.addInstallDirectory(.{
+            .source_dir = .{ .cwd_relative = MpnetModel.MODEL_PATH },
+            .install_dir = .{ .custom = "share" },
+            .install_subdir = "all_mpnet_base_v2.mlpackage",
+        });
+        install_models.step.dependOn(mpnet_model.step);
+        const install_tokenizer = b.addInstallFile(
+            .{ .cwd_relative = MpnetModel.TOKENIZER_PATH },
+            "share/tokenizer.json",
+        );
+        install_tokenizer.step.dependOn(mpnet_model.step);
+        const run = runTest(b, t, use_lldb);
+        run.step.dependOn(&install_models.step);
+        run.step.dependOn(&install_tokenizer.step);
+        test_vector.dependOn(&run.step);
+    }
+
+    const test_benchmark = b.step("test-benchmark", "run embedding quality benchmark tests");
+    {
+        const t = b.addTest(.{
+            .root_source_file = b.path("src/benchmark.zig"),
+            .target = target,
+            .optimize = optimize,
+            .filters = if (test_filter != null) filters else &.{},
+        });
+        t.root_module.addImport("dve", dve_mod);
+        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        const install_models = b.addInstallDirectory(.{
+            .source_dir = .{ .cwd_relative = MpnetModel.MODEL_PATH },
+            .install_dir = .{ .custom = "share" },
+            .install_subdir = "all_mpnet_base_v2.mlpackage",
+        });
+        install_models.step.dependOn(mpnet_model.step);
+        const install_tokenizer = b.addInstallFile(
+            .{ .cwd_relative = MpnetModel.TOKENIZER_PATH },
+            "share/tokenizer.json",
+        );
+        install_tokenizer.step.dependOn(mpnet_model.step);
+        const run = runTest(b, t, use_lldb);
+        run.step.dependOn(&install_models.step);
+        run.step.dependOn(&install_tokenizer.step);
+        test_benchmark.dependOn(&run.step);
+    }
+
+    const test_step = b.step("test", "Run all unit tests");
+    test_step.dependOn(test_vec_storage);
+    test_step.dependOn(test_note_id_map);
+    test_step.dependOn(test_util);
+    test_step.dependOn(test_tokenizer);
+    test_step.dependOn(test_embed);
+    test_step.dependOn(test_vector);
+    test_step.dependOn(test_benchmark);
+}
+
+const EmbeddingModel = enum {
+    apple_nlembedding,
+    mpnet_embedding,
+};
+
+const MpnetModel = struct {
+    const MODEL_DIR = "models/all_mpnet_base_v2";
+    const MODEL_PATH = MODEL_DIR ++ "/all_mpnet_base_v2.mlpackage";
+    const TOKENIZER_PATH = MODEL_DIR ++ "/tokenizer.json";
+
+    step: *Step,
+
+    pub fn create(b: *std.Build) MpnetModel {
+        if (hasDir(MODEL_PATH)) {
+            const noop_step = b.allocator.create(Step) catch @panic("OOM");
+            noop_step.* = Step.init(.{
+                .id = .custom,
+                .name = "mpnet: model already exists",
+                .owner = b,
+            });
+            return .{ .step = noop_step };
+        }
+
+        const gen_coreml = RunStep.create(b, "mpnet: generate CoreML model");
+        gen_coreml.setCwd(.{ .cwd_relative = "models" });
+        gen_coreml.addArgs(&.{
+            "./venv/bin/python", "gen-coreml.py",
+            "sentence-transformers/all-mpnet-base-v2", "--output", "all_mpnet_base_v2",
+        });
+        return .{ .step = &gen_coreml.step };
+    }
+};
+
+fn hasDir(dir_path: []const u8) bool {
+    _ = std.fs.cwd().openDir(dir_path, .{}) catch return false;
+    return true;
+}
+
+const std = @import("std");
+const Step = std.Build.Step;
+const RunStep = Step.Run;
