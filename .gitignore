@@ -2,3 +2,4 @@
 zig-out/
 models/*/
 .DS_Store
+TODO.md
