@@ -3,3 +3,5 @@ zig-out/
 models/*/
 .DS_Store
 TODO.md
+*.db
+.dve_ids
