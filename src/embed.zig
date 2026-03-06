@@ -96,6 +96,10 @@ pub const MpnetEmbedder = struct {
         tokenizer_path: []const u8 = TOKENIZER_PATH,
         bundle_model_path: []const u8 = BUNDLE_MODEL_PATH,
         bundle_tokenizer_path: []const u8 = BUNDLE_TOKENIZER_PATH,
+        /// If set, bypasses bundle/exe-relative resolution and uses this path directly.
+        absolute_model_path: ?[]const u8 = null,
+        /// If set, bypasses bundle/exe-relative resolution and uses this path directly.
+        absolute_tokenizer_path: ?[]const u8 = null,
     };
 
     // The calling Swift thread wraps this in an AutoreleasePool, so we do not need to release
@@ -108,13 +112,12 @@ pub const MpnetEmbedder = struct {
         var tokenizer_alloc = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         errdefer tokenizer_alloc.deinit();
 
-        const tokenizer_path = getModelPath(
-            tokenizer_alloc.allocator(),
-            opts.tokenizer_path,
-            opts.bundle_tokenizer_path,
-        ) catch {
-            return error.TokenizerLoadFailed;
-        };
+        const tokenizer_path: [:0]const u8 = if (opts.absolute_tokenizer_path) |p|
+            tokenizer_alloc.allocator().dupeZ(u8, p) catch return error.TokenizerLoadFailed
+        else
+            getModelPath(tokenizer_alloc.allocator(), opts.tokenizer_path, opts.bundle_tokenizer_path) catch {
+                return error.TokenizerLoadFailed;
+            };
 
         const tokenizer_file = std.fs.openFileAbsolute(tokenizer_path, .{}) catch |err| {
             std.log.err("Failed to open tokenizer.json: {}\n", .{err});
@@ -157,13 +160,12 @@ pub const MpnetEmbedder = struct {
         const compileModelAtURL = objc.Sel.registerName("compileModelAtURL:error:");
         const modelWithContentsOfURL = objc.Sel.registerName("modelWithContentsOfURL:error:");
 
-        const full_path = getModelPath(
-            tokenizer_alloc.allocator(),
-            opts.model_path,
-            opts.bundle_model_path,
-        ) catch {
-            return error.PathAllocFailed;
-        };
+        const full_path: [:0]const u8 = if (opts.absolute_model_path) |p|
+            tokenizer_alloc.allocator().dupeZ(u8, p) catch return error.PathAllocFailed
+        else
+            getModelPath(tokenizer_alloc.allocator(), opts.model_path, opts.bundle_model_path) catch {
+                return error.PathAllocFailed;
+            };
 
         const path_ns = NSString.msgSend(Object, fromUTF8, .{full_path.ptr});
         if (path_ns.value == 0) {

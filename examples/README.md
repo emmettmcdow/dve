@@ -1,27 +1,42 @@
 # Examples
 
-Each example implements the same `embed-watch` CLI with two subcommands:
-
-- `watch <dir>` - Watches a directory for changes to `.md` files and re-embeds them as they change.
-- `search <dir> <query>` - Searches the embedded database in `<dir>` and prints results ranked by similarity.
-
-| Example | Status |
-|---------|--------|
-| [Zig](./zig) | Available |
-| [Swift](./swift) | Coming soon |
+Each example embeds a small fixed set of documents, prints them, then drops into an
+interactive query loop. Type a query to find the most similar documents, or `quit` to exit.
 
 ## Zig
-Does this change things?
 
 ```sh
 cd zig
-zig build
-./zig-out/bin/embed-watch watch /path/to/docs
-./zig-out/bin/embed-watch search /path/to/docs "my query"
+zig build run
 ```
 
-Or with `zig build run`:
+## Swift
+
+Requires building the XCFramework first (from the repo root):
 ```sh
-zig build run -- watch /path/to/docs
-zig build run -- search /path/to/docs "my query"
+zig build xcframework
 ```
+
+Then:
+```sh
+cd swift
+swift run dve-repl
+```
+
+### Model selection
+
+By default, the example uses Apple's NaturalLanguage framework — no model files needed.
+
+To use the higher-quality mpnet model, download it first:
+```sh
+./scripts/download_model.sh mpnet
+```
+
+Then set environment variables when running:
+```sh
+DVE_MODEL_PATH=/path/to/all_mpnet_base_v2.mlpackage \
+DVE_TOKENIZER_PATH=/path/to/tokenizer.json \
+swift run dve-repl
+```
+
+> **Note:** The database format differs between models. Use the same model consistently for a given database directory.

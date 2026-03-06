@@ -1,0 +1,4 @@
+module DveCore {
+    header "dve.h"
+    export *
+}

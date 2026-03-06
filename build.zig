@@ -254,6 +254,93 @@ pub fn build(b: *std.Build) !void {
     test_step.dependOn(test_embed);
     test_step.dependOn(test_vector);
     test_step.dependOn(test_benchmark);
+
+    ///////////////////
+    // XCFramework   //
+    ///////////////////
+    // Builds DveCore.xcframework for use by Swift/C consumers.
+    // Both apple_nlembedding and mpnet_embedding are compiled in; the model is
+    // selected at runtime by dve_init based on whether model_path is provided.
+    const xcfw_step = b.step("xcframework", "Build DveCore.xcframework");
+    {
+        const arm_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos });
+        const x86_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .macos });
+        const xcfw_optimize: std.builtin.OptimizeMode = .ReleaseFast;
+
+        const mpnet_options = b.addOptions();
+        mpnet_options.addOption(usize, "vec_sz", @as(usize, 768));
+        mpnet_options.addOption(bool, "debug", false);
+        mpnet_options.addOption(EmbeddingModel, "embedding_model", EmbeddingModel.mpnet_embedding);
+
+        // Tracy must always be disabled in the xcframework. When tracy_enable=true
+        // Tracy starts C++ background threads (via global constructors) that
+        // interfere with Apple's NLEmbedding initialization on the main thread.
+        const xcfw_tracy_arm = b.dependency("tracy", .{
+            .target = arm_target,
+            .optimize = xcfw_optimize,
+            .tracy_enable = false,
+        });
+        const xcfw_tracy_x86 = b.dependency("tracy", .{
+            .target = x86_target,
+            .optimize = xcfw_optimize,
+            .tracy_enable = false,
+        });
+
+        const xcfw_targets = [2]std.Build.ResolvedTarget{ arm_target, x86_target };
+        var libs: [2]std.Build.LazyPath = undefined;
+
+        for (xcfw_targets, 0..) |xcfw_target, i| {
+            const xcfw_tracy = if (i == 0) xcfw_tracy_arm else xcfw_tracy_x86;
+            const lib = b.addStaticLibrary(.{
+                .name = "dve",
+                .root_source_file = b.path("bindings/c/src/intf.zig"),
+                .target = xcfw_target,
+                .optimize = xcfw_optimize,
+            });
+            lib.bundle_compiler_rt = true;
+            lib.root_module.addOptions("config", mpnet_options);
+            lib.root_module.addImport("objc", objc_dep.module("objc"));
+            lib.root_module.addImport("tracy", xcfw_tracy.module("tracy"));
+            lib.root_module.addImport("dve", b.addModule("dve_xcfw", .{
+                .root_source_file = b.path("src/root.zig"),
+                .imports = &.{
+                    .{ .name = "config", .module = mpnet_options.createModule() },
+                    .{ .name = "objc", .module = objc_dep.module("objc") },
+                    .{ .name = "tracy", .module = xcfw_tracy.module("tracy") },
+                },
+            }));
+            lib.root_module.linkFramework("NaturalLanguage", .{});
+            lib.root_module.linkFramework("CoreML", .{});
+            lib.root_module.linkFramework("Foundation", .{});
+            libs[i] = lib.getEmittedBin();
+        }
+
+        // lipo: merge arm64 + x86_64 into a universal binary
+        const lipo = RunStep.create(b, "lipo DveCore");
+        lipo.addArgs(&.{ "lipo", "-create", "-output" });
+        const universal = lipo.addOutputFileArg("libdve.a");
+        lipo.addFileArg(libs[0]);
+        lipo.addFileArg(libs[1]);
+
+        // xcodebuild -create-xcframework
+        const xcfw_out = "zig-out/DveCore.xcframework";
+        const rm = RunStep.create(b, "rm DveCore.xcframework");
+        rm.addArgs(&.{ "rm", "-rf", xcfw_out });
+
+        const xcfw = RunStep.create(b, "xcodebuild xcframework");
+        xcfw.has_side_effects = true;
+        xcfw.addArgs(&.{ "xcodebuild", "-create-xcframework" });
+        xcfw.addArg("-library");
+        xcfw.addFileArg(universal);
+        xcfw.addArg("-headers");
+        xcfw.addArg("bindings/c/include");
+        xcfw.addArg("-output");
+        xcfw.addArg(xcfw_out);
+        xcfw.step.dependOn(&rm.step);
+        xcfw.step.dependOn(&lipo.step);
+
+        xcfw_step.dependOn(&xcfw.step);
+    }
 }
 
 const EmbeddingModel = enum {

@@ -3,139 +3,61 @@ const dve = @import("dve");
 
 const VectorDB = dve.VectorDB(dve.embedding_model);
 
-const POLL_INTERVAL_NS = 1 * std.time.ns_per_s;
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10 MB
+const DOCUMENTS = [_]struct { key: []const u8, text: []const u8 }{
+    .{ .key = "solar-system", .text = "The solar system consists of the Sun and the objects that orbit it, including eight planets, their moons, and countless asteroids and comets." },
+    .{ .key = "photosynthesis", .text = "Photosynthesis is the process by which plants use sunlight, water, and carbon dioxide to produce oxygen and energy in the form of glucose." },
+    .{ .key = "machine-learning", .text = "Machine learning is a branch of artificial intelligence that enables systems to learn and improve from experience without being explicitly programmed." },
+    .{ .key = "ancient-rome", .text = "Ancient Rome was a civilization that grew from a small agricultural community on the Italian Peninsula into a vast empire spanning much of Europe, the Middle East, and North Africa." },
+    .{ .key = "quantum-mechanics", .text = "Quantum mechanics is a fundamental theory in physics that describes the behavior of nature at the smallest scales, where particles can exist in multiple states simultaneously." },
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
-    if (args.len < 3) {
-        printUsage();
-        std.process.exit(1);
+    // Use a temp directory for the database, cleaned up on exit.
+    const tmp_path = "/tmp/dve-repl";
+    std.fs.deleteTreeAbsolute(tmp_path) catch {};
+    var tmp_dir = try std.fs.cwd().makeOpenPath(tmp_path, .{});
+    defer {
+        tmp_dir.close();
+        std.fs.deleteTreeAbsolute(tmp_path) catch {};
     }
-
-    const subcmd = args[1];
-    const dir_path = args[2];
-
-    if (std.mem.eql(u8, subcmd, "watch")) {
-        try cmdWatch(allocator, dir_path);
-    } else if (std.mem.eql(u8, subcmd, "search")) {
-        if (args.len < 4) {
-            printUsage();
-            std.process.exit(1);
-        }
-        try cmdSearch(allocator, dir_path, args[3]);
-    } else {
-        printUsage();
-        std.process.exit(1);
-    }
-}
-
-fn cmdWatch(allocator: std.mem.Allocator, dir_path: []const u8) !void {
-    var dir = try std.fs.cwd().makeOpenPath(dir_path, .{ .iterate = true });
-    defer dir.close();
 
     var embedder = try dve.embed.NLEmbedder.init();
-    const db = try VectorDB.init(allocator, dir, embedder.embedder());
+    const db = try VectorDB.init(allocator, tmp_dir, embedder.embedder());
     defer db.deinit();
 
-    // Track mtimes to detect changes. Map keys are owned (duped) strings.
-    var mtimes = std.StringHashMap(i128).init(allocator);
-    defer {
-        var key_it = mtimes.keyIterator();
-        while (key_it.next()) |key| allocator.free(key.*);
-        mtimes.deinit();
+    // Embed all documents.
+    std.debug.print("Embedding documents...\n\n", .{});
+    for (DOCUMENTS) |doc| {
+        try db.embedText(doc.key, doc.text);
+        std.debug.print("  [{s}]\n  {s}\n\n", .{ doc.key, doc.text });
     }
 
-    std.debug.print("Watching {s} for changes...\n", .{dir_path});
+    // Query loop.
+    const stdin = std.io.getStdIn().reader();
+    var buf: [256]u8 = undefined;
 
     while (true) {
-        var walker = try dir.walk(allocator);
-        defer walker.deinit();
+        std.debug.print("Query (or 'quit'): ", .{});
+        const line = try stdin.readUntilDelimiterOrEof(&buf, '\n') orelse break;
+        const query = std.mem.trimRight(u8, line, "\r\n");
+        if (std.mem.eql(u8, query, "quit")) break;
+        if (query.len == 0) continue;
 
-        while (try walker.next()) |entry| {
-            if (entry.kind != .file) continue;
-            if (!isTextFile(entry.basename)) continue;
+        var results: [5]dve.SearchResult = undefined;
+        const n = try db.search(query, &results);
 
-            const f = dir.openFile(entry.path, .{}) catch continue;
-            const mtime = (f.metadata() catch {
-                f.close();
-                continue;
-            }).modified();
-            f.close();
-
-            const prev = mtimes.get(entry.path);
-            if (prev != null and prev.? == mtime) continue;
-
-            const contents = dir.readFileAlloc(allocator, entry.path, MAX_FILE_SIZE) catch |err| {
-                std.debug.print("Failed to read {s}: {}\n", .{ entry.path, err });
-                continue;
-            };
-            defer allocator.free(contents);
-
-            db.embedTextAsync(entry.path, contents) catch |err| {
-                std.debug.print("Failed to embed {s}: {}\n", .{ entry.path, err });
-                continue;
-            };
-            std.debug.print("Embedded: {s}\n", .{entry.path});
-
-            if (prev == null) {
-                try mtimes.put(try allocator.dupe(u8, entry.path), mtime);
-            } else {
-                mtimes.getPtr(entry.path).?.* = mtime;
-            }
+        if (n == 0) {
+            std.debug.print("No results.\n\n", .{});
+            continue;
         }
 
-        std.time.sleep(POLL_INTERVAL_NS);
+        for (results[0..n]) |result| {
+            std.debug.print("  [{s}] (similarity: {d:.2})\n", .{ result.path, result.similarity });
+        }
+        std.debug.print("\n", .{});
     }
-}
-
-fn cmdSearch(allocator: std.mem.Allocator, dir_path: []const u8, query: []const u8) !void {
-    var dir = try std.fs.cwd().openDir(dir_path, .{});
-    defer dir.close();
-
-    var embedder = try dve.embed.NLEmbedder.init();
-    const db = try VectorDB.init(allocator, dir, embedder.embedder());
-    defer db.deinit();
-
-    var results: [20]dve.SearchResult = undefined;
-    const n = try db.search(query, &results);
-
-    if (n == 0) {
-        std.debug.print("No results found.\n", .{});
-        return;
-    }
-
-    for (results[0..n]) |result| {
-        std.debug.print("{s} (similarity: {d:.2})\n", .{ result.path, result.similarity });
-
-        const text_len = result.end_i - result.start_i;
-        const buf = try allocator.alloc(u8, text_len);
-        defer allocator.free(buf);
-
-        if (dir.openFile(result.path, .{})) |f| {
-            defer f.close();
-            f.seekTo(result.start_i) catch continue;
-            const n_read = f.read(buf) catch continue;
-            std.debug.print("   matched text: {s}\n", .{buf[0..n_read]});
-        } else |_| continue;
-    }
-}
-
-fn isTextFile(name: []const u8) bool {
-    return std.mem.endsWith(u8, name, ".md");
-}
-
-fn printUsage() void {
-    std.debug.print(
-        \\Usage:
-        \\  embed-watch watch  <dir>           Watch a directory and embed text files
-        \\  embed-watch search <dir> <query>   Search the embedded database
-        \\
-    , .{});
 }
