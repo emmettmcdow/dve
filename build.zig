@@ -260,6 +260,35 @@ pub fn build(b: *std.Build) !void {
         test_benchmark.dependOn(&run.step);
     }
 
+    const test_profile = b.step("test-profile", "run profiling tests (not included in test step)");
+    {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/profile.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+            .filters = if (test_filter != null) filters else &.{},
+        });
+        t.root_module.addImport("dve", dve_mod);
+        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        const install_models = b.addInstallDirectory(.{
+            .source_dir = .{ .cwd_relative = MpnetModel.MODEL_PATH },
+            .install_dir = .{ .custom = "share" },
+            .install_subdir = "all_mpnet_base_v2.mlpackage",
+        });
+        install_models.step.dependOn(mpnet_model.step);
+        const install_tokenizer = b.addInstallFile(
+            .{ .cwd_relative = MpnetModel.TOKENIZER_PATH },
+            "share/tokenizer.json",
+        );
+        install_tokenizer.step.dependOn(mpnet_model.step);
+        const run = runTest(b, t, use_lldb);
+        run.step.dependOn(&install_models.step);
+        run.step.dependOn(&install_tokenizer.step);
+        test_profile.dependOn(&run.step);
+    }
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(test_vec_storage);
     test_step.dependOn(test_note_id_map);
