@@ -45,7 +45,7 @@ check() {
 # ---- Builds -----------------------------------------------------------------
 
 section "examples/zig"
-check "zig build" zig build --build-file "$REPO_ROOT/examples/zig/build.zig"
+check "zig build" bash -c "cd '$REPO_ROOT/examples/zig' && zig build"
 
 section "bindings/c (via xcframework)"
 check "zig build xcframework" zig build xcframework

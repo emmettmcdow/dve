@@ -430,7 +430,7 @@ pub const MpnetEmbedder = struct {
         // Mean pooling: average only over real (non-padding) token positions.
         const output_slice = try allocator.alignedAlloc(
             VEC_TYPE,
-            @alignOf(@Vector(VEC_SZ, VEC_TYPE)),
+            std.mem.Alignment.of(@Vector(VEC_SZ, VEC_TYPE)),
             VEC_SZ,
         );
         const zero_vec: @Vector(VEC_SZ, VEC_TYPE) = @splat(0.0);
@@ -471,10 +471,11 @@ fn getModelPath(
         const resource_path_ns = bundle.msgSend(Object, resourcePath_sel, .{});
         if (resource_path_ns.value != 0) {
             const resource_path = resource_path_ns.msgSend([*:0]const u8, utf8_sel, .{});
-            const bundle_path = try std.fmt.allocPrintZ(
+            const bundle_path = try std.fmt.allocPrintSentinel(
                 allocator,
                 "{s}/{s}",
                 .{ resource_path, bundle_relative_path },
+                0,
             );
 
             if (std.fs.accessAbsolute(bundle_path, .{})) |_| {
@@ -496,17 +497,23 @@ fn getExeRelativePath(allocator: Allocator, relative_path: []const u8) ![:0]cons
     };
 
     // Try exe-relative path first
-    const exe_relative = try std.fmt.allocPrintZ(
+    const exe_relative = try std.fmt.allocPrintSentinel(
         allocator,
         "{s}/../{s}",
         .{ exe_path, relative_path },
+        0,
     );
     std.fs.accessAbsolute(exe_relative, .{}) catch {
         // This is the case where we are testing, files are in a different place.
         allocator.free(exe_relative);
         const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
         defer allocator.free(cwd);
-        return try std.fmt.allocPrintZ(allocator, "{s}/zig-out/{s}", .{ cwd, relative_path });
+        return try std.fmt.allocPrintSentinel(
+            allocator,
+            "{s}/zig-out/{s}",
+            .{ cwd, relative_path },
+            0,
+        );
     };
     return exe_relative;
 }
@@ -599,7 +606,7 @@ pub const NLEmbedder = struct {
         // We only embed natural language for now, we should never get a chunk with punctuation.
         assert(isAlphanumeric(str[0]) and isAlphanumeric(str[str.len - 1]));
 
-        const c_str = try std.fmt.allocPrintZ(allocator, "{s}", .{str});
+        const c_str = try std.fmt.allocPrintSentinel(allocator, "{s}", .{str}, 0);
         defer allocator.free(c_str);
         const objc_str = NSString.msgSend(Object, fromUTF8, .{c_str.ptr});
         // defer objc_str.release();
@@ -607,7 +614,7 @@ pub const NLEmbedder = struct {
         const VecType = @Vector(VEC_SZ, VEC_TYPE);
         const vec_buf: [*]align(@alignOf(VecType)) VEC_TYPE = @ptrCast((try allocator.alignedAlloc(
             VEC_TYPE,
-            @alignOf(VecType),
+            std.mem.Alignment.of(VecType),
             VEC_SZ,
         )).ptr);
         self.mutex.lock();
@@ -750,12 +757,12 @@ pub fn Spliterator(comptime delimiters: []const u8) type {
         }
 
         pub fn collectAll(self: *Self, allocator: Allocator) ![]Chunk {
-            var list = std.ArrayList(Chunk).init(allocator);
-            errdefer list.deinit();
+            var list: std.ArrayList(Chunk) = .{};
+            errdefer list.deinit(allocator);
             while (self.next()) |chunk| {
-                try list.append(chunk);
+                try list.append(allocator, chunk);
             }
-            return list.toOwnedSlice();
+            return list.toOwnedSlice(allocator);
         }
     };
 }

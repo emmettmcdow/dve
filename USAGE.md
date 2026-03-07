@@ -2,6 +2,9 @@
 
 ## Zig
 
+### Requirements
+- Zig 0.15.1
+
 ### Install
 
 Run the following to add dve to your project:
@@ -53,6 +56,10 @@ for (results[0..n]) |result| {
 ```
 
 ## Swift
+
+### Requirements
+- Zig 0.15.1 (to build the XCFramework)
+- Xcode 15+
 
 ### Install
 

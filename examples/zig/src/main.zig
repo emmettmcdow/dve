@@ -37,12 +37,15 @@ pub fn main() !void {
     }
 
     // Query loop.
-    const stdin = std.io.getStdIn().reader();
-    var buf: [256]u8 = undefined;
+    var stdin_rbuf: [4096]u8 = undefined;
+    var stdin_reader = std.fs.File.stdin().reader(&stdin_rbuf);
 
     while (true) {
         std.debug.print("Query (or 'quit'): ", .{});
-        const line = try stdin.readUntilDelimiterOrEof(&buf, '\n') orelse break;
+        const line = stdin_reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return err,
+        };
         const query = std.mem.trimRight(u8, line, "\r\n");
         if (std.mem.eql(u8, query, "quit")) break;
         if (query.len == 0) continue;

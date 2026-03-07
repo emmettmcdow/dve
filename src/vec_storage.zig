@@ -28,26 +28,25 @@ pub inline fn writeSlice(
 ) !void {
     const zone = tracy.beginZone(@src(), .{ .name = "vec_storage.zig:writeSlice" });
     defer zone.end();
-    return w.writeAll(slice);
+    return w.interface.writeAll(slice);
 }
 
 pub inline fn readSlice(
     r: *FileReader,
     buf: []u8,
 ) !void {
-    for (0..buf.len) |i| {
-        buf[i] = try r.readByte();
-    }
+    return r.interface.readSliceAll(buf);
 }
 
 pub inline fn readVec(N: usize, T: type, v: *@Vector(N, T), r: *FileReader, endian: std.builtin.Endian) !void {
+    const Stored = BinaryTypeRepresentation.to_binary(T).stored_as();
     for (0..N) |j| {
-        const elem = r.readInt(BinaryTypeRepresentation.to_binary(T).stored_as(), endian) catch |err| {
+        var bytes: [@sizeOf(Stored)]u8 = undefined;
+        r.interface.readSliceAll(&bytes) catch |err| {
             std.log.err("Error: {}\n", .{err});
             return err;
         };
-        const converted = @as(T, @bitCast(elem));
-        v[j] = converted;
+        v[j] = @as(T, @bitCast(std.mem.readInt(Stored, &bytes, endian)));
     }
 }
 
@@ -65,7 +64,7 @@ pub inline fn writeVec(N: usize, T: type, w: *FileWriter, v: @Vector(N, T), endi
             as_int;
     }
 
-    return w.writeAll(std.mem.asBytes(&buf));
+    return w.interface.writeAll(std.mem.asBytes(&buf));
 }
 
 // **************************************************************************************** Storage
@@ -306,10 +305,15 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
                 else => return err,
             };
             defer f.close();
-            var writer = f.writer();
+            var wbuf: [8192]u8 = undefined;
+            var writer = f.writer(&wbuf);
 
             const endian = self.meta.endianness();
-            try writer.writeStructEndian(self.meta, endian);
+            const native_endian = @import("builtin").cpu.arch.endian();
+            var meta_copy = self.meta;
+            if (native_endian != endian) std.mem.byteSwapAllFields(StorageMetadata, &meta_copy);
+            try writer.interface.writeAll(std.mem.asBytes(&meta_copy));
+
             const cap = self.meta.capacity;
             var index_copy = try self.allocator.alloc(u8, cap);
             defer self.allocator.free(index_copy);
@@ -320,9 +324,10 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
             }
             try writeSlice(&writer, index_copy);
             for (0..cap) |i| try writeVec(vec_sz, vec_type, &writer, self.vectors[i], endian);
-            try writer.writeAll(std.mem.sliceAsBytes(self.note_ids));
-            try writer.writeAll(std.mem.sliceAsBytes(self.start_is));
-            try writer.writeAll(std.mem.sliceAsBytes(self.end_is));
+            try writer.interface.writeAll(std.mem.sliceAsBytes(self.note_ids));
+            try writer.interface.writeAll(std.mem.sliceAsBytes(self.start_is));
+            try writer.interface.writeAll(std.mem.sliceAsBytes(self.end_is));
+            try writer.interface.flush();
 
             for (0..cap) |i| self.setDirty(i, false);
 
@@ -335,13 +340,16 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
                 else => return err,
             };
             defer f.close();
-            var reader = f.reader();
+            var rbuf: [8192]u8 = undefined;
+            var reader = f.reader(&rbuf);
 
             const endian = self.meta.endianness();
             // Save this capacity because when we read the struct, the cap gets set to a value
             // which is not in line with the size of the DS.
             const old_capacity = self.meta.capacity;
-            self.meta = try reader.readStructEndian(StorageMetadata, endian);
+            const native_endian = @import("builtin").cpu.arch.endian();
+            try reader.interface.readSliceAll(std.mem.asBytes(&self.meta));
+            if (native_endian != endian) std.mem.byteSwapAllFields(StorageMetadata, &self.meta);
             if (self.meta.fmt_v != LATEST_META_FORMAT_VERSION or
                 self.meta.vec_sz != vec_sz or
                 self.meta.vec_type != BinaryTypeRepresentation.to_binary(vec_type) or
@@ -373,16 +381,13 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
                 if (self.isOccupied(i)) {
                     try readVec(vec_sz, vec_type, &self.vectors[i], &reader, endian);
                 } else {
-                    try f.seekBy(@intCast(vec_sz * @sizeOf(vec_type)));
+                    try reader.seekBy(@intCast(vec_sz * @sizeOf(vec_type)));
                 }
             }
 
-            const bytes_read = try reader.readAll(std.mem.sliceAsBytes(self.note_ids));
-            assert(bytes_read == self.meta.capacity * @sizeOf(NoteID));
-            const bytes_read2 = try reader.readAll(std.mem.sliceAsBytes(self.start_is));
-            assert(bytes_read2 == self.meta.capacity * @sizeOf(usize));
-            const bytes_read3 = try reader.readAll(std.mem.sliceAsBytes(self.end_is));
-            assert(bytes_read3 == self.meta.capacity * @sizeOf(usize));
+            try reader.interface.readSliceAll(std.mem.sliceAsBytes(self.note_ids));
+            try reader.interface.readSliceAll(std.mem.sliceAsBytes(self.start_is));
+            try reader.interface.readSliceAll(std.mem.sliceAsBytes(self.end_is));
 
             self.vec_n = 0;
             for (self.index) |idx_entry| {
@@ -465,20 +470,20 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
 
         /// Returns all vectors for a given note_id, sorted by start_i
         pub fn vecsForNote(self: Self, allocator: std.mem.Allocator, note_id: NoteID) ![]VecForNoteEntry {
-            var results = std.ArrayList(VecForNoteEntry).init(allocator);
-            errdefer results.deinit();
+            var results: std.ArrayList(VecForNoteEntry) = .{};
+            errdefer results.deinit(allocator);
 
             for (self.index, 0..) |idx_entry, i| {
                 if (!idx_entry.occupied) continue;
                 if (self.note_ids[i] == note_id) {
-                    try results.append(.{
+                    try results.append(allocator, .{
                         .id = i,
                         .row = self.get(i),
                     });
                 }
             }
 
-            const items = try results.toOwnedSlice();
+            const items = try results.toOwnedSlice(allocator);
             std.sort.insertion(VecForNoteEntry, items, {}, struct {
                 fn lessThan(_: void, a: VecForNoteEntry, b: VecForNoteEntry) bool {
                     return a.row.start_i < b.row.start_i;
@@ -1224,6 +1229,7 @@ const std = @import("std");
 const assert = std.debug.assert;
 const FileWriter = std.fs.File.Writer;
 const FileReader = std.fs.File.Reader;
+
 const tmpDir = std.testing.tmpDir;
 const testing_allocator = std.testing.allocator;
 const expect = std.testing.expect;

@@ -284,8 +284,8 @@ pub fn VectorDB(embedding_model: EmbeddingModel) type {
             const allocator = arena.allocator();
             assert(contents.len < MAX_NOTE_LEN);
 
-            var embedded_sentence_list = std.ArrayList(EmbeddedSentence).init(allocator);
-            errdefer embedded_sentence_list.deinit();
+            var embedded_sentence_list: std.ArrayList(EmbeddedSentence) = .{};
+            errdefer embedded_sentence_list.deinit(allocator);
             var spliterator = embed.SentenceSpliterator.init(contents);
             while (spliterator.next()) |sentence| {
                 const vec: ?*const [VEC_SZ]VEC_TYPE =
@@ -296,13 +296,13 @@ pub fn VectorDB(embedding_model: EmbeddingModel) type {
                     else
                         null;
 
-                try embedded_sentence_list.append(.{
+                try embedded_sentence_list.append(allocator, .{
                     .vec = vec,
                     .start_i = sentence.start_i,
                     .end_i = sentence.end_i,
                 });
             }
-            const embedded_sentences = try embedded_sentence_list.toOwnedSlice();
+            const embedded_sentences = try embedded_sentence_list.toOwnedSlice(allocator);
             const note_id = try self.note_id_map.getOrCreateId(path);
             try self.replaceVectors(allocator, note_id, embedded_sentences);
 
@@ -917,7 +917,7 @@ test "embedTextAsync" {
     try db.embedTextAsync(path2, "pizza");
     try db.embedTextAsync(path3, "pizza");
 
-    std.time.sleep(2 * std.time.ns_per_s);
+    std.Thread.sleep(2 * std.time.ns_per_s);
 
     var buffer: [10]SearchResult = undefined;
     const found = try db.search("pizza", &buffer);
@@ -983,6 +983,7 @@ const isAlphanumeric = std.ascii.isAlphanumeric;
 const note_id_map_mod = @import("note_id_map.zig");
 const NoteID = note_id_map_mod.NoteID;
 const NoteIdMap = note_id_map_mod.NoteIdMap;
+
 const NLEmbedder = embed.NLEmbedder;
 const MpnetEmbedder = embed.MpnetEmbedder;
 const spawn = Thread.spawn;

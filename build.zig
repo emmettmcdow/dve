@@ -113,9 +113,11 @@ pub fn build(b: *std.Build) !void {
     const test_vec_storage = b.step("test-vec_storage", "run tests for src/vec_storage.zig");
     {
         const t = b.addTest(.{
-            .root_source_file = b.path("src/vec_storage.zig"),
-            .target = target,
-            .optimize = optimize,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/vec_storage.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
             .filters = if (test_filter != null) filters else &.{},
         });
         t.root_module.addOptions("config", fake_options);
@@ -130,9 +132,11 @@ pub fn build(b: *std.Build) !void {
     const test_note_id_map = b.step("test-note_id_map", "run tests for src/note_id_map.zig");
     {
         const t = b.addTest(.{
-            .root_source_file = b.path("src/note_id_map.zig"),
-            .target = target,
-            .optimize = optimize,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/note_id_map.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
             .filters = if (test_filter != null) filters else &.{},
         });
         t.root_module.addOptions("config", fake_options);
@@ -147,9 +151,11 @@ pub fn build(b: *std.Build) !void {
     const test_util = b.step("test-util", "run tests for src/util.zig");
     {
         const t = b.addTest(.{
-            .root_source_file = b.path("src/util.zig"),
-            .target = target,
-            .optimize = optimize,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/util.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
             .filters = if (test_filter != null) filters else &.{},
         });
         // util.zig has no external deps beyond std
@@ -159,9 +165,11 @@ pub fn build(b: *std.Build) !void {
     const test_tokenizer = b.step("test-tokenizer", "run tests for src/tokenizer.zig");
     {
         const t = b.addTest(.{
-            .root_source_file = b.path("src/tokenizer.zig"),
-            .target = target,
-            .optimize = optimize,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/tokenizer.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
             .filters = if (test_filter != null) filters else &.{},
         });
         test_tokenizer.dependOn(&runTest(b, t, use_lldb).step);
@@ -170,9 +178,11 @@ pub fn build(b: *std.Build) !void {
     const test_embed = b.step("test-embed", "run tests for src/embed.zig");
     {
         const t = b.addTest(.{
-            .root_source_file = b.path("src/embed.zig"),
-            .target = target,
-            .optimize = optimize,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/embed.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
             .filters = if (test_filter != null) filters else &.{},
         });
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
@@ -196,9 +206,11 @@ pub fn build(b: *std.Build) !void {
     const test_vector = b.step("test-vector", "run tests for src/vector.zig");
     {
         const t = b.addTest(.{
-            .root_source_file = b.path("src/vector.zig"),
-            .target = target,
-            .optimize = optimize,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/vector.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
             .filters = if (test_filter != null) filters else &.{},
         });
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
@@ -222,9 +234,11 @@ pub fn build(b: *std.Build) !void {
     const test_benchmark = b.step("test-benchmark", "run embedding quality benchmark tests");
     {
         const t = b.addTest(.{
-            .root_source_file = b.path("src/benchmark.zig"),
-            .target = target,
-            .optimize = optimize,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/benchmark.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
             .filters = if (test_filter != null) filters else &.{},
         });
         t.root_module.addImport("dve", dve_mod);
@@ -291,11 +305,14 @@ pub fn build(b: *std.Build) !void {
 
         for (xcfw_targets, 0..) |xcfw_target, i| {
             const xcfw_tracy = if (i == 0) xcfw_tracy_arm else xcfw_tracy_x86;
-            const lib = b.addStaticLibrary(.{
+            const lib = b.addLibrary(.{
+                .linkage = .static,
                 .name = "dve",
-                .root_source_file = b.path("bindings/c/src/intf.zig"),
-                .target = xcfw_target,
-                .optimize = xcfw_optimize,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path("bindings/c/src/intf.zig"),
+                    .target = xcfw_target,
+                    .optimize = xcfw_optimize,
+                }),
             });
             lib.bundle_compiler_rt = true;
             lib.root_module.addOptions("config", mpnet_options);

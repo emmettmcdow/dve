@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+
 const CLS_TOKEN_ID = 101;
 const SEP_TOKEN_ID = 102;
 const UNK_TOKEN_ID = 100;
@@ -69,10 +70,10 @@ pub const WordPieceTokenizer = struct {
     }
 
     pub fn tokenize(self: *WordPieceTokenizer, allocator: Allocator, text: []const u8) ![]u32 {
-        var token_ids = std.ArrayList(u32).init(allocator);
-        errdefer token_ids.deinit();
+        var token_ids: std.ArrayList(u32) = .{};
+        errdefer token_ids.deinit(allocator);
 
-        try token_ids.append(self.cls_token_id);
+        try token_ids.append(allocator, self.cls_token_id);
 
         const basic_tokens = try self.basicTokenize(allocator, text);
         defer allocator.free(basic_tokens);
@@ -85,54 +86,54 @@ pub const WordPieceTokenizer = struct {
             for (wordpiece_tokens) |wp_token| {
                 defer allocator.free(wp_token);
                 if (self.vocab.get(wp_token)) |id| {
-                    try token_ids.append(id);
+                    try token_ids.append(allocator, id);
                 } else {
-                    try token_ids.append(self.vocab.get(UNK_TOKEN) orelse UNK_TOKEN_ID);
+                    try token_ids.append(allocator, self.vocab.get(UNK_TOKEN) orelse UNK_TOKEN_ID);
                 }
             }
         }
 
-        try token_ids.append(self.sep_token_id);
+        try token_ids.append(allocator, self.sep_token_id);
 
-        return token_ids.toOwnedSlice();
+        return token_ids.toOwnedSlice(allocator);
     }
 
     fn basicTokenize(self: *WordPieceTokenizer, allocator: Allocator, text: []const u8) ![][]const u8 {
         _ = self;
-        var tokens = std.ArrayList([]const u8).init(allocator);
+        var tokens: std.ArrayList([]const u8) = .{};
         errdefer {
             for (tokens.items) |t| allocator.free(t);
-            tokens.deinit();
+            tokens.deinit(allocator);
         }
 
-        var current_token = std.ArrayList(u8).init(allocator);
-        defer current_token.deinit();
+        var current_token: std.ArrayList(u8) = .{};
+        defer current_token.deinit(allocator);
 
         for (text) |c| {
             const lower_c = std.ascii.toLower(c);
 
             if (std.ascii.isAlphanumeric(lower_c)) {
-                try current_token.append(lower_c);
+                try current_token.append(allocator, lower_c);
             } else if (std.ascii.isWhitespace(c)) {
                 if (current_token.items.len > 0) {
-                    try tokens.append(try allocator.dupe(u8, current_token.items));
+                    try tokens.append(allocator, try allocator.dupe(u8, current_token.items));
                     current_token.clearRetainingCapacity();
                 }
             } else {
                 if (current_token.items.len > 0) {
-                    try tokens.append(try allocator.dupe(u8, current_token.items));
+                    try tokens.append(allocator, try allocator.dupe(u8, current_token.items));
                     current_token.clearRetainingCapacity();
                 }
                 var punct: [1]u8 = .{lower_c};
-                try tokens.append(try allocator.dupe(u8, &punct));
+                try tokens.append(allocator, try allocator.dupe(u8, &punct));
             }
         }
 
         if (current_token.items.len > 0) {
-            try tokens.append(try allocator.dupe(u8, current_token.items));
+            try tokens.append(allocator, try allocator.dupe(u8, current_token.items));
         }
 
-        return tokens.toOwnedSlice();
+        return tokens.toOwnedSlice(allocator);
     }
 
     fn wordpieceTokenize(self: *WordPieceTokenizer, allocator: Allocator, word: []const u8) ![][]const u8 {
@@ -142,10 +143,10 @@ pub const WordPieceTokenizer = struct {
             return result;
         }
 
-        var sub_tokens = std.ArrayList([]const u8).init(allocator);
+        var sub_tokens: std.ArrayList([]const u8) = .{};
         errdefer {
             for (sub_tokens.items) |t| allocator.free(t);
-            sub_tokens.deinit();
+            sub_tokens.deinit(allocator);
         }
 
         var start: usize = 0;
@@ -154,13 +155,13 @@ pub const WordPieceTokenizer = struct {
             var cur_substr: ?[]const u8 = null;
 
             while (start < end) {
-                var substr_buf = std.ArrayList(u8).init(allocator);
-                defer substr_buf.deinit();
+                var substr_buf: std.ArrayList(u8) = .{};
+                defer substr_buf.deinit(allocator);
 
                 if (start > 0) {
-                    try substr_buf.appendSlice("##");
+                    try substr_buf.appendSlice(allocator, "##");
                 }
-                try substr_buf.appendSlice(word[start..end]);
+                try substr_buf.appendSlice(allocator, word[start..end]);
 
                 if (self.vocab.contains(substr_buf.items)) {
                     cur_substr = try allocator.dupe(u8, substr_buf.items);
@@ -173,15 +174,15 @@ pub const WordPieceTokenizer = struct {
                 var result = try allocator.alloc([]const u8, 1);
                 result[0] = try allocator.dupe(u8, UNK_TOKEN);
                 for (sub_tokens.items) |t| allocator.free(t);
-                sub_tokens.deinit();
+                sub_tokens.deinit(allocator);
                 return result;
             }
 
-            try sub_tokens.append(cur_substr.?);
+            try sub_tokens.append(allocator, cur_substr.?);
             start = end;
         }
 
-        return sub_tokens.toOwnedSlice();
+        return sub_tokens.toOwnedSlice(allocator);
     }
 };
 

@@ -113,26 +113,23 @@ pub const NoteIdMap = struct {
         const file = try self.basedir.openFile(MANIFEST_FILENAME, .{});
         defer file.close();
 
-        var reader = file.reader();
+        var rbuf: [4096]u8 = undefined;
+        var reader = file.reader(&rbuf);
 
-        const version = try reader.readInt(u32, .little);
+        const version = try readIntLE(&reader, u32);
         if (version != MANIFEST_VERSION) return error.CorruptManifest;
 
-        self.next_id = try reader.readInt(u64, .little);
-        const entry_count = try reader.readInt(u64, .little);
+        self.next_id = try readIntLE(&reader, u64);
+        const entry_count = try readIntLE(&reader, u64);
 
         for (0..entry_count) |_| {
-            const id = try reader.readInt(u64, .little);
-            const path_len = try reader.readInt(u32, .little);
+            const id = try readIntLE(&reader, u64);
+            const path_len = try readIntLE(&reader, u32);
 
             const path = try self.allocator.alloc(u8, path_len);
             errdefer self.allocator.free(path);
 
-            const bytes_read = try reader.read(path);
-            if (bytes_read != path_len) {
-                self.allocator.free(path);
-                return error.CorruptManifest;
-            }
+            try reader.interface.readSliceAll(path);
 
             try self.path_to_id.put(path, id);
             try self.id_to_path.put(id, path);
@@ -148,19 +145,21 @@ pub const NoteIdMap = struct {
         const file = try self.basedir.createFile(tmp_name, .{});
         errdefer self.basedir.deleteFile(tmp_name) catch {}; // zlinter-disable-current-line
 
-        var writer = file.writer();
+        var wbuf: [4096]u8 = undefined;
+        var writer = file.writer(&wbuf);
 
-        try writer.writeInt(u32, MANIFEST_VERSION, .little);
-        try writer.writeInt(u64, self.next_id, .little);
-        try writer.writeInt(u64, self.id_to_path.count(), .little);
+        try writeIntLE(&writer, u32, MANIFEST_VERSION);
+        try writeIntLE(&writer, u64, self.next_id);
+        try writeIntLE(&writer, u64, self.id_to_path.count());
 
         var it = self.id_to_path.iterator();
         while (it.next()) |entry| {
-            try writer.writeInt(u64, entry.key_ptr.*, .little);
-            try writer.writeInt(u32, @intCast(entry.value_ptr.len), .little);
-            try writer.writeAll(entry.value_ptr.*);
+            try writeIntLE(&writer, u64, entry.key_ptr.*);
+            try writeIntLE(&writer, u32, @intCast(entry.value_ptr.len));
+            try writer.interface.writeAll(entry.value_ptr.*);
         }
 
+        try writer.interface.flush();
         try file.sync();
         file.close();
 
@@ -168,14 +167,14 @@ pub const NoteIdMap = struct {
     }
 
     pub fn pruneOrphanedPaths(self: *Self, basedir: std.fs.Dir) !void {
-        var to_remove = std.ArrayList(NoteID).init(self.allocator);
-        defer to_remove.deinit();
+        var to_remove: std.ArrayList(NoteID) = .{};
+        defer to_remove.deinit(self.allocator);
 
         var it = self.path_to_id.iterator();
         while (it.next()) |entry| {
             basedir.access(entry.key_ptr.*, .{}) catch |err| switch (err) {
                 error.FileNotFound => {
-                    try to_remove.append(entry.value_ptr.*);
+                    try to_remove.append(self.allocator, entry.value_ptr.*);
                 },
                 else => {},
             };
@@ -307,3 +306,16 @@ test "pruneOrphanedPaths removes missing files" {
 
 const std = @import("std");
 const tracy = @import("tracy");
+
+fn readIntLE(reader: *std.fs.File.Reader, comptime T: type) !T {
+    var buf: [@sizeOf(T)]u8 = undefined;
+    try reader.interface.readSliceAll(&buf);
+    return std.mem.readInt(T, &buf, .little);
+}
+
+fn writeIntLE(writer: *std.fs.File.Writer, comptime T: type, value: T) !void {
+    var buf: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &buf, value, .little);
+    try writer.interface.writeAll(&buf);
+}
+
