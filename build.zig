@@ -301,10 +301,10 @@ pub fn build(b: *std.Build) !void {
     ///////////////////
     // XCFramework   //
     ///////////////////
-    // Builds DveCore.xcframework for use by Swift/C consumers.
+    // Builds DVECore.xcframework for use by Swift/C consumers.
     // Both apple_nlembedding and mpnet_embedding are compiled in; the model is
     // selected at runtime by dve_init based on whether model_path is provided.
-    const xcfw_step = b.step("xcframework", "Build DveCore.xcframework");
+    const xcfw_step = b.step("xcframework", "Build DVECore.xcframework");
     {
         const arm_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos });
         const x86_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .macos });
@@ -362,15 +362,15 @@ pub fn build(b: *std.Build) !void {
         }
 
         // lipo: merge arm64 + x86_64 into a universal binary
-        const lipo = RunStep.create(b, "lipo DveCore");
+        const lipo = RunStep.create(b, "lipo DVECore");
         lipo.addArgs(&.{ "lipo", "-create", "-output" });
         const universal = lipo.addOutputFileArg("libdve.a");
         lipo.addFileArg(libs[0]);
         lipo.addFileArg(libs[1]);
 
         // xcodebuild -create-xcframework
-        const xcfw_out = "zig-out/DveCore.xcframework";
-        const rm = RunStep.create(b, "rm DveCore.xcframework");
+        const xcfw_out = "zig-out/DVECore.xcframework";
+        const rm = RunStep.create(b, "rm DVECore.xcframework");
         rm.addArgs(&.{ "rm", "-rf", xcfw_out });
 
         const xcfw = RunStep.create(b, "xcodebuild xcframework");

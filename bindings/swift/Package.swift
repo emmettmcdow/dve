@@ -2,29 +2,29 @@
 import PackageDescription
 
 let package = Package(
-    name: "DveKit",
+    name: "DVEKit",
     platforms: [
         .macOS(.v13),
     ],
     products: [
-        .library(name: "DveKit", targets: ["DveKit"]),
+        .library(name: "DVEKit", targets: ["DVEKit"]),
     ],
     targets: [
         // Pre-built XCFramework containing the Zig/C core.
         // For local development: run `zig build xcframework` from the dve repo root,
-        // then reference the output at ../../zig-out/DveCore.xcframework.
+        // then reference the output at ../../zig-out/DVECore.xcframework.
         // For released versions: replace with a remote binaryTarget(url:checksum:).
         .binaryTarget(
-            name: "DveCore",
-            path: "../../zig-out/DveCore.xcframework"
+            name: "DVECore",
+            path: "../../zig-out/DVECore.xcframework"
         ),
         .target(
-            name: "DveKit",
-            dependencies: ["DveCore"],
+            name: "DVEKit",
+            dependencies: ["DVECore"],
             linkerSettings: [
-                // DveCore links into these Apple frameworks at runtime.
+                // DVECore links into these Apple frameworks at runtime.
                 // Declaring them here propagates the requirement to any binary
-                // that depends on DveKit, so consumers don't need to add them manually.
+                // that depends on DVEKit, so consumers don't need to add them manually.
                 .linkedFramework("NaturalLanguage"),
                 .linkedFramework("CoreML"),
                 .linkedLibrary("c++"),

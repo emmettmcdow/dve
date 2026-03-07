@@ -1,7 +1,7 @@
 const std = @import("std");
 const dve = @import("dve");
 
-const VectorDB = dve.VectorDB(dve.embedding_model);
+const VectorEngine = dve.VectorEngine(dve.embedding_model);
 
 const DOCUMENTS = [_]struct { key: []const u8, text: []const u8 }{
     .{ .key = "solar-system", .text = "The solar system consists of the Sun and the objects that orbit it, including eight planets, their moons, and countless asteroids and comets." },
@@ -26,13 +26,13 @@ pub fn main() !void {
     }
 
     var embedder = try dve.embed.NLEmbedder.init();
-    const db = try VectorDB.init(allocator, tmp_dir, embedder.embedder());
-    defer db.deinit();
+    const vectors = try VectorEngine.init(allocator, tmp_dir, embedder.embedder());
+    defer vectors.deinit();
 
     // Embed all documents.
     std.debug.print("Embedding documents...\n\n", .{});
     for (DOCUMENTS) |doc| {
-        try db.embedText(doc.key, doc.text);
+        try vectors.embedText(doc.key, doc.text);
         std.debug.print("  [{s}]\n  {s}\n\n", .{ doc.key, doc.text });
     }
 
@@ -51,7 +51,7 @@ pub fn main() !void {
         if (query.len == 0) continue;
 
         var results: [5]dve.SearchResult = undefined;
-        const n = try db.search(query, &results);
+        const n = try vectors.search(query, &results);
 
         if (n == 0) {
             std.debug.print("No results.\n\n", .{});

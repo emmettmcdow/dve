@@ -1,4 +1,4 @@
-import DveKit
+import DVEKit
 import Foundation
 
 let documents: [(key: String, text: String)] = [
@@ -15,12 +15,12 @@ let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
 try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
 defer { try? FileManager.default.removeItem(at: tmpDir) }
 
-let db = try DveDatabase(directory: tmpDir, model: .appleNL)
+let vectors = try VectorEngine(directory: tmpDir, model: .appleNL)
 
 // Embed all documents.
 print("Embedding documents...\n")
 for doc in documents {
-    try db.embed(key: doc.key, content: doc.text)
+    try vectors.embed(key: doc.key, content: doc.text)
     print("  [\(doc.key)]\n  \(doc.text)\n")
 }
 
@@ -31,7 +31,7 @@ while true {
     if line == "quit" { break }
     if line.isEmpty { continue }
 
-    let results = try db.search(line, maxResults: 5)
+    let results = try vectors.search(line, maxResults: 5)
     if results.isEmpty {
         print("No results.\n")
         continue

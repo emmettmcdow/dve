@@ -1,4 +1,4 @@
-module DveCore {
+module DVECore {
     header "dve.h"
     export *
 }

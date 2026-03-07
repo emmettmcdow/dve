@@ -32,7 +32,7 @@ fn stripQuery(query: []const u8) []const u8 {
     return query[start_i..end_i];
 }
 
-pub fn VectorDB(embedding_model: EmbeddingModel) type {
+pub fn VectorEngine(embedding_model: EmbeddingModel) type {
     const VEC_SZ = switch (embedding_model) {
         .apple_nlembedding => NLEmbedder.VEC_SZ,
         .mpnet_embedding => MpnetEmbedder.VEC_SZ,
@@ -399,7 +399,7 @@ fn wordlike(contents: []const u8) bool {
     return false;
 }
 
-const TestVecDB = VectorDB(.apple_nlembedding);
+const TestVecDB = VectorEngine(.apple_nlembedding);
 const TestVector = @Vector(NLEmbedder.VEC_SZ, NLEmbedder.VEC_TYPE);
 fn getVectorsForPath(db: *TestVecDB, path: []const u8, buf: []TestVector) !usize {
     const note_id = db.note_id_map.getId(path) orelse return 0;
@@ -503,7 +503,7 @@ test "search mpnet" {
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
     var e = try MpnetEmbedder.init(.{});
-    var db = try VectorDB(.mpnet_embedding).init(arena.allocator(), tmpD.dir, e.embedder());
+    var db = try VectorEngine(.mpnet_embedding).init(arena.allocator(), tmpD.dir, e.embedder());
     defer db.deinit();
 
     const path = "test.md";
@@ -860,7 +860,7 @@ test "embed skip low-value" {
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
     var e = try MpnetEmbedder.init(.{});
-    var db = try VectorDB(.mpnet_embedding).init(arena.allocator(), tmpD.dir, e.embedder());
+    var db = try VectorEngine(.mpnet_embedding).init(arena.allocator(), tmpD.dir, e.embedder());
     defer db.deinit();
     db.embedder.threshold = 0;
 

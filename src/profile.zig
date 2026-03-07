@@ -18,7 +18,7 @@ const Embedder = switch (embedding_model) {
     .mpnet_embedding => embed.MpnetEmbedder,
 };
 
-const TestVecDB = dve.VectorDB(embedding_model);
+const TestVecDB = dve.VectorEngine(embedding_model);
 const VecStorage = dve.vec_storage.Storage(VEC_SZ, VEC_TYPE);
 
 const words = [_][]const u8{

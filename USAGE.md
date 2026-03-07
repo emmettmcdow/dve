@@ -34,22 +34,22 @@ exe.root_module.linkFramework("Foundation", .{});
 const dve = @import("dve");
 
 // Open a directory to store the vector database.
-const dir = try std.fs.cwd().makeOpenPath("my_db", .{});
+const dir = try std.fs.cwd().makeOpenPath("my_vectors", .{});
 
-// VectorDB is generic over the embedding model, which is set at build time.
-const VectorDB = dve.VectorDB(dve.embedding_model);
+// VectorEngine is generic over the embedding model, which is set at build time.
+const VectorEngine = dve.VectorEngine(dve.embedding_model);
 var embedder = try dve.embed.NLEmbedder.init();
-const db = try VectorDB.init(allocator, dir, embedder.embedder());
-defer db.deinit();
+const vectors = try VectorEngine.init(allocator, dir, embedder.embedder());
+defer vectors.deinit();
 
 // Embed text. The key identifies the entry (typically a file path).
-try db.embedText("doc1", "Machine learning enables computers to learn from data");
+try vectors.embedText("doc1", "Machine learning enables computers to learn from data");
 // embedTextAsync returns immediately and embeds on a background thread.
-try db.embedTextAsync("doc2", "The solar system has eight planets");
+try vectors.embedTextAsync("doc2", "The solar system has eight planets");
 
 // Search returns results ordered by similarity.
 var results: [10]dve.SearchResult = undefined;
-const n = try db.search("artificial intelligence", &results);
+const n = try vectors.search("artificial intelligence", &results);
 for (results[0..n]) |result| {
     std.debug.print("{s} (similarity: {d:.2})\n", .{ result.path, result.similarity });
 }
@@ -80,29 +80,29 @@ targets: [
         dependencies: [
             // "swift" is the directory name of the local package, which SPM
             // uses as the package identity for local path dependencies.
-            .product(name: "DveKit", package: "swift"),
+            .product(name: "DVEKit", package: "swift"),
         ]
     ),
 ]
 ```
 
-> **Note:** DveKit will be available via a remote SPM URL once a release is published. Until then, reference the local path above.
+> **Note:** DVEKit will be available via a remote SPM URL once a release is published. Until then, reference the local path above.
 
 ### Usage
 
 ```swift
-import DveKit
+import DVEKit
 
 // Open (or create) a directory to store the vector database.
-let db = try DveDatabase(directory: myURL, model: .appleNL)
+let vectors = try VectorEngine(directory: myURL, model: .appleNL)
 
 // Embed text. The key identifies the entry (typically a file path).
-try db.embed(key: "doc1", content: "Machine learning enables computers to learn from data")
+try vectors.embed(key: "doc1", content: "Machine learning enables computers to learn from data")
 // embedAsync returns immediately and embeds on a background thread.
-try db.embedAsync(key: "doc2", content: "The solar system has eight planets")
+try vectors.embedAsync(key: "doc2", content: "The solar system has eight planets")
 
 // Search returns results ordered by similarity.
-let results = try db.search("artificial intelligence", maxResults: 10)
+let results = try vectors.search("artificial intelligence", maxResults: 10)
 for result in results {
     print("\(result.key) (similarity: \(result.similarity))")
 }
@@ -120,7 +120,7 @@ For higher-quality embeddings, use the mpnet model. Download it first:
 
 Then initialize with explicit model paths:
 ```swift
-let db = try DveDatabase(
+let vectors = try VectorEngine(
     directory: myURL,
     model: .mpnet(
         modelURL: URL(fileURLWithPath: "/path/to/all_mpnet_base_v2.mlpackage"),

@@ -5,11 +5,11 @@ const embed = dve.embed;
 const MpnetEmbedder = embed.MpnetEmbedder;
 const NLEmbedder = embed.NLEmbedder;
 
-// Both VectorDB specializations compiled in so the xcframework supports
+// Both VectorEngine specializations compiled in so the xcframework supports
 // runtime model selection. Each has its own on-disk format (768-dim vs 512-dim),
 // so a given database directory only works with one model at a time.
-const AppleVDB = dve.VectorDB(.apple_nlembedding);
-const MpnetVDB = dve.VectorDB(.mpnet_embedding);
+const AppleVDB = dve.VectorEngine(.apple_nlembedding);
+const MpnetVDB = dve.VectorEngine(.mpnet_embedding);
 
 const ActiveModel = enum { apple_nl, mpnet };
 
@@ -60,7 +60,7 @@ export fn dve_init(
             return @intFromEnum(CError.GenericFail);
         };
         mpnet_db = MpnetVDB.init(allocator, dir, mpnet_embedder.embedder()) catch |err| {
-            std.log.err("dve_init: failed to init VectorDB: {}\n", .{err});
+            std.log.err("dve_init: failed to init VectorEngine: {}\n", .{err});
             return @intFromEnum(CError.GenericFail);
         };
         active_model = .mpnet;
@@ -70,7 +70,7 @@ export fn dve_init(
             return @intFromEnum(CError.GenericFail);
         };
         apple_db = AppleVDB.init(allocator, dir, apple_embedder.embedder()) catch |err| {
-            std.log.err("dve_init: failed to init VectorDB: {}\n", .{err});
+            std.log.err("dve_init: failed to init VectorEngine: {}\n", .{err});
             return @intFromEnum(CError.GenericFail);
         };
         active_model = .apple_nl;
@@ -141,7 +141,7 @@ export fn dve_embed_async(key: [*:0]const u8, content: [*:0]const u8) c_int {
 
 export fn dve_search(
     query: [*:0]const u8,
-    outbuf: [*c]CDveSearchResult,
+    outbuf: [*c]CDVESearchResult,
     n: u32,
 ) c_int {
     mutex.lock();
@@ -216,15 +216,15 @@ export fn dve_rename(old_key: [*:0]const u8, new_key: [*:0]const u8) c_int {
 // Internal C-compatible result type
 const DVE_PATH_MAX = 1024;
 
-const CDveSearchResult = extern struct {
+const CDVESearchResult = extern struct {
     key: [DVE_PATH_MAX]u8,
     start_i: u32,
     end_i: u32,
     similarity: f32,
 };
 
-fn toC(sr: dve.SearchResult) CDveSearchResult {
-    var r = CDveSearchResult{
+fn toC(sr: dve.SearchResult) CDVESearchResult {
+    var r = CDVESearchResult{
         .key = std.mem.zeroes([DVE_PATH_MAX]u8),
         .start_i = @intCast(sr.start_i),
         .end_i = @intCast(sr.end_i),

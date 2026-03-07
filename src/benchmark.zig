@@ -362,4 +362,4 @@ const dve = @import("dve");
 const embed = dve.embed;
 const SearchResult = dve.SearchResult;
 const embedding_model = dve.embedding_model;
-const TestVecDB = dve.VectorDB(embedding_model);
+const TestVecDB = dve.VectorEngine(embedding_model);

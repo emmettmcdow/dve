@@ -8,14 +8,14 @@ typedef enum {
     DVE_ERR_GENERIC    = -1,
     DVE_ERR_DOUBLE_INIT = -2,
     DVE_ERR_NOT_INIT   = -3,
-} DveError;
+} DVEError;
 
 typedef struct {
     char key[DVE_PATH_MAX];
     uint32_t start_i;
     uint32_t end_i;
     float similarity;
-} DveSearchResult;
+} DVESearchResult;
 
 /**
  * Initialize the dve database.
@@ -26,7 +26,7 @@ typedef struct {
  * tokenizer_path - absolute path to the tokenizer.json file.
  *                  Pass NULL or empty string when compiled for apple_nlembedding.
  *
- * Returns DVE_SUCCESS on success, negative DveError on failure.
+ * Returns DVE_SUCCESS on success, negative DVEError on failure.
  */
 int dve_init(const char *basedir, const char *model_path, const char *tokenizer_path);
 
@@ -53,9 +53,9 @@ int dve_embed_async(const char *key, const char *content);
  * outbuf - caller-provided buffer to write results into.
  * n      - capacity of outbuf.
  *
- * Returns the number of results written, or negative DveError on failure.
+ * Returns the number of results written, or negative DVEError on failure.
  */
-int dve_search(const char *query, DveSearchResult *outbuf, uint32_t n);
+int dve_search(const char *query, DVESearchResult *outbuf, uint32_t n);
 
 /** Remove all embeddings associated with key. */
 int dve_remove(const char *key);

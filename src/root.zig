@@ -5,7 +5,7 @@ const config = @import("config");
 pub const embedding_model: embed_mod.EmbeddingModel =
     @enumFromInt(@intFromEnum(config.embedding_model));
 
-pub const VectorDB = @import("vector.zig").VectorDB;
+pub const VectorEngine = @import("vector.zig").VectorEngine;
 pub const SearchResult = @import("vector.zig").SearchResult;
 pub const Error = @import("vector.zig").Error;
 pub const embed = embed_mod;

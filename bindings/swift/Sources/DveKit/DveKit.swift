@@ -1,4 +1,4 @@
-import DveCore
+import DVECore
 import Foundation
 
 // MARK: - Public types
@@ -10,7 +10,7 @@ public struct SearchResult {
     public let similarity: Float
 }
 
-public enum DveModel {
+public enum EmbeddingModel {
     /// Apple's NaturalLanguage framework. Fast, no model file required. Good for development.
     case appleNL
     /// all-mpnet-base-v2. Higher quality embeddings. Requires model files.
@@ -18,7 +18,7 @@ public enum DveModel {
     case mpnet(modelURL: URL, tokenizerURL: URL)
 }
 
-public enum DveError: Error {
+public enum VectorEngineError: Error {
     case initFailed(code: Int32)
     case alreadyInitialized
     case notInitialized
@@ -28,17 +28,17 @@ public enum DveError: Error {
     case renameFailed(code: Int32)
 }
 
-// MARK: - DveDatabase
+// MARK: - VectorEngine
 
 /// A local vector embedding database. One instance per process (singleton).
-public final class DveDatabase {
+public final class VectorEngine {
 
     /// Initialize the database.
     ///
     /// - Parameters:
     ///   - directory: Directory where the database files will be stored.
     ///   - model: The embedding model to use.
-    public init(directory: URL, model: DveModel) throws {
+    public init(directory: URL, model: EmbeddingModel) throws {
         let basedir = directory.path
         let result: Int32
 
@@ -50,7 +50,7 @@ public final class DveDatabase {
         }
 
         guard result == DVE_SUCCESS.rawValue else {
-            throw DveError.initFailed(code: result)
+            throw VectorEngineError.initFailed(code: result)
         }
     }
 
@@ -64,7 +64,7 @@ public final class DveDatabase {
     public func embed(key: String, content: String) throws {
         let result = dve_embed(key, content)
         guard result == DVE_SUCCESS.rawValue else {
-            throw DveError.embedFailed(code: result)
+            throw VectorEngineError.embedFailed(code: result)
         }
     }
 
@@ -72,7 +72,7 @@ public final class DveDatabase {
     public func embedAsync(key: String, content: String) throws {
         let result = dve_embed_async(key, content)
         guard result == DVE_SUCCESS.rawValue else {
-            throw DveError.embedFailed(code: result)
+            throw VectorEngineError.embedFailed(code: result)
         }
     }
 
@@ -84,10 +84,10 @@ public final class DveDatabase {
     ///   - query: The search query.
     ///   - maxResults: Maximum number of results to return (default 20).
     public func search(_ query: String, maxResults: Int = 20) throws -> [SearchResult] {
-        var buf = [DveSearchResult](repeating: DveSearchResult(), count: maxResults)
+        var buf = [DVESearchResult](repeating: DVESearchResult(), count: maxResults)
         let n = dve_search(query, &buf, UInt32(maxResults))
         guard n >= 0 else {
-            throw DveError.searchFailed(code: n)
+            throw VectorEngineError.searchFailed(code: n)
         }
         return buf[0..<Int(n)].map { r in
             SearchResult(
@@ -107,7 +107,7 @@ public final class DveDatabase {
     public func remove(key: String) throws {
         let result = dve_remove(key)
         guard result == DVE_SUCCESS.rawValue else {
-            throw DveError.removeFailed(code: result)
+            throw VectorEngineError.removeFailed(code: result)
         }
     }
 
@@ -115,7 +115,7 @@ public final class DveDatabase {
     public func rename(from oldKey: String, to newKey: String) throws {
         let result = dve_rename(oldKey, newKey)
         guard result == DVE_SUCCESS.rawValue else {
-            throw DveError.renameFailed(code: result)
+            throw VectorEngineError.renameFailed(code: result)
         }
     }
 }

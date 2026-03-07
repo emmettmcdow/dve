@@ -4,14 +4,14 @@ Built with zig, but bindings are available for Swift.
 
 ## Usage
 ```swift
-import DveKit
+import DVEKit
 
-let db = try DveDatabase(directory: myURL, model: .appleNL)
+let vectors = try VectorEngine(directory: myURL, model: .appleNL)
 
-try db.embed(key: "doc1", content: "Machine learning enables computers to learn from data")
-try db.embed(key: "path/to/doc2", content: "The solar system has eight planets")
+try vectors.embed(key: "doc1", content: "Machine learning enables computers to learn from data")
+try vectors.embed(key: "path/to/doc2", content: "The solar system has eight planets")
 
-let results = try db.search("artificial intelligence")
+let results = try vectors.search("artificial intelligence")
 // results[0].key == "doc1"
 ```
 
