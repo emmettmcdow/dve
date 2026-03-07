@@ -624,6 +624,11 @@ pub const NLEmbedder = struct {
             return null;
         }
 
+        // NLEmbedding does not return unit vectors; normalize to enable dot-product search.
+        const vec_ptr: *VecType = @ptrCast(vec_buf);
+        const mag: VecType = @splat(@sqrt(@reduce(.Add, vec_ptr.* * vec_ptr.*)));
+        vec_ptr.* = vec_ptr.* / mag;
+
         return EmbeddingModelOutput{
             .apple_nlembedding = @ptrCast(vec_buf),
         };
@@ -881,12 +886,12 @@ test "embed - nlembed solo" {
     // doesn't do anything FUBAR.
     var vec = output.?.apple_nlembedding.*;
     var sum = @reduce(.Add, vec);
-    try expectEqual(1.009312, sum);
+    try expectEqual(0.08761532, sum);
 
     output = try e.embed(allocator, "Hello again world");
     vec = output.?.apple_nlembedding.*;
     sum = @reduce(.Add, vec);
-    try expectEqual(7.870239, sum);
+    try expectEqual(0.83664304, sum);
 }
 
 test "embed - mpnetembed init with autorelease pool (simulates Swift caller)" {
@@ -1100,6 +1105,58 @@ fn threadSafetyTest(e: *Embedder) !void {
     }
     barrier.set();
     for (&threads) |*t| t.join();
+}
+
+test "embed - output is L2-normalized (mpnet)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var mpnet = try MpnetEmbedder.init(.{});
+    defer mpnet.deinit();
+    var e = mpnet.embedder();
+
+    const phrases = [_][]const u8{
+        "Hello world",
+        "The quick brown fox jumps over the lazy dog",
+        "Machine learning models convert text into vector representations",
+        "Zig is a systems programming language designed for correctness",
+        "a",
+    };
+    for (phrases) |phrase| {
+        const output = (try e.embed(arena.allocator(), phrase)) orelse return error.EmbedReturnedNull;
+        const vec = output.mpnet_embedding.*;
+        const norm = @sqrt(@reduce(.Add, vec * vec));
+        if (@abs(norm - 1.0) >= 1e-5) {
+            std.debug.print("mpnet norm for \"{s}\": {d:.8} (expected 1.0)\n", .{ phrase, norm });
+            return error.TestExpectedEqual;
+        }
+    }
+}
+
+test "embed - output is L2-normalized (nlembed)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var nl = try NLEmbedder.init();
+    defer nl.deinit();
+    var e = nl.embedder();
+
+    const phrases = [_][]const u8{
+        "Hello world",
+        "The quick brown fox jumps over the lazy dog",
+        "Machine learning models convert text into vector representations",
+        "Zig is a systems programming language designed for correctness",
+        "a",
+    };
+    for (phrases) |phrase| {
+        const output = (try e.embed(arena.allocator(), phrase)) orelse return error.EmbedReturnedNull;
+        const vec = output.apple_nlembedding.*;
+        const norm = @sqrt(@reduce(.Add, vec * vec));
+        if (@abs(norm - 1.0) >= 1e-5) {
+            std.debug.print("nlembed norm for \"{s}\": {d:.8} (expected 1.0)\n", .{ phrase, norm });
+            return error.TestExpectedEqual;
+        }
+    }
 }
 
 const std = @import("std");

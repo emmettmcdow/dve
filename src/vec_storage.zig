@@ -273,7 +273,7 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
 
             for (self.index, 0..) |idx_entry, id| {
                 if (!idx_entry.occupied) continue;
-                const raw_similar = cosine_similarity(vec_sz, vec_type, self.vectors[id], query);
+                const raw_similar = dot(vec_sz, vec_type, self.vectors[id], query);
                 if (raw_similar > threshold) {
                     try pq.add(.{ .id = id, .sim = raw_similar });
                 }
