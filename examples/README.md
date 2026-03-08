@@ -10,7 +10,10 @@ cd zig
 zig build run
 ```
 
-## Swift
+## Swift (Experimental)
+
+> **Note:** The Swift example works but the bindings are experimental. First-class Swift support
+> is planned for a future release.
 
 Requires building the XCFramework first (from the repo root):
 ```sh

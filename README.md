@@ -1,18 +1,28 @@
 # dve - dve vector engine
 dve is a library for creating and searching vector embeddings locally on Apple devices.
-Built with zig, but bindings are available for Swift.
+Built with Zig. Experimental Swift bindings are also available.
 
 ## Usage
-```swift
-import DVEKit
+```zig
+const dve = @import("dve");
 
-let vectors = try VectorEngine(directory: myURL, model: .appleNL)
+// Open a directory to store the vector database.
+const dir = try std.fs.cwd().makeOpenPath("my_vectors", .{});
 
-try vectors.embed(key: "doc1", content: "Machine learning enables computers to learn from data")
-try vectors.embed(key: "path/to/doc2", content: "The solar system has eight planets")
+// VectorEngine is generic over the embedding model, which is set at build time.
+const VectorEngine = dve.VectorEngine(dve.embedding_model);
+var embedder = try dve.embed.NLEmbedder.init();
+const vectors = try VectorEngine.init(allocator, dir, embedder.embedder());
+defer vectors.deinit();
 
-let results = try vectors.search("artificial intelligence")
-// results[0].key == "doc1"
+// Embed text. The key identifies the entry (typically a file path).
+try vectors.embedText("doc1", "Machine learning enables computers to learn from data");
+try vectors.embedText("doc2", "The solar system has eight planets");
+
+// Search returns results ordered by similarity.
+var results: [10]dve.SearchResult = undefined;
+const n = try vectors.search("artificial intelligence", &results);
+// results[0].path == "doc1"
 ```
 
 See the [examples](./examples) directory for complete working demos in Zig and Swift.
