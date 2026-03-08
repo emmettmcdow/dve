@@ -25,7 +25,8 @@ pub fn main() !void {
         std.fs.deleteTreeAbsolute(tmp_path) catch {};
     }
 
-    var embedder = try dve.embed.NLEmbedder.init();
+    // var embedder = try dve.embed.NLEmbedder.init();
+    var embedder = try dve.embed.MpnetEmbedder.init(.{});
     const vectors = try VectorEngine.init(allocator, tmp_dir, embedder.embedder());
     defer vectors.deinit();
 

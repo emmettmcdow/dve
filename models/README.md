@@ -13,5 +13,5 @@ To run these helper scripts, make sure you are using Python 3.12 or lower. And r
 ```bash
 python3 -m venv venv
 . ./venv/bin/activate
-pip install -r requirement.txt
+pip install -r requirements.txt
 ```
