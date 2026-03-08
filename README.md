@@ -2,6 +2,12 @@
 dve is a library for creating and searching vector embeddings locally on Apple devices.
 Built with Zig. Experimental Swift bindings are also available.
 
+dve is early-stage and actively developed. Bug reports, issues, and pull requests are welcome on
+GitHub.
+
+If you're trying dve and run into trouble, feel free to reach out directly:
+[@emmettmcdow](https://github.com/emmettmcdow).
+
 ## Usage
 ```zig
 const dve = @import("dve");
