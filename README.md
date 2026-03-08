@@ -51,10 +51,10 @@ core design goal.
 
 ## Roadmap
 - Add Linux support.
-- Add Windows support.
+- Make Swift bindings more stable.
+- Make C/C++ bindings more stable.
+- iOS support.
 - Multi-modal embedding support.
 - Download links within text documents and embed them.
 - Support for multiple model types (beyond mpnet and Apple NL).
 - Support multiple database instances within a single process.
-- iOS support.
-- C/C++ bindings.
