@@ -3,35 +3,18 @@ const MAX_NOTE_LEN: usize = std.math.maxInt(u32);
 pub const Error = error{NotQueuedShuttingDown};
 
 pub const SearchResult = struct {
+    /// The path or the key associated with this vector.
     path: []const u8,
+    /// If a document has multiple vectors, then start_i is the index where this vector starts.
     start_i: usize,
+    /// If a document has multiple vectors, then start_i is the index where this vector ends.
     end_i: usize,
+    /// This is the dot product similarity between the query and the specified vector.
     similarity: f32 = 0.0,
 };
 
-fn stripQuery(query: []const u8) []const u8 {
-    var start_i: usize = 0;
-    var end_i = query.len;
-    for (query, 0..) |c, i| {
-        start_i = i;
-        if (isAlphanumeric(c)) {
-            break;
-        }
-    }
-    const new_len = end_i - start_i;
-    if (start_i == end_i - 1) return query[0..0];
-    for (1..new_len + 1) |neg_i| {
-        const i = query.len - neg_i;
-        const c = query[i];
-        if (isAlphanumeric(c)) {
-            break;
-        }
-        end_i = i;
-    }
-    assert(start_i <= end_i);
-    return query[start_i..end_i];
-}
-
+/// VectorEngine is the primary way to use the vector engine. It requires selecting an
+/// EmbeddingModel. The EmbeddingModel must match the Embedder passed into the initialization func.
 pub fn VectorEngine(embedding_model: EmbeddingModel) type {
     const VEC_SZ = switch (embedding_model) {
         .apple_nlembedding => NLEmbedder.VEC_SZ,
@@ -105,6 +88,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             self.allocator.destroy(self.note_id_map);
             self.allocator.destroy(self);
         }
+        /// Stops the background work queue from running without de-initializing memory.
         pub fn shutdown(self: *Self) void {
             {
                 self.work_queue_mutex.lock();
@@ -115,6 +99,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             self.work_queue_thread.join();
         }
 
+        /// Searches the vector database. Can return multiple results per path/key.
         pub fn search(self: *Self, raw_query: []const u8, buf: []SearchResult) !usize {
             const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:search" });
             defer zone.end();
@@ -152,6 +137,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             return found_n;
         }
 
+        /// Searches the vector database. Each path/key will be unique in the results.
         pub fn uniqueSearch(self: *Self, raw_query: []const u8, buf: []SearchResult) !usize {
             const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:uniqueSearch" });
             defer zone.end();
@@ -194,6 +180,8 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             return unique_found_n;
         }
 
+        /// Given a sentence(result_content), highlight words in the sentence that most match the
+        /// query. This can be used to highlight to the user *why* a search result appeared.
         pub fn populateHighlights(
             self: *Self,
             query: []const u8,
@@ -236,7 +224,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             return;
         }
 
-        pub fn workQueueRun(self: *@This()) !void {
+        fn workQueueRun(self: *@This()) !void {
             while (true) {
                 self.work_queue_mutex.lock();
                 const job = while (true) {
@@ -264,19 +252,13 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             end_i: usize,
         };
 
-        pub fn embedText(
-            self: *Self,
-            path: []const u8,
-            contents: []const u8,
-        ) !void {
+        // Embed an entire document, a collection of sentences. And associate it with a key/path.
+        // Runs synchronously.
+        pub fn embedText(self: *Self, path: []const u8, contents: []const u8) !void {
             return self.embedTextInternal(path, contents);
         }
 
-        fn embedTextInternal(
-            self: *Self,
-            path: []const u8,
-            contents: []const u8,
-        ) !void {
+        fn embedTextInternal(self: *Self, path: []const u8, contents: []const u8) !void {
             const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:embedText" });
             defer zone.end();
             var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -309,11 +291,9 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             std.log.info("Embedded {d} sentences\n", .{embedded_sentences.len});
         }
 
-        pub fn embedTextAsync(
-            self: *Self,
-            path: []const u8,
-            contents: []const u8,
-        ) !void {
+        // Embed an entire document, a collection of sentences. And associate it with a key/path.
+        // Runs asynchronously.
+        pub fn embedTextAsync(self: *Self, path: []const u8, contents: []const u8) !void {
             {
                 self.work_queue_mutex.lock();
                 defer self.work_queue_mutex.unlock();
@@ -351,10 +331,12 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             try self.vec_storage.save(self.embedder.path);
         }
 
+        /// Validate the vector database is in a good state.
         pub fn validate(self: *Self) !void {
             try self.vec_storage.validate();
         }
 
+        /// Delete the entries associated with a given path.
         pub fn removePath(self: *Self, path: []const u8) !void {
             if (self.note_id_map.getId(path)) |note_id| {
                 self.vec_storage.rmByNoteId(note_id);
@@ -362,14 +344,16 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             try self.note_id_map.removePath(path);
         }
 
+        /// For entries associated with a given path, associate them with a different path.
         pub fn renamePath(self: *Self, old_path: []const u8, new_path: []const u8) !void {
             try self.note_id_map.renamePath(old_path, new_path);
         }
 
-        pub fn getPath(self: *Self, note_id: NoteID) ?[]const u8 {
+        fn getPath(self: *Self, note_id: NoteID) ?[]const u8 {
             return self.note_id_map.getPath(note_id);
         }
 
+        /// Remove paths which no longer have a vector associated with them.
         pub fn pruneOrphanedPaths(self: *Self, basedir: std.fs.Dir) !void {
             try self.note_id_map.pruneOrphanedPaths(basedir);
         }
@@ -379,6 +363,29 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             std.debug.print("Checking similarity against '{s}':\n", .{query});
         }
     };
+}
+
+fn stripQuery(query: []const u8) []const u8 {
+    var start_i: usize = 0;
+    var end_i = query.len;
+    for (query, 0..) |c, i| {
+        start_i = i;
+        if (isAlphanumeric(c)) {
+            break;
+        }
+    }
+    const new_len = end_i - start_i;
+    if (start_i == end_i - 1) return query[0..0];
+    for (1..new_len + 1) |neg_i| {
+        const i = query.len - neg_i;
+        const c = query[i];
+        if (isAlphanumeric(c)) {
+            break;
+        }
+        end_i = i;
+    }
+    assert(start_i <= end_i);
+    return query[start_i..end_i];
 }
 
 fn whitespaceOnly(contents: []const u8) bool {
@@ -964,7 +971,6 @@ test "embedTextAsync rejects after shutdown" {
     db.shutdown();
     try expectEqual(Error.NotQueuedShuttingDown, db.embedTextAsync(path, "pizza"));
 }
-
 
 const std = @import("std");
 const testing_allocator = std.testing.allocator;

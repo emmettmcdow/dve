@@ -1,4 +1,5 @@
 # Usage & Installation
+The main interface for this library is defined in [vector.zig](src/vector.zig).
 
 ## Model selection
 
