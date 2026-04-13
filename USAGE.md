@@ -27,6 +27,7 @@ const dve_dep = b.dependency("dve", .{
     .optimize = optimize,
     .@"embedding-model" = .mpnet_embedding,
 });
+b.getInstallStep().dependOn(dve_dep.builder.getInstallStep());
 ```
 
 On the first build, dve will automatically:
