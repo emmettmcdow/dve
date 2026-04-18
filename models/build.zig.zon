@@ -1,0 +1,10 @@
+.{
+    .name = .coreml_models,
+    .version = "4.0.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig.zon",
+        "build.zig",
+        "all_mpnet_base_v2/",
+    },
+}

@@ -11,6 +11,10 @@
             .url = "git+https://github.com/tealsnow/zig-tracy#74c75efe3576adc47846369d4df50f4f62a17597",
             .hash = "tracy-0.0.10-Dn49m2RUAAAdadZoiLef0OCmVdUyeu5GmEzXoTAokcZl",
         },
+        .coreml_models = .{
+            .url = "https://github.com/emmettmcdow/dve/releases/download/coreml-models-v4/coreml_models_v4.tar.gz",
+            .hash = "coreml_models-4.0.0-AAAAACm1Cxod09rT_gubnNq396SoNW90-0qBBhdQJibw",
+        },
     },
     .paths = .{
         "build.zig",

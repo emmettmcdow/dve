@@ -6,3 +6,4 @@ TODO.md
 *.db
 .dve_ids
 .build/
+*.tar*
