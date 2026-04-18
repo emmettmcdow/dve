@@ -1,7 +1,7 @@
 .{
     .name = .dve,
     .fingerprint = 0xf422f14929418132,
-    .version = "0.0.0",
+    .version = "0.0.1",
     .dependencies = .{
         .zig_objc = .{
             .url = "git+https://github.com/mitchellh/zig-objc#27d0e03242e7ee6842bf8a86d2e0bb1f586a9847",

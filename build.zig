@@ -342,7 +342,7 @@ pub fn build(b: *std.Build) !void {
         for (xcfw_targets, 0..) |xcfw_target, i| {
             const xcfw_tracy = if (i == 0) xcfw_tracy_arm else xcfw_tracy_x86;
             const lib = b.addLibrary(.{
-                .linkage = .static,
+                .linkage = .dynamic,
                 .name = "dve",
                 .root_module = b.createModule(.{
                     .root_source_file = b.path("bindings/c/src/intf.zig"),
@@ -365,32 +365,44 @@ pub fn build(b: *std.Build) !void {
             lib.root_module.linkFramework("NaturalLanguage", .{});
             lib.root_module.linkFramework("CoreML", .{});
             lib.root_module.linkFramework("Foundation", .{});
+            // Set the install name at link time so install_name_tool is not needed.
+            lib.install_name = "@rpath/DVECore.framework/DVECore";
             libs[i] = lib.getEmittedBin();
         }
 
-        // lipo: merge arm64 + x86_64 into a universal binary
+        // lipo: merge arm64 + x86_64 into a universal dylib
         const lipo = RunStep.create(b, "lipo DVECore");
         lipo.addArgs(&.{ "lipo", "-create", "-output" });
-        const universal = lipo.addOutputFileArg("libdve.a");
+        const universal = lipo.addOutputFileArg("DVECore");
         lipo.addFileArg(libs[0]);
         lipo.addFileArg(libs[1]);
 
-        // xcodebuild -create-xcframework
+        // Assemble DVECore.framework: dylib + headers + model resources
+        const fw_out = "zig-out/DVECore.framework";
         const xcfw_out = "zig-out/DVECore.xcframework";
-        const rm = RunStep.create(b, "rm DVECore.xcframework");
-        rm.addArgs(&.{ "rm", "-rf", xcfw_out });
 
+        const rm = RunStep.create(b, "rm DVECore artifacts");
+        rm.addArgs(&.{ "rm", "-rf", fw_out, xcfw_out });
+
+        const mk_fw = RunStep.create(b, "construct DVECore.framework");
+        mk_fw.has_side_effects = true;
+        mk_fw.addArgs(&.{ "/bin/sh", "scripts/mk-framework.sh" });
+        mk_fw.addFileArg(universal);
+        mk_fw.addFileArg(mpnet_model_path);
+        mk_fw.addFileArg(mpnet_tokenizer_path);
+        mk_fw.addArg(fw_out);
+        mk_fw.step.dependOn(&lipo.step);
+        mk_fw.step.dependOn(&rm.step);
+
+        // xcodebuild -create-xcframework from the assembled framework
         const xcfw = RunStep.create(b, "xcodebuild xcframework");
         xcfw.has_side_effects = true;
         xcfw.addArgs(&.{ "xcodebuild", "-create-xcframework" });
-        xcfw.addArg("-library");
-        xcfw.addFileArg(universal);
-        xcfw.addArg("-headers");
-        xcfw.addArg("bindings/c/include");
+        xcfw.addArg("-framework");
+        xcfw.addArg(fw_out);
         xcfw.addArg("-output");
         xcfw.addArg(xcfw_out);
-        xcfw.step.dependOn(&rm.step);
-        xcfw.step.dependOn(&lipo.step);
+        xcfw.step.dependOn(&mk_fw.step);
 
         xcfw_step.dependOn(&xcfw.step);
     }

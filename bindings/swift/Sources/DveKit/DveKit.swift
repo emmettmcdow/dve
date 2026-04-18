@@ -13,9 +13,8 @@ public struct SearchResult {
 public enum EmbeddingModel {
     /// Apple's NaturalLanguage framework. Fast, no model file required. Good for development.
     case appleNL
-    /// all-mpnet-base-v2. Higher quality embeddings. Requires model files.
-    /// Download with: `swift package download-dve-model --model mpnet`
-    case mpnet(modelURL: URL, tokenizerURL: URL)
+    /// all-mpnet-base-v2. Higher quality embeddings. Model is bundled in DVECore.framework.
+    case mpnet
 }
 
 public enum VectorEngineError: Error {
@@ -26,6 +25,9 @@ public enum VectorEngineError: Error {
     case searchFailed(code: Int32)
     case removeFailed(code: Int32)
     case renameFailed(code: Int32)
+    /// The mpnet model files could not be found in DVECore.framework/Resources/.
+    /// Ensure DVECore.framework is properly embedded in your app.
+    case modelNotFound
 }
 
 // MARK: - VectorEngine
@@ -37,20 +39,22 @@ public final class VectorEngine {
     ///
     /// - Parameters:
     ///   - directory: Directory where the database files will be stored.
-    ///   - model: The embedding model to use.
+    ///   - model: The embedding model to use. For `.mpnet`, the model is resolved
+    ///     automatically from DVECore.framework — no path configuration required.
     public init(directory: URL, model: EmbeddingModel) throws {
         let basedir = directory.path
-        let result: Int32
+        let code: Int32
 
         switch model {
         case .appleNL:
-            result = dve_init(basedir, "", "")
-        case .mpnet(let modelURL, let tokenizerURL):
-            result = dve_init(basedir, modelURL.path, tokenizerURL.path)
+            code = dve_init(basedir, "", "")
+        case .mpnet:
+            let (modelURL, tokenizerURL) = try VectorEngine.resolveMpnetURLs()
+            code = dve_init(basedir, modelURL.path, tokenizerURL.path)
         }
 
-        guard result == DVE_SUCCESS.rawValue else {
-            throw VectorEngineError.initFailed(code: result)
+        guard code == DVE_SUCCESS.rawValue else {
+            throw VectorEngineError.initFailed(code: code)
         }
     }
 
@@ -117,5 +121,24 @@ public final class VectorEngine {
         guard result == DVE_SUCCESS.rawValue else {
             throw VectorEngineError.renameFailed(code: result)
         }
+    }
+
+    // MARK: - Private
+
+    /// Resolves the mpnet model and tokenizer paths from DVECore.framework's Resources/.
+    /// DVECore is a dynamic framework, so its bundle is accessible at runtime via its
+    /// bundle identifier regardless of whether the consumer is an app or CLI tool.
+    private static func resolveMpnetURLs() throws -> (model: URL, tokenizer: URL) {
+        guard let bundle = Bundle(identifier: "com.emmettmcdow.DVECore") else {
+            throw VectorEngineError.modelNotFound
+        }
+        let resources = bundle.bundleURL.appendingPathComponent("Resources")
+        let modelURL = resources.appendingPathComponent("all_mpnet_base_v2.mlpackage")
+        let tokenizerURL = resources.appendingPathComponent("tokenizer.json")
+        guard FileManager.default.fileExists(atPath: modelURL.path),
+              FileManager.default.fileExists(atPath: tokenizerURL.path) else {
+            throw VectorEngineError.modelNotFound
+        }
+        return (modelURL, tokenizerURL)
     }
 }

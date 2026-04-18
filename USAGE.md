@@ -118,31 +118,38 @@ for (results[0..n]) |result| {
 > First-class Swift support is planned for a future release.
 
 ### Requirements
-- Zig 0.15.1 (to build the XCFramework)
 - Xcode 15+
 
 ### Install
-First, build the XCFramework from the repo root:
-```sh
-zig build xcframework
-```
 
-If you are using XCode, you can add the dependency using
-`File -> Add Package Dependencies -> Add Local`, and selecting `dve/bindings/swift/`.
-
-Or add it to your `Package.swift`:
+**From a release tag** (recommended):
 ```swift
 dependencies: [
-    .package(path: "/path/to/dve/bindings/swift"),
+    .package(url: "https://github.com/emmettmcdow/dve", from: "0.0.1"),
 ],
 targets: [
     .target(
         name: "MyTarget",
         dependencies: [
-            .product(name: "DVEKit", package: "swift"),
+            .product(name: "DVEKit", package: "DVEKit"),
         ]
     ),
 ]
+```
+
+**From source** (requires Zig 0.15.1):
+
+Build the XCFramework first:
+```sh
+zig build xcframework
+```
+
+Then add DVEKit as a local package. In Xcode: `File → Add Package Dependencies → Add Local`,
+select `dve/bindings/swift/`. Or in your `Package.swift`:
+```swift
+dependencies: [
+    .package(path: "/path/to/dve/bindings/swift"),
+],
 ```
 
 ### Usage
@@ -152,6 +159,7 @@ import DVEKit
 
 // Open (or create) a directory to store the vector database.
 let vectors = try VectorEngine(directory: myURL, model: .appleNL)
+// or: model: .mpnet  — higher quality, model is bundled in the framework
 
 // Embed text. The key identifies the entry (typically a file path).
 try vectors.embed(key: "doc1", content: "Machine learning enables computers to learn from data")
@@ -164,3 +172,12 @@ for result in results {
     print("\(result.key) (similarity: \(result.similarity))")
 }
 ```
+
+### Release process (for maintainers)
+
+1. `zig build xcframework`
+2. `(cd zig-out/ && zip -r DVECore.xcframework.zip DVECore-[VERSION].xcframework)`
+3. Upload `DVECore-[VERSION].xcframework.zip` to the GitHub release
+4. `swift package compute-checksum DVECore-[VERSION].xcframework.zip`
+5. Update `bindings/swift/Package.swift` to `binaryTarget(url:checksum:)` with the new URL and checksum
+6. Commit and tag

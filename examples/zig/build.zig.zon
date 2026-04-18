@@ -1,6 +1,6 @@
 .{
     .name = .embed_watch,
-    .version = "0.0.0",
+    .version = "0.0.1",
     .fingerprint = 0x908b6c44cda5f4cf,
     .dependencies = .{
         .dve = .{
