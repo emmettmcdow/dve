@@ -3,7 +3,7 @@
 Each example embeds a small fixed set of documents, prints them, then drops into an
 interactive query loop. Type a query to find the most similar documents, or `quit` to exit.
 
-> These examples use the default Apple NaturalLanguage embedding model — no model files needed.
+> These examples use the default Apple NaturalLanguage embedding model.
 > To use the higher-quality mpnet model, see [Model selection](../USAGE.md#model-selection) in USAGE.md.
 
 ## Zig

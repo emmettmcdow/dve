@@ -7,16 +7,13 @@ dve supports two embedding backends:
 
 - **Apple NaturalLanguage** (default) — no model files required, works out of the box, good for
   development and prototyping. Scores 66% on our benchmarks. 
-- **mpnet** (`sentence-transformers/all-mpnet-base-v2`) — higher quality embeddings. Requires
-  Python ≤ 3.12 installed on your system at build-time. Scores 88% on our benchmarks.
+- **mpnet** (`sentence-transformers/all-mpnet-base-v2`) — higher quality embeddings. Scores 88%
+  on our benchmarks.
 
 > **Note:** The database format differs between models. Use the same model consistently
 > for a given database directory.
 
 ### Using the mpnet model
-
-**Prerequisite:** Python 3 (≤ 3.12) must be installed on your system. It is only needed at
-build time — your application does not depend on Python at runtime.
 
 To use mpnet, pass the `embedding-model` option when declaring the dve dependency in your
 `build.zig`:
@@ -30,14 +27,11 @@ const dve_dep = b.dependency("dve", .{
 b.getInstallStep().dependOn(dve_dep.builder.getInstallStep());
 ```
 
-On the first build, dve will automatically:
-1. Create a Python venv in `models/venv/`
-2. Install required Python packages
-3. Download and convert the model from HuggingFace (~400MB, may take several minutes)
+On the first build, Zig will automatically download the pre-converted CoreML model (~400MB)
+from GitHub Releases and cache it in your local Zig package cache. Subsequent builds skip the
+download.
 
-Subsequent builds detect that the model already exists and skip all three steps.
-
-Then initialize with the generated model paths:
+Then initialize with the model:
 ```zig
 var embedder = try dve.embed.MpnetEmbedder.init(.{});
 const vectors = try VectorEngine.init(allocator, dir, embedder.embedder());
@@ -47,7 +41,6 @@ const vectors = try VectorEngine.init(allocator, dir, embedder.embedder());
 
 ### Requirements
 - Zig 0.15.1
-- Python 3 (≤ 3.12) - build-time only. Needed only if using Mpnet.
 
 ### Install
 
@@ -77,20 +70,17 @@ exe.root_module.linkFramework("Foundation", .{});
 b.installArtifact(exe);
 
 // If using mpnet, install model files into your project's zig-out/share/ so the
-// exe can find them at their default paths. Depend on dve's install step to ensure
-// model generation completes before copying.
-//const dve_install = dve_dep.builder.getInstallStep();
+// exe can find them at their default paths.
+//const coreml_models = dve_dep.builder.dependency("coreml_models", .{});
 //const install_model = b.addInstallDirectory(.{
-//    .source_dir = dve_dep.path("models/all_mpnet_base_v2/all_mpnet_base_v2.mlpackage"),
+//    .source_dir = coreml_models.path("all_mpnet_base_v2/all_mpnet_base_v2.mlpackage"),
 //    .install_dir = .{ .custom = "share" },
 //    .install_subdir = "all_mpnet_base_v2.mlpackage",
 //});
-//install_model.step.dependOn(dve_install);
 //const install_tokenizer = b.addInstallFile(
-//    dve_dep.path("models/all_mpnet_base_v2/tokenizer.json"),
+//    coreml_models.path("all_mpnet_base_v2/tokenizer.json"),
 //    "share/tokenizer.json",
 //);
-//install_tokenizer.step.dependOn(dve_install);
 //b.getInstallStep().dependOn(&install_model.step);
 //b.getInstallStep().dependOn(&install_tokenizer.step);
 ```
