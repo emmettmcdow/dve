@@ -2,6 +2,29 @@ const std = @import("std");
 const dve = @import("dve");
 const embed = dve.embed;
 
+const LOG_PATH = "/tmp/dve.log";
+var log_fd: ?std.fs.File = null;
+
+fn logFn(
+    comptime message_level: std.log.Level,
+    comptime scope: @TypeOf(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    if (log_fd == null) {
+        log_fd = std.fs.createFileAbsolute(LOG_PATH, .{}) catch return;
+    }
+    var buf: [1024]u8 = undefined;
+    const prefix = "[" ++ @tagName(message_level) ++ "] (" ++ @tagName(scope) ++ ") ";
+    const msg = std.fmt.bufPrint(&buf, prefix ++ format ++ "\n", args) catch return;
+    _ = log_fd.?.write(msg) catch return;
+}
+
+pub const std_options: std.Options = .{
+    .logFn = logFn,
+    .log_level = .debug,
+};
+
 const MpnetEmbedder = embed.MpnetEmbedder;
 const NLEmbedder = embed.NLEmbedder;
 
