@@ -38,7 +38,7 @@ git add bindings/swift/Package.swift
 git commit -m "Release v0.0.2"
 git push origin main
 
-gh release create v0.0.2 DVECore-<version>.xcframework.zip \
+gh release create v0.0.2 zig-out/DVECore-<version>.xcframework.zip \
   --title "v0.0.2" \
   --notes "..."
 ```
