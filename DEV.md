@@ -15,9 +15,9 @@ zig build xcframework
 swift package compute-checksum zig-out/DVECore-<version>.xcframework.zip
 ```
 
-### 2. Update Package.swift files
+### 2. Update root Package.swift
 
-Update `examples/swift/Package.swift` with the final release URL and checksum **before** creating the tag. The URL is deterministic:
+Update `Package.swift` (repo root) with the final release URL and checksum **before** creating the tag. The URL is deterministic:
 
 ```
 https://github.com/emmettmcdow/dve/releases/download/<tag>/DVECore-<version>.xcframework.zip
@@ -26,20 +26,22 @@ https://github.com/emmettmcdow/dve/releases/download/<tag>/DVECore-<version>.xcf
 ```swift
 .binaryTarget(
     name: "DVECore",
-    url: "https://github.com/emmettmcdow/dve/releases/download/v0.1.0/DVECore-0.1.0.xcframework.zip",
+    url: "https://github.com/emmettmcdow/dve/releases/download/v0.1.1/DVECore-0.1.1.xcframework.zip",
     checksum: "<output of swift package compute-checksum>"
 ),
 ```
+
+> **Do not edit `examples/swift/Package.swift`** — that file always uses a local path and is only for development.
 
 ### 3. Commit, tag, and release in one shot
 
 ```sh
 git add Package.swift
-git commit -m "Release v0.1.0"
+git commit -m "Release v<version>"
 git push origin main
 
-gh release create v0.0.2 zig-out/DVECore-<version>.xcframework.zip \
-  --title "v0.0.2" \
+gh release create v<version> zig-out/DVECore-<version>.xcframework.zip \
+  --title "v<version>" \
   --notes "..."
 ```
 
