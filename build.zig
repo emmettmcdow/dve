@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) !void {
         EmbeddingModel,
         "embedding-model",
         "Embedding model to use (apple_nlembedding or mpnet_embedding)",
-    ) orelse .apple_nlembedding;
+    ) orelse .mpnet_embedding;
     const test_filter: ?[]const u8 = b.option(
         []const u8,
         "test-filter",
@@ -309,8 +309,7 @@ pub fn build(b: *std.Build) !void {
     // XCFramework   //
     ///////////////////
     // Builds DVECore.xcframework for use by Swift/C consumers.
-    // Both apple_nlembedding and mpnet_embedding are compiled in; the model is
-    // selected at runtime by dve_init based on whether model_path is provided.
+    // Always compiled with mpnet_embedding; model files are bundled in Resources/.
     const xcfw_step = b.step("xcframework", "Build DVECore.xcframework");
     {
         const arm_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos });

@@ -26,10 +26,11 @@ let package = Package(
     targets: [
         // Release: pre-built XCFramework downloaded by SPM from GitHub Releases.
         // For local development, replace with:
-        //   .binaryTarget(name: "DVECore", path: "../../zig-out/DVECore.xcframework")
+        // .binaryTarget(name: "DVECore", path: "../../zig-out/DVECore.xcframework"),
         .binaryTarget(
             name: "DVECore",
-            url: "https://github.com/emmettmcdow/dve/releases/download/v0.0.1/DVECore-0.0.1.xcframework.zip",
+            url:
+                "https://github.com/emmettmcdow/dve/releases/download/v0.0.1/DVECore-0.0.1.xcframework.zip",
             checksum: "6a287a1d902ca4ce8af1ed16cccae1b1d853a4f5e06a0a5bae2492df1effd156"
         ),
         .target(

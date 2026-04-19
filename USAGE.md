@@ -5,37 +5,12 @@ The main interface for this library is defined in [vector.zig](src/vector.zig).
 
 dve supports two embedding backends:
 
-- **Apple NaturalLanguage** (default) — no model files required, works out of the box, good for
-  development and prototyping. Scores 66% on our benchmarks. 
-- **mpnet** (`sentence-transformers/all-mpnet-base-v2`) — higher quality embeddings. Scores 88%
-  on our benchmarks.
+- **mpnet** (`sentence-transformers/all-mpnet-base-v2`) — default. Scores 88% on our benchmarks.
+- **Apple NaturalLanguage** — no model files required, good for quick prototyping. Scores 66%
+  on our benchmarks. Opt in with `.@"embedding-model" = .apple_nlembedding`.
 
 > **Note:** The database format differs between models. Use the same model consistently
 > for a given database directory.
-
-### Using the mpnet model
-
-To use mpnet, pass the `embedding-model` option when declaring the dve dependency in your
-`build.zig`:
-
-```zig
-const dve_dep = b.dependency("dve", .{
-    .target = target,
-    .optimize = optimize,
-    .@"embedding-model" = .mpnet_embedding,
-});
-b.getInstallStep().dependOn(dve_dep.builder.getInstallStep());
-```
-
-On the first build, Zig will automatically download the pre-converted CoreML model (~400MB)
-from GitHub Releases and cache it in your local Zig package cache. Subsequent builds skip the
-download.
-
-Then initialize with the model:
-```zig
-var embedder = try dve.embed.MpnetEmbedder.init(.{});
-const vectors = try VectorEngine.init(allocator, dir, embedder.embedder());
-```
 
 ## Zig
 
@@ -49,14 +24,12 @@ Run the following to add dve to your project:
 zig fetch --save git+https://github.com/emmettmcdow/dve
 ```
 
-Then in your `build.zig`, fetch the dependency and add it to your compile target. Use
-`.apple_nlembedding` (default, no setup required) or `.mpnet_embedding` (see [Model
-selection](#model-selection) above):
+Then in your `build.zig`, fetch the dependency and add it to your compile target:
 ```zig
 const dve_dep = b.dependency("dve", .{
     .target = target,
     .optimize = optimize,
-    // .@"embedding-model" = .mpnet_embedding, // uncomment for higher-quality embeddings
+    // .@"embedding-model" = .apple_nlembedding, // lighter, no model download
 });
 const dve_module = dve_dep.module("dve");
 
@@ -69,20 +42,8 @@ exe.root_module.linkFramework("Foundation", .{});
 
 b.installArtifact(exe);
 
-// If using mpnet, install model files into your project's zig-out/share/ so the
-// exe can find them at their default paths.
-//const coreml_models = dve_dep.builder.dependency("coreml_models", .{});
-//const install_model = b.addInstallDirectory(.{
-//    .source_dir = coreml_models.path("all_mpnet_base_v2/all_mpnet_base_v2.mlpackage"),
-//    .install_dir = .{ .custom = "share" },
-//    .install_subdir = "all_mpnet_base_v2.mlpackage",
-//});
-//const install_tokenizer = b.addInstallFile(
-//    coreml_models.path("all_mpnet_base_v2/tokenizer.json"),
-//    "share/tokenizer.json",
-//);
-//b.getInstallStep().dependOn(&install_model.step);
-//b.getInstallStep().dependOn(&install_tokenizer.step);
+// Install model files into your project's zig-out/share/ so the exe can find them.
+b.getInstallStep().dependOn(dve_dep.builder.getInstallStep());
 ```
 
 ### Usage
@@ -93,9 +54,8 @@ const dve = @import("dve");
 // Open a directory to store the vector database.
 const dir = try std.fs.cwd().makeOpenPath("my_vectors", .{});
 
-// VectorEngine is generic over the embedding model, which is set at build time.
 const VectorEngine = dve.VectorEngine(dve.embedding_model);
-var embedder = try dve.embed.NLEmbedder.init();
+var embedder = try dve.embed.MpnetEmbedder.init(.{});
 const vectors = try VectorEngine.init(allocator, dir, embedder.embedder());
 defer vectors.deinit();
 
@@ -158,8 +118,7 @@ dependencies: [
 import DVEKit
 
 // Open (or create) a directory to store the vector database.
-let vectors = try VectorEngine(directory: myURL, model: .appleNL)
-// or: model: .mpnet  — higher quality, model is bundled in the framework
+let vectors = try VectorEngine(directory: myURL)
 
 // Embed text. The key identifies the entry (typically a file path).
 try vectors.embed(key: "doc1", content: "Machine learning enables computers to learn from data")
@@ -175,9 +134,4 @@ for result in results {
 
 ### Release process (for maintainers)
 
-1. `zig build xcframework`
-2. `(cd zig-out/ && zip -r DVECore.xcframework.zip DVECore-[VERSION].xcframework)`
-3. Upload `DVECore-[VERSION].xcframework.zip` to the GitHub release
-4. `swift package compute-checksum DVECore-[VERSION].xcframework.zip`
-5. Update `bindings/swift/Package.swift` to `binaryTarget(url:checksum:)` with the new URL and checksum
-6. Commit and tag
+See [DEV.md](DEV.md).

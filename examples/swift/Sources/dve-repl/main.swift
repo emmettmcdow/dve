@@ -15,7 +15,7 @@ let tmpDir = URL(fileURLWithPath: NSTemporaryDirectory())
 try FileManager.default.createDirectory(at: tmpDir, withIntermediateDirectories: true)
 defer { try? FileManager.default.removeItem(at: tmpDir) }
 
-let vectors = try VectorEngine(directory: tmpDir, model: .appleNL)
+let vectors = try VectorEngine(directory: tmpDir)
 
 // Embed all documents.
 print("Embedding documents...\n")

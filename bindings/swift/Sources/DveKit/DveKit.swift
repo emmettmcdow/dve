@@ -1,4 +1,5 @@
 import DVECore
+import Darwin
 import Foundation
 
 // MARK: - Public types
@@ -8,13 +9,6 @@ public struct SearchResult {
     public let startIndex: Int
     public let endIndex: Int
     public let similarity: Float
-}
-
-public enum EmbeddingModel {
-    /// Apple's NaturalLanguage framework. Fast, no model file required. Good for development.
-    case appleNL
-    /// all-mpnet-base-v2. Higher quality embeddings. Model is bundled in DVECore.framework.
-    case mpnet
 }
 
 public enum VectorEngineError: Error {
@@ -39,20 +33,10 @@ public final class VectorEngine {
     ///
     /// - Parameters:
     ///   - directory: Directory where the database files will be stored.
-    ///   - model: The embedding model to use. For `.mpnet`, the model is resolved
-    ///     automatically from DVECore.framework — no path configuration required.
-    public init(directory: URL, model: EmbeddingModel) throws {
+    public init(directory: URL) throws {
         let basedir = directory.path
-        let code: Int32
-
-        switch model {
-        case .appleNL:
-            code = dve_init(basedir, "", "")
-        case .mpnet:
-            let (modelURL, tokenizerURL) = try VectorEngine.resolveMpnetURLs()
-            code = dve_init(basedir, modelURL.path, tokenizerURL.path)
-        }
-
+        let (modelURL, tokenizerURL) = try VectorEngine.resolveMpnetURLs()
+        let code = dve_init(basedir, modelURL.path, tokenizerURL.path)
         guard code == DVE_SUCCESS.rawValue else {
             throw VectorEngineError.initFailed(code: code)
         }
@@ -126,17 +110,25 @@ public final class VectorEngine {
     // MARK: - Private
 
     /// Resolves the mpnet model and tokenizer paths from DVECore.framework's Resources/.
-    /// DVECore is a dynamic framework, so its bundle is accessible at runtime via its
-    /// bundle identifier regardless of whether the consumer is an app or CLI tool.
     private static func resolveMpnetURLs() throws -> (model: URL, tokenizer: URL) {
-        guard let bundle = Bundle(identifier: "com.emmettmcdow.DVECore") else {
+        // Find the path of the loaded DVECore dylib via its exported symbol.
+        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "dve_init") else {
             throw VectorEngineError.modelNotFound
         }
-        let resources = bundle.bundleURL.appendingPathComponent("Resources")
+        var info = Dl_info()
+        guard dladdr(sym, &info) != 0, let fname = info.dli_fname else {
+            throw VectorEngineError.modelNotFound
+        }
+        // fname is e.g. ".../DVECore.framework/DVECore"
+        // One level up is the framework directory.
+        let frameworkURL = URL(fileURLWithPath: String(cString: fname))
+            .deletingLastPathComponent()
+        let resources = frameworkURL.appendingPathComponent("Resources")
         let modelURL = resources.appendingPathComponent("all_mpnet_base_v2.mlpackage")
         let tokenizerURL = resources.appendingPathComponent("tokenizer.json")
         guard FileManager.default.fileExists(atPath: modelURL.path),
-              FileManager.default.fileExists(atPath: tokenizerURL.path) else {
+            FileManager.default.fileExists(atPath: tokenizerURL.path)
+        else {
             throw VectorEngineError.modelNotFound
         }
         return (modelURL, tokenizerURL)
