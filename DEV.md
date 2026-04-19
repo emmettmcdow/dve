@@ -12,7 +12,7 @@ From the repo root:
 ```sh
 zig build xcframework
 (cd zig-out && zip -r DVECore-<version>.xcframework.zip DVECore.xcframework)
-swift package compute-checksum DVECore-<version>.xcframework.zip
+swift package compute-checksum zig-out/DVECore-<version>.xcframework.zip
 ```
 
 ### 2. Update Package.swift
