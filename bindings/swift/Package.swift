@@ -30,8 +30,8 @@ let package = Package(
         .binaryTarget(
             name: "DVECore",
             url:
-                "https://github.com/emmettmcdow/dve/releases/download/v0.0.1/DVECore-0.0.1.xcframework.zip",
-            checksum: "6a287a1d902ca4ce8af1ed16cccae1b1d853a4f5e06a0a5bae2492df1effd156"
+                "https://github.com/emmettmcdow/dve/releases/download/v0.1.0/DVECore-0.1.0.xcframework.zip",
+            checksum: "bde44fa984e6e1dde3c6ddae7c40207e89e0ef44d1793c0466785390e22b9d7a"
         ),
         .target(
             name: "DVEKit",
