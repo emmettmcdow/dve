@@ -17,7 +17,7 @@ swift package compute-checksum zig-out/DVECore-<version>.xcframework.zip
 
 ### 2. Update Package.swift files
 
-Update `Package.swift` (repo root) with the final release URL and checksum **before** creating the tag. The URL is deterministic:
+Update `examples/swift/Package.swift` with the final release URL and checksum **before** creating the tag. The URL is deterministic:
 
 ```
 https://github.com/emmettmcdow/dve/releases/download/<tag>/DVECore-<version>.xcframework.zip

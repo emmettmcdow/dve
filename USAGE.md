@@ -85,7 +85,7 @@ for (results[0..n]) |result| {
 **From a release tag** (recommended):
 ```swift
 dependencies: [
-    .package(url: "https://github.com/emmettmcdow/dve", from: "0.1.0"),
+    .package(url: "https://github.com/emmettmcdow/dve", from: "0.1.1"),
 ],
 targets: [
     .target(
