@@ -26,7 +26,7 @@ https://github.com/emmettmcdow/dve/releases/download/<tag>/DVECore-<version>.xcf
 ```swift
 .binaryTarget(
     name: "DVECore",
-    url: "https://github.com/emmettmcdow/dve/releases/download/v0.1.1/DVECore-0.1.1.xcframework.zip",
+    url: "https://github.com/emmettmcdow/dve/releases/download/v0.1.2/DVECore-0.1.2.xcframework.zip",
     checksum: "<output of swift package compute-checksum>"
 ),
 ```

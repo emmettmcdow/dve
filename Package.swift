@@ -2,7 +2,7 @@
 import PackageDescription
 
 // This is the root Package.swift, enabling:
-//   .package(url: "https://github.com/emmettmcdow/dve", from: "0.1.1")
+//   .package(url: "https://github.com/emmettmcdow/dve", from: "0.1.2")
 //
 // Development (Zig installed):
 //   Run `zig build xcframework` first. The binaryTarget below points to the
@@ -24,8 +24,9 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "DVECore",
-            url: "https://github.com/emmettmcdow/dve/releases/download/v0.1.1/DVECore-0.1.1.xcframework.zip",
-            checksum: "d6db9be1f14205b26b70dfcd3c163236476315d8637c38d2bbd6f6f55090a41e"
+            url:
+                "https://github.com/emmettmcdow/dve/releases/download/v0.1.2/DVECore-0.1.2.xcframework.zip",
+            checksum: "027b0321467a32c1b207388b9632ea12cba5512a67990fe7b653cb03a2485f1f"
         ),
         .target(
             name: "DVEKit",
