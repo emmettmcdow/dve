@@ -11,7 +11,7 @@ Releases involve two artifacts:
 From the repo root:
 ```sh
 zig build xcframework
-(cd zig-out && zip -r DVECore-<version>.xcframework.zip zig-out/DVECore.xcframework)
+(cd zig-out && zip -r DVECore-<version>.xcframework.zip DVECore.xcframework)
 swift package compute-checksum DVECore-<version>.xcframework.zip
 ```
 
