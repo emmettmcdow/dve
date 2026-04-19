@@ -43,7 +43,7 @@ pub fn main() !void {
 
     while (true) {
         std.debug.print("Query (or 'quit'): ", .{});
-        const line = stdin_reader.interface.takeDelimiterExclusive('\n') catch |err| switch (err) {
+        const line = stdin_reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
             error.EndOfStream => break,
             else => return err,
         };
