@@ -91,7 +91,7 @@ targets: [
     .target(
         name: "MyTarget",
         dependencies: [
-            .product(name: "DVEKit", package: "DVEKit"),
+            .product(name: "DVEKit", package: "dve"),
         ]
     ),
 ]
@@ -105,10 +105,10 @@ zig build xcframework
 ```
 
 Then add DVEKit as a local package. In Xcode: `File → Add Package Dependencies → Add Local`,
-select `dve/bindings/swift/`. Or in your `Package.swift`:
+select the `dve/` repo root. Or in your `Package.swift`:
 ```swift
 dependencies: [
-    .package(path: "/path/to/dve/bindings/swift"),
+    .package(path: "/path/to/dve"),
 ],
 ```
 

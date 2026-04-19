@@ -54,8 +54,8 @@ if [ "$SKIP_SWIFT" = true ]; then
     echo
     echo "==> Swift (skipped via --skip-swift)"
 else
-    section "bindings/swift"
-    check "swift build" swift build --package-path "$REPO_ROOT/bindings/swift"
+    section "Package.swift (root)"
+    check "swift build" swift build --package-path "$REPO_ROOT"
 
     section "examples/swift"
     check "swift build" swift build --package-path "$REPO_ROOT/examples/swift"
