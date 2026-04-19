@@ -29,15 +29,27 @@ public enum VectorEngineError: Error {
 /// A local vector embedding database. One instance per process (singleton).
 public final class VectorEngine {
 
-    /// Initialize the database.
+    /// Initialize the vector database.
     ///
     /// - Parameters:
     ///   - directory: Directory where the database files will be stored.
+    ///
+    /// - Important: Only one `VectorEngine` may exist per process. Creating a second
+    ///   instance throws `VectorEngineError.alreadyInitialized`. Let the existing
+    ///   instance go out of scope before creating a new one.
+    ///
+    /// The embedding model is determined at compile time and cannot be changed at runtime.
+    /// Model files are resolved automatically from DVECore.framework — no path configuration required.
     public init(directory: URL) throws {
         let basedir = directory.path
         let (modelURL, tokenizerURL) = try VectorEngine.resolveMpnetURLs()
         let code = dve_init(basedir, modelURL.path, tokenizerURL.path)
-        guard code == DVE_SUCCESS.rawValue else {
+        switch code {
+        case DVE_SUCCESS.rawValue:
+            break
+        case DVE_ERR_DOUBLE_INIT.rawValue:
+            throw VectorEngineError.alreadyInitialized
+        default:
             throw VectorEngineError.initFailed(code: code)
         }
     }
