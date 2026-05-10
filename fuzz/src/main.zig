@@ -3,7 +3,7 @@ const dve = @import("dve");
 
 const VectorEngine = dve.VectorEngine(dve.embedding_model);
 
-const OPS_PER_WORKER: u32 = 1;
+const DEFAULT_OPS_PER_WORKER: u32 = 1;
 const MAX_KEY_LEN: usize = 256;
 const MAX_CONTENT_LEN: usize = 8192;
 
@@ -17,8 +17,10 @@ pub fn main() !void {
 
     var is_worker = false;
     var stop_on_fail = false;
+    var path_constraints = false;
     var seed: u64 = std.crypto.random.int(u64);
     var max_iterations: ?u64 = null;
+    var ops_per_worker: u32 = DEFAULT_OPS_PER_WORKER;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -38,20 +40,29 @@ pub fn main() !void {
                 help();
                 return err;
             };
+        } else if (std.mem.eql(u8, args[i], "--ops-per-worker") and i + 1 < args.len) {
+            i += 1;
+            ops_per_worker = std.fmt.parseInt(u32, args[i], 10) catch |err| {
+                std.debug.print("--ops-per-worker requires a number as an argument\n", .{});
+                help();
+                return err;
+            };
         } else if (std.mem.eql(u8, args[i], "--stop-on-fail")) {
             stop_on_fail = true;
+        } else if (std.mem.eql(u8, args[i], "--path-constraints")) {
+            path_constraints = true;
         }
     }
 
     if (is_worker) {
-        try runWorker(allocator, seed);
+        try runWorker(allocator, seed, ops_per_worker, path_constraints);
     } else {
-        try runCoordinator(allocator, seed, max_iterations, stop_on_fail);
+        try runCoordinator(allocator, seed, max_iterations, stop_on_fail, ops_per_worker, path_constraints);
     }
 }
 
 fn help() void {
-    std.debug.print("usage: dve-fuzz [--worker] [--seed N] [--stop-on-fail] [--max-iterations N]\n", .{});
+    std.debug.print("usage: dve-fuzz [--worker] [--seed N] [--stop-on-fail] [--max-iterations N] [--ops-per-worker N] [--path-constraints]\n", .{});
 }
 
 fn writeOut(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
@@ -65,6 +76,8 @@ fn runCoordinator(
     initial_seed: u64,
     max_iterations: ?u64,
     stop_on_fail: bool,
+    ops_per_worker: u32,
+    path_constraints: bool,
 ) !void {
     var prng = std.Random.DefaultPrng.init(initial_seed);
     const rand = prng.random();
@@ -77,11 +90,15 @@ fn runCoordinator(
         const worker_seed = rand.int(u64);
         const seed_str = try std.fmt.allocPrint(allocator, "{d}", .{worker_seed});
         defer allocator.free(seed_str);
+        const ops_str = try std.fmt.allocPrint(allocator, "{d}", .{ops_per_worker});
+        defer allocator.free(ops_str);
 
-        var child = std.process.Child.init(
-            &.{ exe_path, "--worker", "--seed", seed_str },
-            allocator,
-        );
+        var worker_args: std.ArrayList([]const u8) = .empty;
+        defer worker_args.deinit(allocator);
+        try worker_args.appendSlice(allocator, &.{ exe_path, "--worker", "--seed", seed_str, "--ops-per-worker", ops_str });
+        if (path_constraints) try worker_args.append(allocator, "--path-constraints");
+
+        var child = std.process.Child.init(worker_args.items, allocator);
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Inherit;
         try child.spawn();
@@ -110,7 +127,7 @@ fn runCoordinator(
 
 const Op = enum { embed, embedAsync, search, uniqueSearch, populateHighlights, remove, rename };
 
-fn runWorker(allocator: std.mem.Allocator, seed: u64) !void {
+fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_constraints: bool) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const rand = prng.random();
 
@@ -129,6 +146,14 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64) !void {
     const engine = try VectorEngine.init(allocator, tmp_dir, embedder.embedder());
     defer engine.deinit();
 
+    // When path_constraints is enabled, tracks successfully embedded keys so
+    // that remove/rename are only called when a path is known to exist.
+    var known_keys: std.ArrayList([]u8) = .empty;
+    defer if (path_constraints) {
+        for (known_keys.items) |k| allocator.free(k);
+        known_keys.deinit(allocator);
+    };
+
     var key_buf: [MAX_KEY_LEN]u8 = undefined;
     var key2_buf: [MAX_KEY_LEN]u8 = undefined;
     var content_buf: [MAX_CONTENT_LEN]u8 = undefined;
@@ -137,7 +162,7 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64) !void {
     var highlights_buf: [20]usize = undefined;
 
     var op_i: u32 = 0;
-    while (op_i < OPS_PER_WORKER) : (op_i += 1) {
+    while (op_i < ops_per_worker) : (op_i += 1) {
         const op = @as(Op, @enumFromInt(rand.uintLessThan(u8, std.meta.fields(Op).len)));
 
         switch (op) {
@@ -157,6 +182,7 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64) !void {
                     try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"embed\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
                     continue;
                 };
+                if (path_constraints) try known_keys.append(allocator, try allocator.dupe(u8, key));
                 try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"embed\"}}\n", .{});
             },
             .embedAsync => {
@@ -175,6 +201,7 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64) !void {
                     try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"embedAsync\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
                     continue;
                 };
+                if (path_constraints) try known_keys.append(allocator, try allocator.dupe(u8, key));
                 try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"embedAsync\"}}\n", .{});
             },
             .search => {
@@ -226,7 +253,9 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64) !void {
                 try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"populateHighlights\"}}\n", .{});
             },
             .remove => {
-                const key = randString(rand, &key_buf);
+                if (path_constraints and known_keys.items.len == 0) continue;
+                const key_idx: ?usize = if (path_constraints) rand.uintLessThan(usize, known_keys.items.len) else null;
+                const key = if (key_idx) |idx| known_keys.items[idx] else randString(rand, &key_buf);
                 const key_json = try jsonEscape(allocator, key);
                 defer allocator.free(key_json);
                 try writeOut(
@@ -238,10 +267,13 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64) !void {
                     try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"remove\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
                     continue;
                 };
+                if (key_idx) |idx| allocator.free(known_keys.swapRemove(idx));
                 try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"remove\"}}\n", .{});
             },
             .rename => {
-                const old_key = randString(rand, &key_buf);
+                if (path_constraints and known_keys.items.len == 0) continue;
+                const old_key_idx: ?usize = if (path_constraints) rand.uintLessThan(usize, known_keys.items.len) else null;
+                const old_key = if (old_key_idx) |idx| known_keys.items[idx] else randString(rand, &key_buf);
                 const new_key = randString(rand, &key2_buf);
                 const old_json = try jsonEscape(allocator, old_key);
                 defer allocator.free(old_json);
@@ -256,6 +288,10 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64) !void {
                     try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"rename\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
                     continue;
                 };
+                if (old_key_idx) |idx| {
+                    allocator.free(known_keys.swapRemove(idx));
+                    try known_keys.append(allocator, try allocator.dupe(u8, new_key));
+                }
                 try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"rename\"}}\n", .{});
             },
         }
