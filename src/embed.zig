@@ -269,8 +269,9 @@ pub const MpnetEmbedder = struct {
             std.log.info("Skipping embed of zero-length string\n", .{});
             return null;
         }
-        // We only embed natural language for now, we should never get a chunk with punctuation.
-        assert(isAlphanumeric(str[0]) and isAlphanumeric(str[str.len - 1]));
+        if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
+            std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'\n", .{str});
+        }
 
         const token_ids = try self.tokenizer.tokenize(allocator, str);
         defer allocator.free(token_ids);
@@ -603,8 +604,9 @@ pub const NLEmbedder = struct {
             std.log.info("Skipping embed of zero-length string\n", .{});
             return null;
         }
-        // We only embed natural language for now, we should never get a chunk with punctuation.
-        assert(isAlphanumeric(str[0]) and isAlphanumeric(str[str.len - 1]));
+        if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
+            std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'\n", .{str});
+        }
 
         const c_str = try std.fmt.allocPrintSentinel(allocator, "{s}", .{str}, 0);
         defer allocator.free(c_str);
@@ -1157,6 +1159,23 @@ test "embed - output is L2-normalized (nlembed)" {
             return error.TestExpectedEqual;
         }
     }
+}
+
+// This is technically valid but likely unexpected. Throw a warning instead of failing.
+test "embed with punctuation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var nl = try NLEmbedder.init();
+    defer nl.deinit();
+    var mpnet = try MpnetEmbedder.init(.{});
+    defer mpnet.deinit();
+    var e1 = nl.embedder();
+    var e2 = nl.embedder();
+
+    _ = try e1.embed(allocator, "*foo bar*");
+    _ = try e2.embed(allocator, "*foo bar*");
 }
 
 const std = @import("std");
