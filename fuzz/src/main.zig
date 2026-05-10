@@ -54,9 +54,9 @@ fn help() void {
     std.debug.print("usage: dve-fuzz [--worker] [--seed N] [--stop-on-fail] [--max-iterations N]\n", .{});
 }
 
-fn writeOut(comptime fmt: []const u8, args: anytype) !void {
-    var buf: [MAX_CONTENT_LEN * 2]u8 = undefined;
-    const s = try std.fmt.bufPrint(&buf, fmt, args);
+fn writeOut(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+    const s = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(s);
     try std.fs.File.stdout().writeAll(s);
 }
 
@@ -100,13 +100,15 @@ fn runCoordinator(
         };
 
         if (crashed) {
-            try writeOut("{{\"event\":\"crash\",\"seed\":{d}}}\n", .{worker_seed});
+            try writeOut(allocator, "{{\"event\":\"crash\",\"seed\":{d}}}\n", .{worker_seed});
             if (stop_on_fail) break;
         }
         if (max_iterations != null and i >= max_iterations.?) break;
         i += 1;
     }
 }
+
+const Op = enum { embed, embedAsync, search, uniqueSearch, populateHighlights, remove, rename };
 
 fn runWorker(allocator: std.mem.Allocator, seed: u64) !void {
     var prng = std.Random.DefaultPrng.init(seed);
@@ -121,42 +123,145 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64) !void {
     var tmp_dir = try std.fs.openDirAbsolute(tmp_path, .{});
     defer tmp_dir.close();
 
-    try writeOut("{{\"event\":\"start\",\"seed\":{d}}}\n", .{seed});
+    try writeOut(allocator, "{{\"event\":\"start\",\"seed\":{d}}}\n", .{seed});
 
     var embedder = try dve.embed.MpnetEmbedder.init(.{});
     const engine = try VectorEngine.init(allocator, tmp_dir, embedder.embedder());
     defer engine.deinit();
 
     var key_buf: [MAX_KEY_LEN]u8 = undefined;
+    var key2_buf: [MAX_KEY_LEN]u8 = undefined;
     var content_buf: [MAX_CONTENT_LEN]u8 = undefined;
+    var content2_buf: [MAX_CONTENT_LEN]u8 = undefined;
+    var search_results: [10]dve.SearchResult = undefined;
+    var highlights_buf: [20]usize = undefined;
 
-    var op: u32 = 0;
-    while (op < OPS_PER_WORKER) : (op += 1) {
-        const key = randString(rand, &key_buf);
-        const content = randString(rand, &content_buf);
+    var op_i: u32 = 0;
+    while (op_i < OPS_PER_WORKER) : (op_i += 1) {
+        const op = @as(Op, @enumFromInt(rand.uintLessThan(u8, std.meta.fields(Op).len)));
 
-        const key_json = try jsonEscape(allocator, key);
-        defer allocator.free(key_json);
-        const content_json = try jsonEscape(allocator, content);
-        defer allocator.free(content_json);
-
-        try writeOut(
-            "{{\"event\":\"attempt\",\"op\":\"embed\",\"key\":\"{s}\",\"content\":\"{s}\"}}\n",
-            .{ key_json, content_json },
-        );
-
-        engine.embedText(key, content) catch |err| {
-            try writeOut(
-                "{{\"event\":\"error\",\"op\":\"embed\",\"err\":\"{s}\"}}\n",
-                .{@errorName(err)},
-            );
-            continue;
-        };
-
-        try writeOut("{{\"event\":\"ok\",\"op\":\"embed\"}}\n", .{});
+        switch (op) {
+            .embed => {
+                const key = randString(rand, &key_buf);
+                const content = randString(rand, &content_buf);
+                const key_json = try jsonEscape(allocator, key);
+                defer allocator.free(key_json);
+                const content_json = try jsonEscape(allocator, content);
+                defer allocator.free(content_json);
+                try writeOut(
+                    allocator,
+                    "{{\"event\":\"attempt\",\"op\":\"embed\",\"key\":\"{s}\",\"content\":\"{s}\"}}\n",
+                    .{ key_json, content_json },
+                );
+                engine.embedText(key, content) catch |err| {
+                    try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"embed\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+                    continue;
+                };
+                try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"embed\"}}\n", .{});
+            },
+            .embedAsync => {
+                const key = randString(rand, &key_buf);
+                const content = randString(rand, &content_buf);
+                const key_json = try jsonEscape(allocator, key);
+                defer allocator.free(key_json);
+                const content_json = try jsonEscape(allocator, content);
+                defer allocator.free(content_json);
+                try writeOut(
+                    allocator,
+                    "{{\"event\":\"attempt\",\"op\":\"embedAsync\",\"key\":\"{s}\",\"content\":\"{s}\"}}\n",
+                    .{ key_json, content_json },
+                );
+                engine.embedTextAsync(key, content) catch |err| {
+                    try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"embedAsync\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+                    continue;
+                };
+                try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"embedAsync\"}}\n", .{});
+            },
+            .search => {
+                const query = randString(rand, &key_buf);
+                const query_json = try jsonEscape(allocator, query);
+                defer allocator.free(query_json);
+                try writeOut(
+                    allocator,
+                    "{{\"event\":\"attempt\",\"op\":\"search\",\"query\":\"{s}\"}}\n",
+                    .{query_json},
+                );
+                const n = engine.search(query, &search_results) catch |err| {
+                    try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"search\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+                    continue;
+                };
+                try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"search\",\"n\":{d}}}\n", .{n});
+            },
+            .uniqueSearch => {
+                const query = randString(rand, &key_buf);
+                const query_json = try jsonEscape(allocator, query);
+                defer allocator.free(query_json);
+                try writeOut(
+                    allocator,
+                    "{{\"event\":\"attempt\",\"op\":\"uniqueSearch\",\"query\":\"{s}\"}}\n",
+                    .{query_json},
+                );
+                const n = engine.uniqueSearch(query, &search_results) catch |err| {
+                    try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"uniqueSearch\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+                    continue;
+                };
+                try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"uniqueSearch\",\"n\":{d}}}\n", .{n});
+            },
+            .populateHighlights => {
+                const query = randString(rand, &key_buf);
+                const content = randString(rand, &content2_buf);
+                const query_json = try jsonEscape(allocator, query);
+                defer allocator.free(query_json);
+                const content_json = try jsonEscape(allocator, content);
+                defer allocator.free(content_json);
+                try writeOut(
+                    allocator,
+                    "{{\"event\":\"attempt\",\"op\":\"populateHighlights\",\"query\":\"{s}\",\"content\":\"{s}\"}}\n",
+                    .{ query_json, content_json },
+                );
+                engine.populateHighlights(query, content, &highlights_buf) catch |err| {
+                    try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"populateHighlights\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+                    continue;
+                };
+                try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"populateHighlights\"}}\n", .{});
+            },
+            .remove => {
+                const key = randString(rand, &key_buf);
+                const key_json = try jsonEscape(allocator, key);
+                defer allocator.free(key_json);
+                try writeOut(
+                    allocator,
+                    "{{\"event\":\"attempt\",\"op\":\"remove\",\"key\":\"{s}\"}}\n",
+                    .{key_json},
+                );
+                engine.removePath(key) catch |err| {
+                    try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"remove\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+                    continue;
+                };
+                try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"remove\"}}\n", .{});
+            },
+            .rename => {
+                const old_key = randString(rand, &key_buf);
+                const new_key = randString(rand, &key2_buf);
+                const old_json = try jsonEscape(allocator, old_key);
+                defer allocator.free(old_json);
+                const new_json = try jsonEscape(allocator, new_key);
+                defer allocator.free(new_json);
+                try writeOut(
+                    allocator,
+                    "{{\"event\":\"attempt\",\"op\":\"rename\",\"old_key\":\"{s}\",\"new_key\":\"{s}\"}}\n",
+                    .{ old_json, new_json },
+                );
+                engine.renamePath(old_key, new_key) catch |err| {
+                    try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"rename\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+                    continue;
+                };
+                try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"rename\"}}\n", .{});
+            },
+        }
     }
 
-    try writeOut("{{\"event\":\"done\",\"ops\":{d}}}\n", .{op});
+    try writeOut(allocator, "{{\"event\":\"done\",\"ops\":{d}}}\n", .{op_i});
 }
 
 fn randString(rand: std.Random, buf: []u8) []u8 {
