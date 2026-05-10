@@ -1,6 +1,6 @@
 const MAX_NOTE_LEN: usize = std.math.maxInt(u32);
 
-pub const Error = error{NotQueuedShuttingDown};
+pub const Error = error{ NotQueuedShuttingDown, InvalidPath };
 
 pub const SearchResult = struct {
     /// The path or the key associated with this vector.
@@ -106,6 +106,8 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
+            if (raw_query.len == 0) return 0;
+
             const max_results = buf.len;
 
             const query = stripQuery(raw_query);
@@ -143,6 +145,8 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             defer zone.end();
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
+
+            if (raw_query.len == 0) return 0;
 
             const query = stripQuery(raw_query);
             if (query.len == 0) return 0;
@@ -192,6 +196,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             defer zone.end();
 
             const max_highlights = @divExact(highlights.len, 2);
+            if (max_highlights == 0) return;
 
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
@@ -255,6 +260,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         // Embed an entire document, a collection of sentences. And associate it with a key/path.
         // Runs synchronously.
         pub fn embedText(self: *Self, path: []const u8, contents: []const u8) !void {
+            if (path.len == 0) return Error.InvalidPath;
             return self.embedTextInternal(path, contents);
         }
 
@@ -294,6 +300,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         // Embed an entire document, a collection of sentences. And associate it with a key/path.
         // Runs asynchronously.
         pub fn embedTextAsync(self: *Self, path: []const u8, contents: []const u8) !void {
+            if (path.len == 0) return Error.InvalidPath;
             {
                 self.work_queue_mutex.lock();
                 defer self.work_queue_mutex.unlock();
@@ -338,6 +345,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
 
         /// Delete the entries associated with a given path.
         pub fn removePath(self: *Self, path: []const u8) !void {
+            if (path.len == 0) return Error.InvalidPath;
             if (self.note_id_map.getId(path)) |note_id| {
                 self.vec_storage.rmByNoteId(note_id);
             }
@@ -346,6 +354,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
 
         /// For entries associated with a given path, associate them with a different path.
         pub fn renamePath(self: *Self, old_path: []const u8, new_path: []const u8) !void {
+            if (old_path.len == 0 or new_path.len == 0) return Error.InvalidPath;
             try self.note_id_map.renamePath(old_path, new_path);
         }
 
@@ -970,6 +979,49 @@ test "embedTextAsync rejects after shutdown" {
     const path = "test.md";
     db.shutdown();
     try expectEqual(Error.NotQueuedShuttingDown, db.embedTextAsync(path, "pizza"));
+}
+
+test "empty inputs" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    const te = try testEmbedder(testing_allocator);
+    defer testing_allocator.destroy(te.e);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    defer db.deinit();
+
+    var res: [1]SearchResult = undefined;
+
+    try expectEqual(0, db.search("", &res));
+    try expectEqual(0, db.uniqueSearch("", &res));
+
+    var highlights: [2]usize = undefined;
+    try db.populateHighlights("", "", &.{});
+    try db.populateHighlights("", "book", &highlights);
+    try db.populateHighlights("book", "", &highlights);
+    try db.populateHighlights("book", "book", &.{});
+    try db.populateHighlights("book", "", &.{});
+    try db.populateHighlights("", "book", &.{});
+    try db.populateHighlights("", "", &highlights);
+
+    try expectEqual(Error.InvalidPath, db.removePath(""));
+
+    try expectEqual(Error.InvalidPath, db.renamePath("foo", ""));
+    try expectEqual(Error.InvalidPath, db.renamePath("", "foo"));
+
+    try expectEqual(Error.InvalidPath, db.embedText("", ""));
+    try db.embedText("foo", "");
+    try expectEqual(Error.InvalidPath, db.embedText("", "foo"));
+
+    try expectEqual(Error.InvalidPath, db.embedTextAsync("", ""));
+    try db.embedTextAsync("foo", "");
+    try expectEqual(Error.InvalidPath, db.embedTextAsync("", "foo"));
+
+    // There should be something present at foo
+    try db.embedText("foo", "bar");
+    try expectEqual(0, db.search("foo", &.{}));
+    try expectEqual(0, db.uniqueSearch("foo", &.{}));
 }
 
 const std = @import("std");
