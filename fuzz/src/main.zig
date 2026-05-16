@@ -127,6 +127,13 @@ fn runCoordinator(
 
 const Op = enum { embed, embedAsync, search, uniqueSearch, populateHighlights, remove, rename };
 
+fn validate(allocator: std.mem.Allocator, engine: *VectorEngine) !void {
+    engine.validate() catch |err| {
+        try writeOut(allocator, "{{\"event\":\"validate_fail\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+        return err;
+    };
+}
+
 fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_constraints: bool) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const rand = prng.random();
@@ -184,6 +191,7 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_
                 };
                 if (path_constraints) try known_keys.append(allocator, try allocator.dupe(u8, key));
                 try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"embed\"}}\n", .{});
+                try validate(allocator, engine);
             },
             .embedAsync => {
                 const key = randString(rand, &key_buf);
@@ -203,6 +211,7 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_
                 };
                 if (path_constraints) try known_keys.append(allocator, try allocator.dupe(u8, key));
                 try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"embedAsync\"}}\n", .{});
+                try validate(allocator, engine);
             },
             .search => {
                 const query = randString(rand, &key_buf);
@@ -269,6 +278,7 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_
                 };
                 if (key_idx) |idx| allocator.free(known_keys.swapRemove(idx));
                 try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"remove\"}}\n", .{});
+                try validate(allocator, engine);
             },
             .rename => {
                 if (path_constraints and known_keys.items.len == 0) continue;
@@ -293,6 +303,7 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_
                     try known_keys.append(allocator, try allocator.dupe(u8, new_key));
                 }
                 try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"rename\"}}\n", .{});
+                try validate(allocator, engine);
             },
         }
     }
