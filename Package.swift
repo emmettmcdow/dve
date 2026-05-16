@@ -22,12 +22,7 @@ let package = Package(
         .library(name: "DVEKit", targets: ["DVEKit"])
     ],
     targets: [
-        .binaryTarget(
-            name: "DVECore",
-            url:
-                "https://github.com/emmettmcdow/dve/releases/download/v0.1.3/DVECore-0.1.3.xcframework.zip",
-            checksum: "f1abcfcdf471549f06bc5e7778d587f861fc1a6a7d1723e15a3ac32bc81d2361"
-        ),
+        .binaryTarget(name: "DVECore", path: "zig-out/DVECore.xcframework"),
         .target(
             name: "DVEKit",
             dependencies: ["DVECore"],
