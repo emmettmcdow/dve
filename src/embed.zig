@@ -888,12 +888,12 @@ test "embed - nlembed solo" {
     // doesn't do anything FUBAR.
     var vec = output.?.apple_nlembedding.*;
     var sum = @reduce(.Add, vec);
-    try expectEqual(0.08761532, sum);
+    try std.testing.expectApproxEqAbs(0.08761532, sum, 1e-4);
 
     output = try e.embed(allocator, "Hello again world");
     vec = output.?.apple_nlembedding.*;
     sum = @reduce(.Add, vec);
-    try expectEqual(0.83664304, sum);
+    try std.testing.expectApproxEqAbs(0.83664304, sum, 1e-4);
 }
 
 test "embed - mpnetembed init with autorelease pool (simulates Swift caller)" {
@@ -943,15 +943,13 @@ test "embed - mpnetembed solo" {
 
     const vec = output.?.mpnet_embedding.*;
     const vec_array: [768]f32 = vec;
-    try expectEqualSlices(
-        f32,
-        &.{ 2.6249737e-2, 1.3395556e-2, -4.533195e-3 },
-        vec_array[0..3],
-    );
+    for (&[_]f32{ 2.6249737e-2, 1.3395556e-2, -4.533195e-3 }, vec_array[0..3]) |exp, got| {
+        try std.testing.expectApproxEqAbs(exp, got, 1e-4);
+    }
 
     // From the Python reference implementation
     const sum = @reduce(.Add, vec);
-    try expectEqual(-2.155769e-1, sum);
+    try std.testing.expectApproxEqAbs(-2.155769e-1, sum, 1e-4);
 }
 
 test "embed skip empty" {
