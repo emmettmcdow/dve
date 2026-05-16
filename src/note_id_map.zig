@@ -13,6 +13,7 @@ pub const NoteIdMap = struct {
     next_id: NoteID,
     allocator: std.mem.Allocator,
     basedir: std.fs.Dir,
+    mutex: std.Thread.Mutex,
 
     const Self = @This();
 
@@ -23,6 +24,7 @@ pub const NoteIdMap = struct {
             .next_id = 1,
             .allocator = allocator,
             .basedir = basedir,
+            .mutex = .{},
         };
 
         self.load() catch |err| switch (err) {
@@ -43,6 +45,9 @@ pub const NoteIdMap = struct {
     }
 
     pub fn getOrCreateId(self: *Self, path: []const u8) !NoteID {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         if (self.path_to_id.get(path)) |id| {
             return id;
         }
@@ -62,14 +67,24 @@ pub const NoteIdMap = struct {
     }
 
     pub fn getId(self: *Self, path: []const u8) ?NoteID {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.path_to_id.get(path);
     }
 
     pub fn getPath(self: *Self, id: NoteID) ?[]const u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.id_to_path.get(id);
     }
 
     pub fn removePath(self: *Self, path: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.removePathLocked(path);
+    }
+
+    fn removePathLocked(self: *Self, path: []const u8) !void {
         const id = self.path_to_id.get(path) orelse return;
 
         const owned_path = self.id_to_path.get(id) orelse return;
@@ -87,6 +102,9 @@ pub const NoteIdMap = struct {
     }
 
     pub fn renamePath(self: *Self, old_path: []const u8, new_path: []const u8) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         const id = self.path_to_id.get(old_path) orelse return error.NotFound;
 
         _ = self.path_to_id.remove(old_path);
@@ -101,6 +119,8 @@ pub const NoteIdMap = struct {
     }
 
     pub fn count(self: *Self) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         return self.path_to_id.count();
     }
 
@@ -167,6 +187,9 @@ pub const NoteIdMap = struct {
     }
 
     pub fn pruneOrphanedPaths(self: *Self, basedir: std.fs.Dir) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
         var to_remove: std.ArrayList(NoteID) = .{};
         defer to_remove.deinit(self.allocator);
 
@@ -182,7 +205,7 @@ pub const NoteIdMap = struct {
 
         for (to_remove.items) |id| {
             if (self.id_to_path.get(id)) |path| {
-                try self.removePath(path);
+                try self.removePathLocked(path);
             }
         }
     }
@@ -281,6 +304,114 @@ test "renamePath preserves id" {
     try expect(map.getId("old.md") == null);
     try expectEqual(id, map.getId("new.md").?);
     try expectEqualStrings("new.md", map.getPath(id).?);
+}
+
+test "thread safety: concurrent access across full interface" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    defer map.deinit();
+
+    // Pre-populate; create real files for every other entry so pruneOrphanedPaths has work to do.
+    const pre_count = 20;
+    for (0..pre_count) |i| {
+        var buf: [32]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, "pre{d}.md", .{i});
+        _ = try map.getOrCreateId(path);
+        if (i % 2 == 0) (try tmpD.dir.createFile(path, .{})).close();
+    }
+
+    // getOrCreateId — 4 threads each insert 10 unique paths; collect IDs to assert uniqueness.
+    const creator_count = 4;
+    const creator_ops = 10;
+    var creator_ids: [creator_count * creator_ops]NoteID = undefined;
+
+    const CreatorCtx = struct { map: *NoteIdMap, ids: []NoteID, thread_idx: usize, ops: usize };
+    const creator_worker = struct {
+        fn run(ctx: CreatorCtx) void {
+            for (0..ctx.ops) |i| {
+                var buf: [32]u8 = undefined;
+                const path = std.fmt.bufPrint(&buf, "c{d}_{d}.md", .{ ctx.thread_idx, i }) catch unreachable;
+                ctx.ids[ctx.thread_idx * ctx.ops + i] = ctx.map.getOrCreateId(path) catch 0;
+            }
+        }
+    }.run;
+
+    // getId, getPath, count — read concurrently while writers mutate.
+    const ReaderCtx = struct { map: *NoteIdMap };
+    const reader_worker = struct {
+        fn run(ctx: ReaderCtx) void {
+            for (0..pre_count) |i| {
+                var buf: [32]u8 = undefined;
+                const path = std.fmt.bufPrint(&buf, "pre{d}.md", .{i}) catch unreachable;
+                if (ctx.map.getId(path)) |id| _ = ctx.map.getPath(id);
+                _ = ctx.map.count();
+            }
+        }
+    }.run;
+
+    // removePath — delete the first half of the pre-populated entries.
+    const RemoverCtx = struct { map: *NoteIdMap };
+    const remover_worker = struct {
+        fn run(ctx: RemoverCtx) void {
+            for (0..pre_count / 2) |i| {
+                var buf: [32]u8 = undefined;
+                const path = std.fmt.bufPrint(&buf, "pre{d}.md", .{i}) catch unreachable;
+                ctx.map.removePath(path) catch {};
+            }
+        }
+    }.run;
+
+    // renamePath — rename the second half of the pre-populated entries.
+    const RenamerCtx = struct { map: *NoteIdMap };
+    const renamer_worker = struct {
+        fn run(ctx: RenamerCtx) void {
+            for (pre_count / 2..pre_count) |i| {
+                var old_buf: [32]u8 = undefined;
+                var new_buf: [32]u8 = undefined;
+                const old_path = std.fmt.bufPrint(&old_buf, "pre{d}.md", .{i}) catch unreachable;
+                const new_path = std.fmt.bufPrint(&new_buf, "ren{d}.md", .{i}) catch unreachable;
+                ctx.map.renamePath(old_path, new_path) catch {};
+            }
+        }
+    }.run;
+
+    // pruneOrphanedPaths — scans and removes entries whose files are absent.
+    const PrunerCtx = struct { map: *NoteIdMap, dir: std.fs.Dir };
+    const pruner_worker = struct {
+        fn run(ctx: PrunerCtx) void {
+            ctx.map.pruneOrphanedPaths(ctx.dir) catch {};
+        }
+    }.run;
+
+    var creator_threads: [creator_count]std.Thread = undefined;
+    for (0..creator_count) |i| {
+        creator_threads[i] = try std.Thread.spawn(.{}, creator_worker, .{CreatorCtx{
+            .map = &map,
+            .ids = &creator_ids,
+            .thread_idx = i,
+            .ops = creator_ops,
+        }});
+    }
+    var t_read = try std.Thread.spawn(.{}, reader_worker, .{ReaderCtx{ .map = &map }});
+    var t_remove = try std.Thread.spawn(.{}, remover_worker, .{RemoverCtx{ .map = &map }});
+    var t_rename = try std.Thread.spawn(.{}, renamer_worker, .{RenamerCtx{ .map = &map }});
+    var t_prune = try std.Thread.spawn(.{}, pruner_worker, .{PrunerCtx{ .map = &map, .dir = tmpD.dir }});
+
+    for (&creator_threads) |*t| t.join();
+    t_read.join();
+    t_remove.join();
+    t_rename.join();
+    t_prune.join();
+
+    // All creator paths are unique so their assigned IDs must be distinct.
+    // A race on next_id causes different paths to receive the same ID.
+    for (0..creator_ids.len) |i| {
+        for (i + 1..creator_ids.len) |j| {
+            try expect(creator_ids[i] != creator_ids[j]);
+        }
+    }
 }
 
 test "pruneOrphanedPaths removes missing files" {
