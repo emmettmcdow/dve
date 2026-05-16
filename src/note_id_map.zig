@@ -59,7 +59,10 @@ pub const NoteIdMap = struct {
         errdefer self.allocator.free(path_copy);
 
         try self.path_to_id.put(path_copy, id);
+        errdefer _ = self.path_to_id.remove(path_copy);
+
         try self.id_to_path.put(id, path_copy);
+        errdefer _ = self.id_to_path.remove(id);
 
         try self.save();
 
@@ -304,6 +307,24 @@ test "renamePath preserves id" {
     try expect(map.getId("old.md") == null);
     try expectEqual(id, map.getId("new.md").?);
     try expectEqualStrings("new.md", map.getPath(id).?);
+}
+
+test "getOrCreateId does not double free when save fails" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    defer map.deinit();
+
+    // Remove write permission on the tmpdir so save() cannot create the .tmp file.
+    // path_copy is inserted into id_to_path before save() is called; the errdefer
+    // then frees it, leaving a dangling value. deinit() frees it again — double free.
+    // std.testing.allocator (GPA) will catch the second free.
+    try std.posix.fchmod(tmpD.dir.fd, 0o555);
+    defer std.posix.fchmod(tmpD.dir.fd, 0o755) catch {};
+
+    const result = map.getOrCreateId("test.md");
+    try std.testing.expectError(error.AccessDenied, result);
 }
 
 test "thread safety: concurrent access across full interface" {
