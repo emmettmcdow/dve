@@ -58,6 +58,10 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
         .tracy_enable = tracy_enable,
         .tracy_callstack = @as(u32, 62),
+        // On-demand: collect nothing until a `tracy` server connects, so the
+        // client doesn't buffer profiling data unbounded when unattached. Must
+        // match nana's tracy options exactly (see nana build.zig addTracy).
+        .tracy_on_demand = true,
     });
 
     ////////////////////
