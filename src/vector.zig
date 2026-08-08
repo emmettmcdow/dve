@@ -371,6 +371,35 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             if (!config.debug) return;
             std.debug.print("Checking similarity against '{s}':\n", .{query});
         }
+
+        /// Searches the vector database with an already-embedded query vector. Behaves like
+        /// `search`, but runs no embedding operations.
+        pub fn rawVectorSearch(self: *Self, vec: @Vector(VEC_SZ, VEC_TYPE), buf: []SearchResult) !usize {
+            const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:rawVectorSearch" });
+            defer zone.end();
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+
+            const max_results = buf.len;
+            const vec_res = try arena.allocator().alloc(VecStorage.SearchEntry, max_results);
+            const found_n = try self.vec_storage.search(
+                vec,
+                vec_res,
+                self.embedder.threshold,
+            );
+            for (0..found_n) |i| {
+                const p = self.note_id_map.getPath(vec_res[i].row.note_id) orelse continue;
+                buf[i] = SearchResult{
+                    .path = p,
+                    .start_i = vec_res[i].row.start_i,
+                    .end_i = vec_res[i].row.end_i,
+                    .similarity = vec_res[i].similarity,
+                };
+            }
+
+            std.log.info("Found {d} results searching with raw vector", .{found_n});
+            return found_n;
+        }
     };
 }
 
@@ -622,6 +651,213 @@ test "uniqueSearch returns results with similarity" {
     try std.testing.expect(buffer[2].similarity > 0);
     try std.testing.expect(buffer[0].similarity >= buffer[1].similarity);
     try std.testing.expect(buffer[1].similarity >= buffer[2].similarity);
+
+    try db.validate();
+}
+
+fn RawVec(comptime model: EmbeddingModel) type {
+    return switch (model) {
+        .apple_nlembedding => @Vector(NLEmbedder.VEC_SZ, NLEmbedder.VEC_TYPE),
+        .mpnet_embedding => @Vector(MpnetEmbedder.VEC_SZ, MpnetEmbedder.VEC_TYPE),
+    };
+}
+
+/// Embeds `text` outside of the engine, so tests can hand rawVectorSearch a query vector
+/// without the engine doing any embedding itself.
+fn rawQueryVec(
+    comptime model: EmbeddingModel,
+    e: *embed.Embedder,
+    allocator: std.mem.Allocator,
+    text: []const u8,
+) !RawVec(model) {
+    const v = (try e.embed(allocator, text)) orelse return error.TestEmbedFailed;
+    return @field(v, @tagName(model)).*;
+}
+
+test "rawVectorSearch hello" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    const te = try testEmbedder(testing_allocator);
+    defer testing_allocator.destroy(te.e);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    defer db.deinit();
+
+    const path = "test.md";
+    try db.embedText(path, "hello");
+
+    const query = try rawQueryVec(.apple_nlembedding, &db.embedder, arena.allocator(), "hello");
+    var buf: [1]SearchResult = undefined;
+    try expectEqual(1, try db.rawVectorSearch(query, &buf));
+    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+        .{ .path = path, .start_i = 0, .end_i = 5 },
+    }, buf[0..1]);
+    try expect(buf[0].similarity > 0);
+
+    try db.validate();
+}
+
+test "rawVectorSearch matches search" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    const te = try testEmbedder(testing_allocator);
+    defer testing_allocator.destroy(te.e);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    defer db.deinit();
+
+    const path = "test.md";
+    try db.embedText(path, "pizza. pizza. pizza.");
+
+    var expected: [10]SearchResult = undefined;
+    const expected_n = try db.search("pizza", &expected);
+    try expectEqual(3, expected_n);
+
+    const query = try rawQueryVec(.apple_nlembedding, &db.embedder, arena.allocator(), "pizza");
+    var actual: [10]SearchResult = undefined;
+    try expectEqual(expected_n, try db.rawVectorSearch(query, &actual));
+    try expectSearchResultsIgnoresimilarity(expected[0..expected_n], actual[0..expected_n]);
+    for (expected[0..expected_n], actual[0..expected_n]) |e, a| {
+        try expectEqual(e.similarity, a.similarity);
+    }
+
+    try db.validate();
+}
+
+test "rawVectorSearch returns results with similarity" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    const te = try testEmbedder(testing_allocator);
+    defer testing_allocator.destroy(te.e);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    defer db.deinit();
+
+    const path = "test.md";
+    try db.embedText(path, "brick. tacos. pizza.");
+    db.embedder.threshold = 0.0;
+
+    const query = try rawQueryVec(.apple_nlembedding, &db.embedder, arena.allocator(), "pizza");
+    var buffer: [10]SearchResult = undefined;
+    try expectEqual(3, try db.rawVectorSearch(query, &buffer));
+
+    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+        .{ .path = path, .start_i = 14, .end_i = 19 },
+        .{ .path = path, .start_i = 7, .end_i = 12 },
+        .{ .path = path, .start_i = 0, .end_i = 5 },
+    }, buffer[0..3]);
+
+    try expect(buffer[0].similarity > 0);
+    try expect(buffer[0].similarity >= buffer[1].similarity);
+    try expect(buffer[1].similarity >= buffer[2].similarity);
+
+    try db.validate();
+}
+
+test "rawVectorSearch no matches" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    const te = try testEmbedder(testing_allocator);
+    defer testing_allocator.destroy(te.e);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    defer db.deinit();
+
+    try db.embedText("test.md", "pizza");
+
+    // A zero vector has a zero dot product against everything, so nothing clears the threshold.
+    const query: TestVector = @splat(0.0);
+    var buffer: [10]SearchResult = undefined;
+    try expectEqual(0, try db.rawVectorSearch(query, &buffer));
+
+    try db.validate();
+}
+
+test "rawVectorSearch empty database" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    const te = try testEmbedder(testing_allocator);
+    defer testing_allocator.destroy(te.e);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    defer db.deinit();
+
+    const query = try rawQueryVec(.apple_nlembedding, &db.embedder, arena.allocator(), "pizza");
+    var buffer: [10]SearchResult = undefined;
+    try expectEqual(0, try db.rawVectorSearch(query, &buffer));
+}
+
+test "rawVectorSearch cap results" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    const te = try testEmbedder(testing_allocator);
+    defer testing_allocator.destroy(te.e);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    defer db.deinit();
+
+    for (0..5) |i| {
+        var path_buf: [16]u8 = undefined;
+        try db.embedText(try bufPrint(&path_buf, "test{d}.md", .{i}), "brick");
+    }
+
+    const query = try rawQueryVec(.apple_nlembedding, &db.embedder, arena.allocator(), "brick");
+    var buffer: [2]SearchResult = undefined;
+    try expectEqual(2, try db.rawVectorSearch(query, &buffer));
+    try expectEqual(0, try db.rawVectorSearch(query, &.{}));
+
+    try db.validate();
+}
+
+test "rawVectorSearch skips removed paths" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    const te = try testEmbedder(testing_allocator);
+    defer testing_allocator.destroy(te.e);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    defer db.deinit();
+
+    const path = "test.md";
+    try db.embedText(path, "pizza");
+
+    const query = try rawQueryVec(.apple_nlembedding, &db.embedder, arena.allocator(), "pizza");
+    var buffer: [10]SearchResult = undefined;
+    try expectEqual(1, try db.rawVectorSearch(query, &buffer));
+
+    try db.removePath(path);
+    try expectEqual(0, try db.rawVectorSearch(query, &buffer));
+
+    try db.validate();
+}
+
+test "rawVectorSearch mpnet" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    var e = try MpnetEmbedder.init(.{});
+    var db = try VectorEngine(.mpnet_embedding).init(arena.allocator(), tmpD.dir, e.embedder());
+    defer db.deinit();
+
+    const path = "test.md";
+    try db.embedText(path, "pizza. pizza. pizza.");
+
+    const query = try rawQueryVec(.mpnet_embedding, &db.embedder, arena.allocator(), "pizza");
+    var buffer: [10]SearchResult = undefined;
+    try expectEqual(3, try db.rawVectorSearch(query, &buffer));
+    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+        .{ .path = path, .start_i = 0, .end_i = 5 },
+        .{ .path = path, .start_i = 7, .end_i = 12 },
+        .{ .path = path, .start_i = 14, .end_i = 19 },
+    }, buffer[0..3]);
 
     try db.validate();
 }
