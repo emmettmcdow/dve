@@ -58,7 +58,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         ) !*Self {
             var vecs = try VecStorage.init(allocator, basedir, .{});
             try vecs.load(embedder.path);
-            const wq = try WorkQueue.init(allocator, 64);
+            const wq = try WorkQueue.init(allocator, 1024);
 
             const note_id_map = try allocator.create(NoteIdMap);
             errdefer allocator.destroy(note_id_map);
@@ -315,17 +315,29 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         // Runs asynchronously.
         pub fn embedTextAsync(self: *Self, path: []const u8, contents: []const u8) !void {
             if (path.len == 0) return Error.InvalidPath;
-            {
-                self.work_queue_mutex.lock();
-                defer self.work_queue_mutex.unlock();
-                if (!self.work_queue_running) return error.NotQueuedShuttingDown;
-            }
+
             const owned_path = try self.allocator.dupe(u8, path);
             errdefer self.allocator.free(owned_path);
-            const owned_contents = try self.allocator.alloc(u8, contents.len);
+            const owned_contents = try self.allocator.dupe(u8, contents);
             errdefer self.allocator.free(owned_contents);
-            @memcpy(owned_contents, contents);
-            try self.work_queue.push(.{ .path = owned_path, .contents = owned_contents });
+
+            // The push and the signal both have to happen under work_queue_mutex. The
+            // consumer holds that mutex from the pop that comes up empty until it waits on
+            // the condition, so a push that lands in between would not wake it.
+            self.work_queue_mutex.lock();
+            defer self.work_queue_mutex.unlock();
+            if (!self.work_queue_running) return Error.NotQueuedShuttingDown;
+
+            // Re-queuing a path replaces the job still sitting in the queue. That job's
+            // buffers are ours to free -- nothing else refers to them.
+            const displaced = try self.work_queue.push(.{
+                .path = owned_path,
+                .contents = owned_contents,
+            });
+            if (displaced) |old| {
+                self.allocator.free(old.path);
+                self.allocator.free(old.contents);
+            }
             self.work_queue_condition.signal();
         }
 
@@ -1212,6 +1224,43 @@ test "embedTextAsync drains queue on shutdown" {
     var buffer: [N]SearchResult = undefined;
     const found = try db.search("pizza", &buffer);
     try expectEqual(N, found);
+
+    try db.validate();
+}
+
+// Uses testing_allocator rather than an arena so that a job dropped without being freed
+// is reported. Re-queuing a path replaces the job already in the queue, and the replaced
+// job's path/contents belong to nobody but us.
+test "embedTextAsync frees jobs it replaces in the queue" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    const te = try testEmbedder(testing_allocator);
+    defer testing_allocator.destroy(te.e);
+    var db = try TestVecDB.init(testing_allocator, tmpD.dir, te.iface);
+    defer db.deinit();
+
+    const N = 60;
+
+    // Two passes over the same paths. The queue holds 63 and the embedder is far slower
+    // than these pushes, so the second pass lands on jobs that are still queued.
+    for (0..2) |_| {
+        for (0..N) |i| {
+            var path_buf: [16]u8 = undefined;
+            const path = bufPrint(&path_buf, "test{d}.md", .{i + 1}) catch unreachable;
+            while (true) {
+                db.embedTextAsync(path, "pizza") catch |err| switch (err) {
+                    error.Full => continue,
+                    else => return err,
+                };
+                break;
+            }
+        }
+    }
+    db.shutdown();
+
+    // A replaced job must be embedded once, not twice: N paths, one vector each.
+    var buffer: [N * 2]SearchResult = undefined;
+    try expectEqual(N, try db.search("pizza", &buffer));
 
     try db.validate();
 }

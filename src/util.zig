@@ -51,14 +51,19 @@ pub fn UniqueCircularBuffer(T: type, ID_T: type, GET_ID_FN: fn (T) ID_T) type {
         }
 
         /// Push to the back of the queue.
-        pub fn push(self: *@This(), item: T) Error!void {
+        ///
+        /// An item whose id is already queued replaces the queued one in place, keeping its
+        /// position. The replaced item is returned so the caller can release anything it
+        /// owns; dropping the return value leaks it.
+        pub fn push(self: *@This(), item: T) Error!?T {
             self.mutex.lock();
             defer self.mutex.unlock();
 
             // Check if we can update rather than add.
             if (self.id_to_idx.getEntry(GET_ID_FN(item))) |entry| {
+                const displaced = self.ring_buf[entry.value_ptr.*];
                 self.ring_buf[entry.value_ptr.*] = item;
-                return;
+                return displaced;
             }
 
             if ((self.write_i + 1) % self.N == self.read_i) {
@@ -67,6 +72,7 @@ pub fn UniqueCircularBuffer(T: type, ID_T: type, GET_ID_FN: fn (T) ID_T) type {
             self.ring_buf[self.write_i] = item;
             self.id_to_idx.putAssumeCapacity(GET_ID_FN(item), self.write_i);
             self.write_i = (self.write_i + 1) % self.N;
+            return null;
         }
     };
 }
@@ -83,14 +89,14 @@ test "UniqueCircularBuffer" {
     { // FIFO base
         var buf = try UsizeCircularBuf.init(allocator, capacity);
         defer buf.deinit();
-        for (0..capacity - 1) |i| try buf.push(i);
+        for (0..capacity - 1) |i| try expectEqual(null, try buf.push(i));
         for (0..capacity - 1) |i| try expectEqual(i, buf.pop());
     }
     { // Error Cases
         var buf = try UsizeCircularBuf.init(allocator, capacity);
         defer buf.deinit();
         try expectEqual(null, buf.pop());
-        for (0..capacity - 1) |i| try buf.push(i);
+        for (0..capacity - 1) |i| _ = try buf.push(i);
         try expectEqual(UsizeCircularBuf.Error.Full, buf.push(4));
     }
     { // Update unique.
@@ -107,19 +113,27 @@ test "UniqueCircularBuffer" {
         defer buf.deinit();
 
         const a = TestStruct{ .id = 1, .val = 1 };
-        try buf.push(a);
+        try expectEqual(null, try buf.push(a));
         const b = TestStruct{ .id = 2, .val = 2 };
-        try buf.push(b);
+        try expectEqual(null, try buf.push(b));
         const c = TestStruct{ .id = 3, .val = 3 };
-        try buf.push(c);
+        try expectEqual(null, try buf.push(c));
 
         const want = 420;
         const b_mod = TestStruct{ .id = b.id, .val = want };
-        try buf.push(b_mod);
+        // The displaced item comes back so its owner can free what it holds.
+        try expectEqualDeep(b, try buf.push(b_mod));
 
         try expectEqualDeep(a, buf.pop());
         try expectEqualDeep(b_mod, buf.pop());
         try expectEqualDeep(c, buf.pop());
+    }
+    { // A replacement does not consume a slot.
+        var buf = try UsizeCircularBuf.init(allocator, capacity);
+        defer buf.deinit();
+        for (0..capacity - 1) |i| _ = try buf.push(i);
+        try expectEqual(0, try buf.push(0));
+        try expectEqual(UsizeCircularBuf.Error.Full, buf.push(capacity));
     }
 }
 
