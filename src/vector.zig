@@ -309,6 +309,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             const owned_path = try self.allocator.dupe(u8, path);
             errdefer self.allocator.free(owned_path);
             const owned_contents = try self.allocator.alloc(u8, contents.len);
+            errdefer self.allocator.free(owned_contents);
             @memcpy(owned_contents, contents);
             try self.work_queue.push(.{ .path = owned_path, .contents = owned_contents });
             self.work_queue_condition.signal();
