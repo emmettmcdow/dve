@@ -300,6 +300,34 @@ pub fn build(b: *std.Build) !void {
         test_profile.dependOn(&run.step);
     }
 
+    ///////////////////
+    // Wikitest      //
+    ///////////////////
+    // Scaling harness that ingests and searches the Simple Wikipedia corpus.
+    // Builds only -- invoke the binary yourself, from wikitest/ so that its
+    // default corpus and database paths resolve next to download.sh:
+    //   zig build wikitest -Doptimize=ReleaseFast
+    //   (cd wikitest && ../zig-out/bin/wikitest embed --limit 1000)
+    const wikitest_step = b.step("wikitest", "Build the Wikipedia scaling harness");
+    {
+        const exe = b.addExecutable(.{
+            .name = "wikitest",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("wikitest/main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addImport("dve", dve_mod);
+        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
+
+        // Installed by this step only, so a plain `zig build` doesn't build the
+        // harness. The embedder resolves model assets relative to the
+        // executable, so the shared install step has to run too.
+        wikitest_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+        wikitest_step.dependOn(b.getInstallStep());
+    }
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(test_vec_storage);
     test_step.dependOn(test_note_id_map);
