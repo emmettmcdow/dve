@@ -230,6 +230,8 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         }
 
         fn workQueueRun(self: *@This()) !void {
+            var n_embedded: usize = 0;
+            const unflushed_limit = 100;
             while (true) {
                 self.work_queue_mutex.lock();
                 const job = while (true) {
@@ -239,6 +241,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                     }
                     if (!self.work_queue_running) {
                         self.work_queue_mutex.unlock();
+                        try self.save();
                         return;
                     }
                     self.work_queue_condition.wait(&self.work_queue_mutex);
@@ -248,6 +251,11 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 self.embedTextInternal(job.path, job.contents) catch |err| {
                     std.log.err("embedText error: {}", .{err});
                 };
+                n_embedded += 1;
+                if (n_embedded >= unflushed_limit) {
+                    n_embedded = 0;
+                    try self.save();
+                }
             }
         }
 
@@ -261,7 +269,13 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         // Runs synchronously.
         pub fn embedText(self: *Self, path: []const u8, contents: []const u8) !void {
             if (path.len == 0) return Error.InvalidPath;
-            return self.embedTextInternal(path, contents);
+            try self.embedTextInternal(path, contents);
+            return self.save();
+        }
+
+        /// Persist changes to disk.
+        pub fn save(self: *Self) !void {
+            return self.vec_storage.save(self.embedder.path);
         }
 
         fn embedTextInternal(self: *Self, path: []const u8, contents: []const u8) !void {
@@ -336,7 +350,6 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                     else => unreachable,
                 };
             }
-            try self.vec_storage.save(self.embedder.path);
         }
 
         /// Validate the vector database is in a good state.
@@ -1216,6 +1229,208 @@ test "embedTextAsync rejects after shutdown" {
     const path = "test.md";
     db.shutdown();
     try expectEqual(Error.NotQueuedShuttingDown, db.embedTextAsync(path, "pizza"));
+}
+
+/// A second engine opened over the same directory. Tests use it to assert on what actually
+/// landed on disk instead of on the in-memory state of the engine that wrote it.
+const Reopened = struct {
+    db: *TestVecDB,
+    embedder: *NLEmbedder,
+    arena: std.heap.ArenaAllocator,
+
+    fn open(dir: std.fs.Dir) !*Reopened {
+        const self = try testing_allocator.create(Reopened);
+        errdefer testing_allocator.destroy(self);
+        self.arena = std.heap.ArenaAllocator.init(testing_allocator);
+        errdefer self.arena.deinit();
+        const te = try testEmbedder(testing_allocator);
+        errdefer testing_allocator.destroy(te.e);
+        self.embedder = te.e;
+        self.db = try TestVecDB.init(self.arena.allocator(), dir, te.iface);
+        return self;
+    }
+
+    fn close(self: *Reopened) void {
+        self.db.deinit();
+        testing_allocator.destroy(self.embedder);
+        self.arena.deinit();
+        testing_allocator.destroy(self);
+    }
+};
+
+/// Like `expectSearchResultsIgnoresimilarity`, but order-independent. Results that tie on
+/// similarity come back in an arbitrary order, which these tests don't care about.
+fn expectSearchResultsUnordered(expected: []const SearchResult, actual: []const SearchResult) !void {
+    if (expected.len != actual.len) {
+        std.debug.print(
+            "slice lengths differ: expected {d}, found {d}\n",
+            .{ expected.len, actual.len },
+        );
+        return error.TestExpectedEqual;
+    }
+    var matched: [128]bool = .{false} ** 128;
+    assert(actual.len <= matched.len);
+    outer: for (expected) |e| {
+        for (actual, 0..) |a, i| {
+            if (matched[i]) continue;
+            if (std.mem.eql(u8, e.path, a.path) and e.start_i == a.start_i and e.end_i == a.end_i) {
+                matched[i] = true;
+                continue :outer;
+            }
+        }
+        std.debug.print(
+            "no result for {{ .path = {s}, .start_i = {d}, .end_i = {d} }}\n",
+            .{ e.path, e.start_i, e.end_i },
+        );
+        return error.TestExpectedEqual;
+    }
+}
+
+test "embedText persists to disk" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    const te = try testEmbedder(testing_allocator);
+    defer testing_allocator.destroy(te.e);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    defer db.deinit();
+
+    const path = "test.md";
+    try db.embedText(path, "hello");
+
+    // `db` is deliberately left open: this asserts that embedText itself flushed the vectors,
+    // not that some later teardown step did.
+    const reopened = try Reopened.open(tmpD.dir);
+    defer reopened.close();
+
+    var buf: [10]SearchResult = undefined;
+    const found = try reopened.db.search("hello", &buf);
+    try expectEqual(1, found);
+    try expectSearchResultsUnordered(&[_]SearchResult{
+        .{ .path = path, .start_i = 0, .end_i = 5 },
+    }, buf[0..found]);
+
+    try reopened.db.validate();
+}
+
+test "embedText persists multiple sentences and paths to disk" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    const te = try testEmbedder(testing_allocator);
+    defer testing_allocator.destroy(te.e);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    defer db.deinit();
+
+    try db.embedText("test1.md", "pizza. pizza. pizza.");
+    try db.embedText("test2.md", "pizza");
+
+    const reopened = try Reopened.open(tmpD.dir);
+    defer reopened.close();
+
+    var buf: [10]SearchResult = undefined;
+    const found = try reopened.db.search("pizza", &buf);
+    try expectEqual(4, found);
+    try expectSearchResultsUnordered(&[_]SearchResult{
+        .{ .path = "test1.md", .start_i = 0, .end_i = 5 },
+        .{ .path = "test1.md", .start_i = 7, .end_i = 12 },
+        .{ .path = "test1.md", .start_i = 14, .end_i = 19 },
+        .{ .path = "test2.md", .start_i = 0, .end_i = 5 },
+    }, buf[0..found]);
+
+    try reopened.db.validate();
+}
+
+test "embedText persists removals to disk" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    const te = try testEmbedder(testing_allocator);
+    defer testing_allocator.destroy(te.e);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    defer db.deinit();
+
+    const path = "test.md";
+    try db.embedText(path, "hello");
+    // Replacing the contents drops the old vector; that drop has to reach disk too.
+    try db.embedText(path, "flatiron");
+
+    const reopened = try Reopened.open(tmpD.dir);
+    defer reopened.close();
+
+    var buf: [10]SearchResult = undefined;
+    try expectEqual(0, try reopened.db.search("hello", &buf));
+    const found = try reopened.db.search("flatiron", &buf);
+    try expectEqual(1, found);
+    try expectSearchResultsUnordered(&[_]SearchResult{
+        .{ .path = path, .start_i = 0, .end_i = 8 },
+    }, buf[0..found]);
+
+    try reopened.db.validate();
+}
+
+test "embedTextAsync persists to disk after shutdown" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    const te = try testEmbedder(testing_allocator);
+    defer testing_allocator.destroy(te.e);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    defer db.deinit();
+
+    const path = "test.md";
+    try db.embedTextAsync(path, "pizza. pizza. pizza.");
+    // shutdown drains the queue, so everything queued above must be on disk once it returns.
+    db.shutdown();
+
+    const reopened = try Reopened.open(tmpD.dir);
+    defer reopened.close();
+
+    var buf: [10]SearchResult = undefined;
+    const found = try reopened.db.search("pizza", &buf);
+    try expectEqual(3, found);
+    try expectSearchResultsUnordered(&[_]SearchResult{
+        .{ .path = path, .start_i = 0, .end_i = 5 },
+        .{ .path = path, .start_i = 7, .end_i = 12 },
+        .{ .path = path, .start_i = 14, .end_i = 19 },
+    }, buf[0..found]);
+
+    try reopened.db.validate();
+}
+
+test "embedTextAsync persists every queued job after shutdown" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    const te = try testEmbedder(testing_allocator);
+    defer testing_allocator.destroy(te.e);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    defer db.deinit();
+
+    const N = 10;
+    var path_bufs: [N][16]u8 = undefined;
+    var expected: [N]SearchResult = undefined;
+    for (0..N) |i| {
+        const path = try bufPrint(&path_bufs[i], "test{d}.md", .{i});
+        try db.embedTextAsync(path, "pizza");
+        expected[i] = .{ .path = path, .start_i = 0, .end_i = 5 };
+    }
+    db.shutdown();
+
+    const reopened = try Reopened.open(tmpD.dir);
+    defer reopened.close();
+
+    var buf: [N * 2]SearchResult = undefined;
+    const found = try reopened.db.search("pizza", &buf);
+    try expectEqual(N, found);
+    try expectSearchResultsUnordered(&expected, buf[0..found]);
+
+    try reopened.db.validate();
 }
 
 test "empty inputs" {
