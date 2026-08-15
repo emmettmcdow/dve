@@ -1,4 +1,9 @@
-pub const Error = error{ MultipleRemove, OverlappingVectors, IncompatibleDatabase };
+pub const Error = error{
+    MultipleRemove,
+    OverlappingVectors,
+    IncompatibleDatabase,
+    UninitializedNoteID,
+};
 
 const LATEST_META_FORMAT_VERSION = 2;
 
@@ -509,6 +514,7 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
         /// Validates our datastructures are as we expect by:
         /// - per-note checking every range does not collide
         /// - checks every vector is L2 normalized
+        /// - checks every NoteID is initialized
         pub fn validate(self: *Self) !void {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
@@ -516,9 +522,14 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
             var note_ids_seen = std.AutoHashMap(NoteID, void).init(arena.allocator());
             for (self.index, 0..) |idx_entry, i| {
                 if (!idx_entry.occupied) continue;
+                // NoteID initialization check
+                if (self.note_ids[i] == 0) {
+                    return Error.UninitializedNoteID;
+                }
                 try note_ids_seen.put(self.note_ids[i], {});
             }
 
+            // Overlap Check
             var it = note_ids_seen.keyIterator();
             while (it.next()) |note_id_ptr| {
                 const entries = try self.vecsForNote(arena.allocator(), note_id_ptr.*);
@@ -533,6 +544,7 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
                 }
             }
 
+            // All L2 normalized
             for (self.index, 0..) |idx_entry, id| {
                 if (!idx_entry.occupied) continue;
                 try validateL2(vec_sz, vec_type, self.vectors[id]);
