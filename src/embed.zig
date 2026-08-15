@@ -1124,12 +1124,7 @@ test "embed - output is L2-normalized (mpnet)" {
     };
     for (phrases) |phrase| {
         const output = (try e.embed(arena.allocator(), phrase)) orelse return error.EmbedReturnedNull;
-        const vec = output.mpnet_embedding.*;
-        const norm = @sqrt(@reduce(.Add, vec * vec));
-        if (@abs(norm - 1.0) >= 1e-5) {
-            std.debug.print("mpnet norm for \"{s}\": {d:.8} (expected 1.0)\n", .{ phrase, norm });
-            return error.TestExpectedEqual;
-        }
+        try validateL2(MpnetEmbedder.VEC_SZ, MpnetEmbedder.VEC_TYPE, output.mpnet_embedding.*);
     }
 }
 
@@ -1150,12 +1145,7 @@ test "embed - output is L2-normalized (nlembed)" {
     };
     for (phrases) |phrase| {
         const output = (try e.embed(arena.allocator(), phrase)) orelse return error.EmbedReturnedNull;
-        const vec = output.apple_nlembedding.*;
-        const norm = @sqrt(@reduce(.Add, vec * vec));
-        if (@abs(norm - 1.0) >= 1e-5) {
-            std.debug.print("nlembed norm for \"{s}\": {d:.8} (expected 1.0)\n", .{ phrase, norm });
-            return error.TestExpectedEqual;
-        }
+        try validateL2(NLEmbedder.VEC_SZ, NLEmbedder.VEC_TYPE, output.apple_nlembedding.*);
     }
 }
 
@@ -1185,6 +1175,7 @@ const expectEqualSlices = std.testing.expectEqualSlices;
 const isAlphanumeric = std.ascii.isAlphanumeric;
 const parseFromSliceLeaky = std.json.parseFromSliceLeaky;
 const tokenizer_mod = @import("tokenizer.zig");
+const validateL2 = @import("util.zig").validateL2;
 const WordPieceTokenizer = tokenizer_mod.WordPieceTokenizer;
 const Mutex = std.Thread.Mutex;
 

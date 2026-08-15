@@ -506,7 +506,9 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
             }
         }
 
-        /// Validates that per note, there are no overlapping indices in the vectors.
+        /// Validates our datastructures are as we expect by:
+        /// - per-note checking every range does not collide
+        /// - checks every vector is L2 normalized
         pub fn validate(self: *Self) !void {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
@@ -529,6 +531,11 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
                         }
                     }
                 }
+            }
+
+            for (self.index, 0..) |idx_entry, id| {
+                if (!idx_entry.occupied) continue;
+                try validateL2(vec_sz, vec_type, self.vectors[id]);
             }
         }
     };
@@ -1239,5 +1246,6 @@ const config = @import("config");
 const tracy = @import("tracy");
 
 const types = @import("types.zig");
+const validateL2 = @import("util.zig").validateL2;
 const VectorID = types.VectorID;
 pub const NoteID = @import("note_id_map.zig").NoteID;
