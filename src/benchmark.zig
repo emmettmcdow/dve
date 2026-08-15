@@ -331,15 +331,16 @@ fn outputContains(output: []SearchResult, path: []const u8) bool {
 const Embedder = switch (embedding_model) {
     .apple_nlembedding => embed.NLEmbedder,
     .mpnet_embedding => embed.MpnetEmbedder,
+    .llama_nomic_embed_text_v1_5_f32 => embed.LlamaNomicEmbedTextV15F32,
 };
 
 fn testEmbedder(allocator: std.mem.Allocator) !struct { e: *Embedder, iface: embed.Embedder } {
     const e = try allocator.create(Embedder);
-    if (embedding_model == .mpnet_embedding) {
-        e.* = try embed.MpnetEmbedder.init(.{});
-    } else {
-        e.* = try embed.NLEmbedder.init();
-    }
+    e.* = switch (embedding_model) {
+        .mpnet_embedding => try embed.MpnetEmbedder.init(.{}),
+        .apple_nlembedding => try embed.NLEmbedder.init(),
+        .llama_nomic_embed_text_v1_5_f32 => try embed.LlamaNomicEmbedTextV15F32.init(),
+    };
     return .{ .e = e, .iface = e.embedder() };
 }
 

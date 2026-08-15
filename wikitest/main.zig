@@ -26,6 +26,7 @@ const VectorEngine = dve.VectorEngine(dve.embedding_model);
 const Embedder = switch (dve.embedding_model) {
     .apple_nlembedding => dve.embed.NLEmbedder,
     .mpnet_embedding => dve.embed.MpnetEmbedder,
+    .llama_nomic_embed_text_v1_5_f32 => dve.embed.LlamaNomicEmbedTextV15F32,
 };
 
 const MAX_ARTICLE_BYTES: usize = 64 * 1024 * 1024;
@@ -308,6 +309,7 @@ fn initEngine(allocator: std.mem.Allocator, db_dir: std.fs.Dir) !Engine {
     e.* = switch (dve.embedding_model) {
         .mpnet_embedding => try dve.embed.MpnetEmbedder.init(.{}),
         .apple_nlembedding => try dve.embed.NLEmbedder.init(),
+        .llama_nomic_embed_text_v1_5_f32 => try dve.embed.LlamaNomicEmbedTextV15F32.init(),
     };
     return .{
         .db = try VectorEngine.init(allocator, db_dir, e.embedder()),

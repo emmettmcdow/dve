@@ -3,7 +3,7 @@ pub fn build(b: *std.Build) !void {
     const embedding_model = b.option(
         EmbeddingModel,
         "embedding-model",
-        "Embedding model to use (apple_nlembedding or mpnet_embedding)",
+        "Embedding model to use",
     ) orelse .mpnet_embedding;
     const test_filter: ?[]const u8 = b.option(
         []const u8,
@@ -11,6 +11,21 @@ pub fn build(b: *std.Build) !void {
         "Filter to select specific tests",
     );
     const use_lldb = b.option(bool, "lldb", "Run tests under lldb debugger") orelse false;
+    // Root of a built llama.cpp checkout: needs include/, ggml/include/ and the
+    // shared libraries in build/bin/. Only consulted when the llama embedding
+    // model is selected.
+    const llama_root = b.option(
+        []const u8,
+        "llama-path",
+        "Path to a built llama.cpp checkout (default: $HOME/llama.cpp)",
+    ) orelse b.pathJoin(&.{ std.posix.getenv("HOME") orelse ".", "llama.cpp" });
+    // Overrides the gguf baked into src/llama_bridge.c. The DVE_LLAMA_MODEL
+    // environment variable overrides both at run time.
+    const llama_model_path = b.option(
+        []const u8,
+        "llama-model",
+        "Path to the .gguf embedding model (default: <llama-path>/build/bin/nomic-embed-text-v1.5.f32.gguf)",
+    ) orelse b.pathJoin(&.{ llama_root, "build", "bin", "nomic-embed-text-v1.5.f32.gguf" });
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -18,6 +33,7 @@ pub fn build(b: *std.Build) !void {
     const real_vec_sz: usize = switch (embedding_model) {
         .apple_nlembedding => 512,
         .mpnet_embedding => 768,
+        .llama_nomic_embed_text_v1_5_f32 => 768,
     };
 
     ///////////////////////
@@ -106,27 +122,18 @@ pub fn build(b: *std.Build) !void {
         }
     }.run;
 
-    // Helper to wire up ObjC + tracy imports and framework/lib links for a test.
-    const addDeps = struct {
-        fn real(
-            t: *std.Build.Step.Compile,
-            cfg: *std.Build.Step.Options,
-            objc: *std.Build.Dependency,
-            tr: *std.Build.Dependency,
-            tr_enable: bool,
-        ) void {
-            t.root_module.addOptions("config", cfg);
-            t.root_module.addImport("objc", objc.module("objc"));
-            t.root_module.addImport("tracy", tr.module("tracy"));
-            t.root_module.linkFramework("NaturalLanguage", .{});
-            t.root_module.linkFramework("CoreML", .{});
-            t.root_module.linkFramework("Foundation", .{});
-            if (tr_enable) {
-                t.root_module.linkLibrary(tr.artifact("tracy"));
-                t.root_module.link_libcpp = true;
-            }
-        }
-    }.real;
+    // Wires up ObjC + tracy imports, framework/lib links, and -- when the llama
+    // embedding model is selected -- the llama.cpp C bridge.
+    const deps = Deps{
+        .b = b,
+        .cfg = real_options,
+        .objc = objc_dep,
+        .tracy = tracy_dep,
+        .tracy_enable = tracy_enable,
+        .llama = embedding_model == .llama_nomic_embed_text_v1_5_f32,
+        .llama_root = llama_root,
+        .llama_model_path = llama_model_path,
+    };
 
     // vec_storage and note_id_map tests use fake config + tracy only (no ObjC).
     const test_vec_storage = b.step("test-vec_storage", "run tests for src/vec_storage.zig");
@@ -204,7 +211,7 @@ pub fn build(b: *std.Build) !void {
             }),
             .filters = if (test_filter != null) filters else &.{},
         });
-        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        deps.add(t);
         const install_models = b.addInstallDirectory(.{
             .source_dir = mpnet_model_path,
             .install_dir = .{ .custom = "share" },
@@ -230,7 +237,7 @@ pub fn build(b: *std.Build) !void {
             }),
             .filters = if (test_filter != null) filters else &.{},
         });
-        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        deps.add(t);
         const install_models = b.addInstallDirectory(.{
             .source_dir = mpnet_model_path,
             .install_dir = .{ .custom = "share" },
@@ -257,7 +264,7 @@ pub fn build(b: *std.Build) !void {
             .filters = if (test_filter != null) filters else &.{},
         });
         t.root_module.addImport("dve", dve_mod);
-        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        deps.add(t);
         const install_models = b.addInstallDirectory(.{
             .source_dir = mpnet_model_path,
             .install_dir = .{ .custom = "share" },
@@ -284,7 +291,7 @@ pub fn build(b: *std.Build) !void {
             .filters = if (test_filter != null) filters else &.{},
         });
         t.root_module.addImport("dve", dve_mod);
-        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        deps.add(t);
         const install_models = b.addInstallDirectory(.{
             .source_dir = mpnet_model_path,
             .install_dir = .{ .custom = "share" },
@@ -319,7 +326,7 @@ pub fn build(b: *std.Build) !void {
             }),
         });
         exe.root_module.addImport("dve", dve_mod);
-        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
+        deps.add(exe);
 
         // Installed by this step only, so a plain `zig build` doesn't build the
         // harness. The embedder resolves model assets relative to the
@@ -442,6 +449,64 @@ pub fn build(b: *std.Build) !void {
 const EmbeddingModel = enum {
     apple_nlembedding,
     mpnet_embedding,
+    llama_nomic_embed_text_v1_5_f32,
+};
+
+/// The imports and links every artifact built against the real config needs.
+const Deps = struct {
+    b: *std.Build,
+    cfg: *Step.Options,
+    objc: *std.Build.Dependency,
+    tracy: *std.Build.Dependency,
+    tracy_enable: bool,
+    llama: bool,
+    llama_root: []const u8,
+    llama_model_path: []const u8,
+
+    fn add(self: Deps, t: *Step.Compile) void {
+        t.root_module.addOptions("config", self.cfg);
+        t.root_module.addImport("objc", self.objc.module("objc"));
+        t.root_module.addImport("tracy", self.tracy.module("tracy"));
+        t.root_module.linkFramework("NaturalLanguage", .{});
+        t.root_module.linkFramework("CoreML", .{});
+        t.root_module.linkFramework("Foundation", .{});
+        if (self.tracy_enable) {
+            t.root_module.linkLibrary(self.tracy.artifact("tracy"));
+            t.root_module.link_libcpp = true;
+        }
+        if (self.llama) self.addLlama(t);
+    }
+
+    /// Compiles src/llama_bridge.c into `t` and links it against a prebuilt
+    /// llama.cpp. src/llama.zig only references the bridge when the llama model
+    /// is selected, so this is skipped entirely for the other models and
+    /// llama.cpp does not need to be present to build them.
+    fn addLlama(self: Deps, t: *Step.Compile) void {
+        const b = self.b;
+        const lib_dir = b.pathJoin(&.{ self.llama_root, "build", "bin" });
+        t.root_module.addCSourceFile(.{
+            .file = b.path("src/llama_bridge.c"),
+            .flags = &.{
+                "-std=c11",
+                "-Wall",
+                "-Wextra",
+                b.fmt("-DDVE_LLAMA_MODEL_PATH=\"{s}\"", .{self.llama_model_path}),
+            },
+        });
+        t.root_module.addIncludePath(b.path("src"));
+        t.root_module.addIncludePath(.{
+            .cwd_relative = b.pathJoin(&.{ self.llama_root, "include" }),
+        });
+        t.root_module.addIncludePath(.{
+            .cwd_relative = b.pathJoin(&.{ self.llama_root, "ggml", "include" }),
+        });
+        t.root_module.addLibraryPath(.{ .cwd_relative = lib_dir });
+        // libllama.dylib and the libggml-*.dylib it pulls in stay wherever cmake
+        // left them, so bake that lookup path into the binary.
+        t.root_module.addRPath(.{ .cwd_relative = lib_dir });
+        t.root_module.linkSystemLibrary("llama", .{});
+        t.root_module.link_libc = true;
+    }
 };
 
 const std = @import("std");

@@ -19,10 +19,12 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
     const VEC_SZ = switch (embedding_model) {
         .apple_nlembedding => NLEmbedder.VEC_SZ,
         .mpnet_embedding => MpnetEmbedder.VEC_SZ,
+        .llama_nomic_embed_text_v1_5_f32 => LlamaNomicEmbedTextV15F32.VEC_SZ,
     };
     const VEC_TYPE = switch (embedding_model) {
         .apple_nlembedding => NLEmbedder.VEC_TYPE,
         .mpnet_embedding => MpnetEmbedder.VEC_TYPE,
+        .llama_nomic_embed_text_v1_5_f32 => LlamaNomicEmbedTextV15F32.VEC_TYPE,
     };
 
     const EmbedJob = struct {
@@ -685,6 +687,10 @@ fn RawVec(comptime model: EmbeddingModel) type {
     return switch (model) {
         .apple_nlembedding => @Vector(NLEmbedder.VEC_SZ, NLEmbedder.VEC_TYPE),
         .mpnet_embedding => @Vector(MpnetEmbedder.VEC_SZ, MpnetEmbedder.VEC_TYPE),
+        .llama_nomic_embed_text_v1_5_f32 => @Vector(
+            LlamaNomicEmbedTextV15F32.VEC_SZ,
+            LlamaNomicEmbedTextV15F32.VEC_TYPE,
+        ),
     };
 }
 
@@ -1545,6 +1551,7 @@ const NoteIdMap = note_id_map_mod.NoteIdMap;
 
 const NLEmbedder = embed.NLEmbedder;
 const MpnetEmbedder = embed.MpnetEmbedder;
+const LlamaNomicEmbedTextV15F32 = embed.LlamaNomicEmbedTextV15F32;
 const spawn = Thread.spawn;
 const Thread = std.Thread;
 const types = @import("types.zig");
