@@ -76,14 +76,6 @@ pub fn UniqueCircularBuffer(T: type, ID_T: type, GET_ID_FN: fn (T) ID_T) type {
         }
     };
 }
-pub const ValidationError = error{NotL2};
-pub fn validateL2(comptime N: usize, comptime T: type, v: @Vector(N, T)) ValidationError!void {
-    const norm = @sqrt(@reduce(.Add, v * v));
-    if (@abs(norm - 1.0) >= 1e-5) {
-        std.debug.print("norm: {d:.8} (expected ~1.0)\n", .{norm});
-        return ValidationError.NotL2;
-    }
-}
 
 fn usizeID(a: usize) usize {
     return a;

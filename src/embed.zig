@@ -84,7 +84,9 @@ pub const MpnetEmbedder = struct {
     pub const REFERENCE_IMPLEMENTATION_NAME = "sentence-transformers/all-mpnet-base-v2";
     pub const THRESHOLD = 0.36;
     pub const STRICT_THRESHOLD = THRESHOLD + 0.1;
-    pub const PATH = @tagName(ID) ++ ".db";
+    // Suffixed by storage type: a quantized database is not loadable by an unquantized
+    // build, so the two live side by side rather than one refusing the other's file.
+    pub const PATH = @tagName(ID) ++ db_suffix ++ ".db";
     pub const MODEL_PATH = "share/all_mpnet_base_v2.mlpackage";
     pub const TOKENIZER_PATH = "share/tokenizer.json";
     pub const BUNDLE_MODEL_PATH = "all_mpnet_base_v2.mlmodelc";
@@ -529,7 +531,9 @@ pub const NLEmbedder = struct {
     pub const REFERENCE_IMPLEMENTATION_NAME = "apple-nlembedding";
     pub const THRESHOLD = 0.40;
     pub const STRICT_THRESHOLD = THRESHOLD * 2;
-    pub const PATH = @tagName(ID) ++ ".db";
+    // Suffixed by storage type: a quantized database is not loadable by an unquantized
+    // build, so the two live side by side rather than one refusing the other's file.
+    pub const PATH = @tagName(ID) ++ db_suffix ++ ".db";
 
     pub fn init() !NLEmbedder {
         const init_zone = tracy.beginZone(@src(), .{ .name = "embed.zig:init" });
@@ -1175,7 +1179,8 @@ const expectEqualSlices = std.testing.expectEqualSlices;
 const isAlphanumeric = std.ascii.isAlphanumeric;
 const parseFromSliceLeaky = std.json.parseFromSliceLeaky;
 const tokenizer_mod = @import("tokenizer.zig");
-const validateL2 = @import("util.zig").validateL2;
+const db_suffix = @import("vec_util.zig").db_suffix;
+const validateL2 = @import("vec_util.zig").validateL2;
 const WordPieceTokenizer = tokenizer_mod.WordPieceTokenizer;
 const Mutex = std.Thread.Mutex;
 

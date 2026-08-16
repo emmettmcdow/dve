@@ -11,6 +11,11 @@ pub fn build(b: *std.Build) !void {
         "Filter to select specific tests",
     );
     const use_lldb = b.option(bool, "lldb", "Run tests under lldb debugger") orelse false;
+    const quant = b.option(
+        StorageQuantize,
+        "storage-quantize",
+        "Whether to quantize vectors before storage (none, f_16 or i_8)",
+    ) orelse .none;
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -71,12 +76,14 @@ pub fn build(b: *std.Build) !void {
     real_options.addOption(usize, "vec_sz", real_vec_sz);
     real_options.addOption(bool, "debug", debug);
     real_options.addOption(EmbeddingModel, "embedding_model", embedding_model);
+    real_options.addOption(StorageQuantize, "quant", quant);
 
     // Fake config used for storage/util tests that don't need real embeddings.
     const fake_options = b.addOptions();
     fake_options.addOption(usize, "vec_sz", @as(usize, 3));
     fake_options.addOption(bool, "debug", debug);
     fake_options.addOption(EmbeddingModel, "embedding_model", EmbeddingModel.apple_nlembedding);
+    fake_options.addOption(StorageQuantize, "quant", .none);
 
     ////////////////////
     // Public Module  //
@@ -352,6 +359,9 @@ pub fn build(b: *std.Build) !void {
         mpnet_options.addOption(usize, "vec_sz", @as(usize, 768));
         mpnet_options.addOption(bool, "debug", false);
         mpnet_options.addOption(EmbeddingModel, "embedding_model", EmbeddingModel.mpnet_embedding);
+        // Pinned like the other options above: the shipped framework's storage format does
+        // not follow -Dstorage-quantize.
+        mpnet_options.addOption(StorageQuantize, "quant", StorageQuantize.none);
 
         // Tracy must always be disabled in the xcframework. When tracy_enable=true
         // Tracy starts C++ background threads (via global constructors) that
@@ -443,6 +453,7 @@ const EmbeddingModel = enum {
     apple_nlembedding,
     mpnet_embedding,
 };
+const StorageQuantize = enum { none, f_16, i_8 };
 
 const std = @import("std");
 const Step = std.Build.Step;

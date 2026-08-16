@@ -1,5 +1,9 @@
 pub const NoteID = u64;
-const MANIFEST_FILENAME = ".dve_ids";
+// Suffixed by storage type alongside the vector database it belongs to. The note ids in
+// here index that database specifically, so sharing one manifest between an unquantized
+// and a quantized build would let `pruneOrphanedPaths` drop paths that only the other
+// build still has vectors for.
+const MANIFEST_FILENAME = ".dve_ids" ++ db_suffix;
 const MANIFEST_VERSION: u32 = 1;
 
 pub const Error = error{
@@ -456,6 +460,7 @@ test "pruneOrphanedPaths removes missing files" {
     try expect(map.getId("missing.md") == null);
 }
 
+const db_suffix = @import("vec_util.zig").db_suffix;
 const std = @import("std");
 const tracy = @import("tracy");
 

@@ -60,9 +60,10 @@ pub inline fn writeVec(N: usize, T: type, w: *FileWriter, v: @Vector(N, T), endi
     defer zone.end();
 
     const native_endian = @import("builtin").cpu.arch.endian();
-    var buf: [N]u32 = undefined;
+    const Stored = BinaryTypeRepresentation.to_binary(T).stored_as();
+    var buf: [N]Stored = undefined;
     for (0..N) |i| {
-        const as_int: u32 = @bitCast(v[i]);
+        const as_int: Stored = @bitCast(v[i]);
         buf[i] = if (endian != native_endian)
             @byteSwap(as_int)
         else
@@ -73,14 +74,19 @@ pub inline fn writeVec(N: usize, T: type, w: *FileWriter, v: @Vector(N, T), endi
 }
 
 // **************************************************************************************** Storage
+// The tag values land in StorageMetadata on disk, so new types append to the end.
 pub const BinaryTypeRepresentation = enum(u8) {
     float32,
     uint8,
+    float16,
+    int8,
 
     pub inline fn to_type(self: BinaryTypeRepresentation) type {
         switch (self) {
             .float32 => return f32,
             .uint8 => return u8,
+            .float16 => return f16,
+            .int8 => return i8,
         }
     }
 
@@ -88,7 +94,9 @@ pub const BinaryTypeRepresentation = enum(u8) {
         switch (T) {
             f32 => return .float32,
             u8 => return .uint8,
-            else => undefined,
+            f16 => return .float16,
+            i8 => return .int8,
+            else => @compileError("no binary representation for " ++ @typeName(T)),
         }
     }
 
@@ -96,6 +104,8 @@ pub const BinaryTypeRepresentation = enum(u8) {
         switch (self) {
             .float32 => return u32,
             .uint8 => return u8,
+            .float16 => return u16,
+            .int8 => return u8,
         }
     }
 };
@@ -134,9 +144,11 @@ pub const StorageMetadata = packed struct {
 // |___|___|___||___|___|___||___|___|____||___|___|____||___|___|__|
 
 pub fn Storage(vec_sz: usize, vec_type: type) type {
-    const Vector = @Vector(vec_sz, vec_type);
-
     return struct {
+        /// The element type varies with the build's quantization setting, so callers that
+        /// hold vectors of their own should name this rather than assume f32.
+        pub const Vector = @Vector(vec_sz, vec_type);
+
         pub const VectorRow = struct {
             note_id: NoteID,
             start_i: usize,
@@ -265,7 +277,9 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
 
             const entry = struct {
                 id: VectorID,
-                sim: vec_type,
+                // f32 regardless of vec_type: storedDot reports similarity in the units of
+                // the original embeddings, which is also what SearchEntry carries.
+                sim: f32,
 
                 const InnerSelf = @This();
 
@@ -278,7 +292,7 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
 
             for (self.index, 0..) |idx_entry, id| {
                 if (!idx_entry.occupied) continue;
-                const raw_similar = dot(vec_sz, vec_type, self.vectors[id], query);
+                const raw_similar = storedDot(vec_sz, vec_type, self.vectors[id], query);
                 if (raw_similar > threshold) {
                     try pq.add(.{ .id = id, .sim = raw_similar });
                 }
@@ -296,7 +310,7 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
             return i;
         }
 
-        fn debugSearchSimilar(vecID: VectorID, similar: vec_type) void {
+        fn debugSearchSimilar(vecID: VectorID, similar: f32) void {
             if (!config.debug) return;
             std.debug.print("    ID({d}) similarity: {d}\n", .{ vecID, similar });
         }
@@ -1258,6 +1272,7 @@ const config = @import("config");
 const tracy = @import("tracy");
 
 const types = @import("types.zig");
-const validateL2 = @import("util.zig").validateL2;
+const storedDot = @import("vec_util.zig").storedDot;
+const validateL2 = @import("vec_util.zig").validateL2;
 const VectorID = types.VectorID;
 pub const NoteID = @import("note_id_map.zig").NoteID;

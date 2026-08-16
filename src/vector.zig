@@ -34,9 +34,35 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         }
     };
 
+    // Quantization narrows the element type of a vector, not its length, so only the
+    // element type varies with `config.quant`.
+    const STORED_VEC_TYPE = switch (config.quant) {
+        .none => VEC_TYPE,
+        .f_16 => f16,
+        .i_8 => i8,
+    };
+    const RawVector = @Vector(VEC_SZ, VEC_TYPE);
+    const StoredVector = @Vector(VEC_SZ, STORED_VEC_TYPE);
+    // Array rather than @Vector for anything held in a collection: a @Vector(768, f32) is
+    // padded to 4096 bytes and aligned to 4096, so inlining one into a struct costs 8KB an
+    // entry. The array form is the bare 3072 bytes, and coerces to StoredVector on use.
+    const StoredArray = [VEC_SZ]STORED_VEC_TYPE;
+
     return struct {
         const Self = @This();
-        pub const VecStorage = vec_storage.Storage(VEC_SZ, VEC_TYPE);
+        pub const VecStorage = vec_storage.Storage(VEC_SZ, STORED_VEC_TYPE);
+        pub const quant = config.quant;
+
+        /// Converts a vector as the embedder produced it into the form VecStorage holds.
+        /// The switch is on a comptime config value, so only the configured prong is
+        /// analyzed -- a `.none` build never reaches the quantizer.
+        fn toStored(v: RawVector) StoredVector {
+            return switch (config.quant) {
+                .none => v,
+                .f_16 => quant32to16(VEC_SZ, v),
+                .i_8 => quant32toi8(VEC_SZ, v),
+            };
+        }
 
         const WorkQueue = UniqueCircularBuffer(EmbedJob, u64, EmbedJob.id);
 
@@ -116,7 +142,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             const query_vec_union = (try self.embedder.embed(arena.allocator(), query)) orelse {
                 return 0;
             };
-            const query_vec = @field(query_vec_union, @tagName(embedding_model)).*;
+            const query_vec = toStored(@field(query_vec_union, @tagName(embedding_model)).*);
             const vec_res = try arena.allocator().alloc(VecStorage.SearchEntry, max_results);
 
             debugSearchHeader(query);
@@ -152,7 +178,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             if (query.len == 0) return 0;
 
             const query_vec_union = (try self.embedder.embed(arena.allocator(), query)) orelse return 0;
-            const query_vec = @field(query_vec_union, @tagName(embedding_model)).*;
+            const query_vec = toStored(@field(query_vec_union, @tagName(embedding_model)).*);
 
             debugSearchHeader(query);
             var search_results: [1000]VecStorage.SearchEntry = undefined;
@@ -260,7 +286,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         }
 
         const EmbeddedSentence = struct {
-            vec: ?*const [VEC_SZ]VEC_TYPE,
+            vec: *const StoredArray,
             start_i: usize,
             end_i: usize,
         };
@@ -290,19 +316,30 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             errdefer embedded_sentence_list.deinit(allocator);
             var spliterator = embed.SentenceSpliterator.init(contents);
             while (spliterator.next()) |sentence| {
-                const vec: ?*const [VEC_SZ]VEC_TYPE =
+                const vec: ?*const RawVector =
                     if (whitespaceOnly(sentence.contents) or !wordlike(sentence.contents))
                         null
                     else if (try self.embedder.embed(allocator, sentence.contents)) |v|
                         @field(v, @tagName(embedding_model))
                     else
                         null;
-
-                try embedded_sentence_list.append(allocator, .{
-                    .vec = vec,
-                    .start_i = sentence.start_i,
-                    .end_i = sentence.end_i,
-                });
+                if (vec) |raw_vec| {
+                    // Unquantized, the embedder's own arena buffer is already the storage
+                    // form, so it is borrowed as-is. Quantizing needs somewhere to put the
+                    // narrowed copy; the arena outlives replaceVectors below.
+                    const stored: *const StoredArray = if (config.quant == .none)
+                        @ptrCast(raw_vec)
+                    else stored: {
+                        const narrowed = try allocator.create(StoredArray);
+                        narrowed.* = toStored(raw_vec.*);
+                        break :stored narrowed;
+                    };
+                    try embedded_sentence_list.append(allocator, .{
+                        .vec = stored,
+                        .start_i = sentence.start_i,
+                        .end_i = sentence.end_i,
+                    });
+                }
             }
             const embedded_sentences = try embedded_sentence_list.toOwnedSlice(allocator);
             const note_id = try self.note_id_map.getOrCreateId(path);
@@ -351,9 +388,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             defer allocator.free(old_vecs);
 
             for (embedded_sentences) |sentence| {
-                if (sentence.vec) |v| {
-                    _ = try self.vec_storage.put(note_id, sentence.start_i, sentence.end_i, v.*);
-                }
+                _ = try self.vec_storage.put(note_id, sentence.start_i, sentence.end_i, sentence.vec.*);
             }
 
             for (old_vecs) |old_v| {
@@ -400,11 +435,13 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
 
         /// Searches the vector database with an already-embedded query vector. Behaves like
         /// `search`, but runs no embedding operations.
-        pub fn rawVectorSearch(self: *Self, vec: @Vector(VEC_SZ, VEC_TYPE), buf: []SearchResult) !usize {
+        pub fn rawVectorSearch(self: *Self, raw_vec: RawVector, buf: []SearchResult) !usize {
             const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:rawVectorSearch" });
             defer zone.end();
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
+
+            const vec = toStored(raw_vec);
 
             const max_results = buf.len;
             const vec_res = try arena.allocator().alloc(VecStorage.SearchEntry, max_results);
@@ -471,7 +508,9 @@ fn wordlike(contents: []const u8) bool {
 }
 
 const TestVecDB = VectorEngine(.apple_nlembedding);
-const TestVector = @Vector(NLEmbedder.VEC_SZ, NLEmbedder.VEC_TYPE);
+// Follows the build's quantization setting -- tests that read vectors back out of storage
+// get them in whatever type they were stored as, not necessarily the embedder's f32.
+const TestVector = TestVecDB.VecStorage.Vector;
 fn getVectorsForPath(db: *TestVecDB, path: []const u8, buf: []TestVector) !usize {
     const note_id = db.note_id_map.getId(path) orelse return 0;
     const vec_rows = try db.vec_storage.vecsForNote(testing_allocator, note_id);
@@ -1545,6 +1584,8 @@ const NoteIdMap = note_id_map_mod.NoteIdMap;
 
 const NLEmbedder = embed.NLEmbedder;
 const MpnetEmbedder = embed.MpnetEmbedder;
+const quant32to16 = @import("vec_util.zig").quant32to16;
+const quant32toi8 = @import("vec_util.zig").quant32toi8;
 const spawn = Thread.spawn;
 const Thread = std.Thread;
 const types = @import("types.zig");
