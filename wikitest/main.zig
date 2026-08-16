@@ -166,8 +166,8 @@ fn runEmbed(allocator: std.mem.Allocator, opts: Options) !void {
             interval_start_vecs = db.vec_storage.vec_n;
         }
     }
-    db.shutdown();
     std.debug.print("Waiting for background embedder to complete...\n", .{});
+    db.shutdown();
 
     const elapsed = total_timer.read();
     std.debug.print(

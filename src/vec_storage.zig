@@ -44,14 +44,20 @@ pub inline fn readSlice(
 }
 
 pub inline fn readVec(N: usize, T: type, v: *@Vector(N, T), r: *FileReader, endian: std.builtin.Endian) !void {
+    const native_endian = @import("builtin").cpu.arch.endian();
     const Stored = BinaryTypeRepresentation.to_binary(T).stored_as();
-    for (0..N) |j| {
-        var bytes: [@sizeOf(Stored)]u8 = undefined;
-        r.interface.readSliceAll(&bytes) catch |err| {
-            std.log.err("Error: {}\n", .{err});
-            return err;
-        };
-        v[j] = @as(T, @bitCast(std.mem.readInt(Stored, &bytes, endian)));
+
+    // Read the whole vector in one go, straight into v. A @Vector can carry trailing padding
+    // (@Vector(3, f32) is 16 bytes, not 12), so cast to the exact on-disk footprint instead of
+    // std.mem.asBytes(v), which would over-read into that padding.
+    const bytes: *[N * @sizeOf(Stored)]u8 = @ptrCast(v);
+    try r.interface.readSliceAll(bytes);
+
+    // Only files written on the opposite-endian machine need fixing up, and that pass runs over
+    // memory that is already hot.
+    if (endian != native_endian) {
+        const words: *[N]Stored = @ptrCast(v);
+        for (words) |*word| word.* = @byteSwap(word.*);
     }
 }
 
@@ -113,8 +119,9 @@ pub const BinaryTypeRepresentation = enum(u8) {
 /// This is the metadata we need to determine what the binary format of the rest of the file looks
 /// like. Nothing dynamic should be in here. Only fixed-size data.
 pub const StorageMetadata = packed struct {
-    /// Big if true
-    endian: bool = true,
+    /// Big if true. Defaults to the writing machine's endianness so save/load are plain memcpys;
+    /// the flag stays on disk so a file moved across architectures is still readable.
+    endian: bool = @import("builtin").cpu.arch.endian() == .big,
     /// This defines what version of the storage metadata to use
     fmt_v: u8,
     /// Dimensionality
@@ -353,6 +360,9 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
             return;
         }
 
+        // TODO: All this mixing and matching of read-meta vs initialized meta is hella weird and
+        // unnecessary. We should refactor some of this to be less confusing.
+        // TODO: vec_sz and vec_type should be capitalized, per convention
         pub fn load(self: *Self, path: []const u8) !void {
             var f = self.dir.openFile(path, .{ .mode = .read_only }) catch |err| switch (err) {
                 std.fs.File.OpenError.FileNotFound => return,

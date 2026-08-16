@@ -11,3 +11,10 @@ wikipedia.
 - `rawmw/*.wiki` - every page contained in `simplewiki*.xml` split into individual files per-page. 
 - `md/*.md` - every page from `rawmw/*.wiki` converted to markdown (best effort). This is the main
 thing we will be using in our tests.
+
+## ETC
+If you are profiling this application, make sure to run the following command to generate a
+`.dSYM`:
+```bash
+dsymutil zig-out/bin/wikitest
+```
