@@ -20,26 +20,12 @@ pub fn build(b: *std.Build) void {
         }),
     });
     exe.root_module.addImport("dve", dve_module);
-    exe.root_module.linkFramework("NaturalLanguage", .{});
-    exe.root_module.linkFramework("CoreML", .{});
-    exe.root_module.linkFramework("Foundation", .{});
 
     b.installArtifact(exe);
 
     // Install mpnet model files into this project's zig-out/share/,
     // where the exe will find them at their default relative paths.
-    const coreml_models = dve_dep.builder.dependency("coreml_models", .{});
-    const install_model = b.addInstallDirectory(.{
-        .source_dir = coreml_models.path("all_mpnet_base_v2/all_mpnet_base_v2.mlpackage"),
-        .install_dir = .{ .custom = "share" },
-        .install_subdir = "all_mpnet_base_v2.mlpackage",
-    });
-    const install_tokenizer = b.addInstallFile(
-        coreml_models.path("all_mpnet_base_v2/tokenizer.json"),
-        "share/tokenizer.json",
-    );
-    b.getInstallStep().dependOn(&install_model.step);
-    b.getInstallStep().dependOn(&install_tokenizer.step);
+    @import("dve").installModels(b, dve_dep);
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());

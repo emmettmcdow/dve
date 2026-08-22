@@ -32,18 +32,10 @@ const dve_dep = b.dependency("dve", .{
     // .@"embedding-model" = .apple_nlembedding, // lighter, no model download
 });
 const dve_module = dve_dep.module("dve");
-
 exe.root_module.addImport("dve", dve_module);
-
-// Link required Apple frameworks
-exe.root_module.linkFramework("NaturalLanguage", .{});
-exe.root_module.linkFramework("CoreML", .{});
-exe.root_module.linkFramework("Foundation", .{});
-
-b.installArtifact(exe);
-
 // Install model files into your project's zig-out/share/ so the exe can find them.
-b.getInstallStep().dependOn(dve_dep.builder.getInstallStep());
+// Not needed with .apple_nlembedding.
+@import("dve").installModels(b, dve_dep);
 ```
 
 ### Usage

@@ -34,20 +34,11 @@ pub fn build(b: *std.Build) !void {
 
     // When mpnet is selected, install the runtime assets (model + tokenizer)
     // to zig-out/share/ so the exe can find them at their default relative paths.
-    // Consumers wire in these assets with one line:
-    //   b.getInstallStep().dependOn(dve_dep.builder.getInstallStep());
+    // This covers dve's own builds only -- a dependency's install steps write to
+    // the dependency's private prefix, not the consumer's. Consumers call
+    // `installModels` below instead.
     if (embedding_model == .mpnet_embedding) {
-        const install_model = b.addInstallDirectory(.{
-            .source_dir = mpnet_model_path,
-            .install_dir = .{ .custom = "share" },
-            .install_subdir = "all_mpnet_base_v2.mlpackage",
-        });
-        const install_tokenizer = b.addInstallFile(
-            mpnet_tokenizer_path,
-            "share/tokenizer.json",
-        );
-        b.getInstallStep().dependOn(&install_model.step);
-        b.getInstallStep().dependOn(&install_tokenizer.step);
+        for (addModelInstalls(b, coreml_models)) |s| b.getInstallStep().dependOn(s);
     }
 
     ////////////////////
@@ -96,6 +87,11 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "tracy", .module = tracy_dep.module("tracy") },
         },
     });
+    // Carried on the module itself so consumers don't link these by hand: a
+    // Compile step inherits frameworks from every module in its import graph.
+    dve_mod.linkFramework("NaturalLanguage", .{});
+    dve_mod.linkFramework("CoreML", .{});
+    dve_mod.linkFramework("Foundation", .{});
     ////////////////
     // Unit Tests //
     ////////////////
@@ -212,18 +208,8 @@ pub fn build(b: *std.Build) !void {
             .filters = if (test_filter != null) filters else &.{},
         });
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
-        const install_models = b.addInstallDirectory(.{
-            .source_dir = mpnet_model_path,
-            .install_dir = .{ .custom = "share" },
-            .install_subdir = "all_mpnet_base_v2.mlpackage",
-        });
-        const install_tokenizer = b.addInstallFile(
-            mpnet_tokenizer_path,
-            "share/tokenizer.json",
-        );
         const run = runTest(b, t, use_lldb);
-        run.step.dependOn(&install_models.step);
-        run.step.dependOn(&install_tokenizer.step);
+        for (addModelInstalls(b, coreml_models)) |s| run.step.dependOn(s);
         test_embed.dependOn(&run.step);
     }
 
@@ -238,18 +224,8 @@ pub fn build(b: *std.Build) !void {
             .filters = if (test_filter != null) filters else &.{},
         });
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
-        const install_models = b.addInstallDirectory(.{
-            .source_dir = mpnet_model_path,
-            .install_dir = .{ .custom = "share" },
-            .install_subdir = "all_mpnet_base_v2.mlpackage",
-        });
-        const install_tokenizer = b.addInstallFile(
-            mpnet_tokenizer_path,
-            "share/tokenizer.json",
-        );
         const run = runTest(b, t, use_lldb);
-        run.step.dependOn(&install_models.step);
-        run.step.dependOn(&install_tokenizer.step);
+        for (addModelInstalls(b, coreml_models)) |s| run.step.dependOn(s);
         test_vector.dependOn(&run.step);
     }
 
@@ -265,18 +241,8 @@ pub fn build(b: *std.Build) !void {
         });
         t.root_module.addImport("dve", dve_mod);
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
-        const install_models = b.addInstallDirectory(.{
-            .source_dir = mpnet_model_path,
-            .install_dir = .{ .custom = "share" },
-            .install_subdir = "all_mpnet_base_v2.mlpackage",
-        });
-        const install_tokenizer = b.addInstallFile(
-            mpnet_tokenizer_path,
-            "share/tokenizer.json",
-        );
         const run = runTest(b, t, use_lldb);
-        run.step.dependOn(&install_models.step);
-        run.step.dependOn(&install_tokenizer.step);
+        for (addModelInstalls(b, coreml_models)) |s| run.step.dependOn(s);
         test_benchmark.dependOn(&run.step);
     }
 
@@ -292,18 +258,8 @@ pub fn build(b: *std.Build) !void {
         });
         t.root_module.addImport("dve", dve_mod);
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
-        const install_models = b.addInstallDirectory(.{
-            .source_dir = mpnet_model_path,
-            .install_dir = .{ .custom = "share" },
-            .install_subdir = "all_mpnet_base_v2.mlpackage",
-        });
-        const install_tokenizer = b.addInstallFile(
-            mpnet_tokenizer_path,
-            "share/tokenizer.json",
-        );
         const run = runTest(b, t, use_lldb);
-        run.step.dependOn(&install_models.step);
-        run.step.dependOn(&install_tokenizer.step);
+        for (addModelInstalls(b, coreml_models)) |s| run.step.dependOn(s);
         test_profile.dependOn(&run.step);
     }
 
@@ -447,6 +403,39 @@ pub fn build(b: *std.Build) !void {
 
         xcfw_step.dependOn(&xcfw.step);
     }
+}
+
+/// Installs the mpnet runtime assets (model + tokenizer) into `b`'s install prefix
+/// under `share/`, where `MpnetEmbedder` looks for them by default
+/// (`<exe_dir>/../share/`). Call this from your own build.zig:
+///
+///     const dve_dep = b.dependency("dve", .{ .target = target, .optimize = optimize });
+///     @import("dve").installModels(b, dve_dep);
+///
+/// Note `@import("dve")` resolves to this build script, not to the `dve` module --
+/// inside build.zig a dependency name refers to its build.zig struct.
+///
+/// Only needed with the default `mpnet_embedding` model; `apple_nlembedding`
+/// requires no model files.
+pub fn installModels(b: *std.Build, dve_dep: *std.Build.Dependency) void {
+    const coreml_models = dve_dep.builder.dependency("coreml_models", .{});
+    for (addModelInstalls(b, coreml_models)) |s| b.getInstallStep().dependOn(s);
+}
+
+/// Creates install steps for the mpnet model + tokenizer, owned by `b`. Returns the
+/// steps so callers can attach them to whichever step needs the assets present (the
+/// install step, or a specific test's run step).
+fn addModelInstalls(b: *std.Build, coreml_models: *std.Build.Dependency) [2]*Step {
+    const install_model = b.addInstallDirectory(.{
+        .source_dir = coreml_models.path("all_mpnet_base_v2/all_mpnet_base_v2.mlpackage"),
+        .install_dir = .{ .custom = "share" },
+        .install_subdir = "all_mpnet_base_v2.mlpackage",
+    });
+    const install_tokenizer = b.addInstallFile(
+        coreml_models.path("all_mpnet_base_v2/tokenizer.json"),
+        "share/tokenizer.json",
+    );
+    return .{ &install_model.step, &install_tokenizer.step };
 }
 
 const EmbeddingModel = enum {
