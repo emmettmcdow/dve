@@ -13,9 +13,7 @@ test t1 {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const BiCase = struct { a: []const u8, b: []const u8, query: []const u8, want: []const u8 };
@@ -65,9 +63,7 @@ test t2 {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     var searchBuf: [20]SearchResult = undefined;
@@ -136,9 +132,7 @@ test t3 {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     var searchBuf: [20]SearchResult = undefined;
@@ -195,9 +189,7 @@ test t4 {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     var searchBuf: [20]SearchResult = undefined;
@@ -247,9 +239,7 @@ test t5 {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     var searchBuf: [20]SearchResult = undefined;
@@ -332,16 +322,6 @@ const Embedder = switch (embedding_model) {
     .apple_nlembedding => embed.NLEmbedder,
     .mpnet_embedding => embed.MpnetEmbedder,
 };
-
-fn testEmbedder(allocator: std.mem.Allocator) !struct { e: *Embedder, iface: embed.Embedder } {
-    const e = try allocator.create(Embedder);
-    if (embedding_model == .mpnet_embedding) {
-        e.* = try embed.MpnetEmbedder.init(.{});
-    } else {
-        e.* = try embed.NLEmbedder.init();
-    }
-    return .{ .e = e, .iface = e.embedder() };
-}
 
 fn reportTest(label: []const u8, got: usize, total: usize) void {
     var buf: [50]u8 = undefined;

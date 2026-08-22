@@ -23,10 +23,6 @@ const dve = @import("dve");
 pub const std_options: std.Options = .{ .log_level = .warn };
 
 const VectorEngine = dve.VectorEngine(dve.embedding_model);
-const Embedder = switch (dve.embedding_model) {
-    .apple_nlembedding => dve.embed.NLEmbedder,
-    .mpnet_embedding => dve.embed.MpnetEmbedder,
-};
 
 const MAX_ARTICLE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -101,9 +97,7 @@ fn runEmbed(allocator: std.mem.Allocator, opts: Options) !void {
     );
 
     var load_timer = try std.time.Timer.start();
-    const engine = try initEngine(allocator, db_dir);
-    defer engine.deinit();
-    const db = engine.db;
+    const db = try VectorEngine.init(allocator, db_dir, .{});
     const load_ns = load_timer.read();
 
     if (db.vec_storage.vec_n != 0) {
@@ -193,9 +187,7 @@ fn runSearch(allocator: std.mem.Allocator, opts: Options) !void {
     defer db_dir.close();
 
     var load_timer = try std.time.Timer.start();
-    const engine = try initEngine(allocator, db_dir);
-    defer engine.deinit();
-    const db = engine.db;
+    const db = try VectorEngine.init(allocator, db_dir, .{});
     const load_ns = load_timer.read();
 
     std.debug.print(
@@ -256,9 +248,7 @@ fn runStat(allocator: std.mem.Allocator, opts: Options) !void {
     defer db_dir.close();
 
     var load_timer = try std.time.Timer.start();
-    const engine = try initEngine(allocator, db_dir);
-    defer engine.deinit();
-    const db = engine.db;
+    const db = try VectorEngine.init(allocator, db_dir, .{});
     const load_ns = load_timer.read();
 
     std.debug.print(
@@ -287,34 +277,6 @@ fn runStat(allocator: std.mem.Allocator, opts: Options) !void {
 }
 
 // ******************************************************************************************* Setup
-
-/// The engine takes ownership of the embedder's *contents* (`deinit` calls
-/// through the interface) but not of its allocation, so the caller has to keep
-/// the pointer around and destroy it after `db.deinit()`.
-const Engine = struct {
-    db: *VectorEngine,
-    embedder: *Embedder,
-    allocator: std.mem.Allocator,
-
-    fn deinit(self: Engine) void {
-        self.db.deinit();
-        self.allocator.destroy(self.embedder);
-    }
-};
-
-fn initEngine(allocator: std.mem.Allocator, db_dir: std.fs.Dir) !Engine {
-    const e = try allocator.create(Embedder);
-    errdefer allocator.destroy(e);
-    e.* = switch (dve.embedding_model) {
-        .mpnet_embedding => try dve.embed.MpnetEmbedder.init(.{}),
-        .apple_nlembedding => try dve.embed.NLEmbedder.init(),
-    };
-    return .{
-        .db = try VectorEngine.init(allocator, db_dir, e.embedder()),
-        .embedder = e,
-        .allocator = allocator,
-    };
-}
 
 /// Collects up to `limit` filenames from `dir`, sorted, so that a smaller limit
 /// always yields a prefix of a larger one.

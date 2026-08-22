@@ -25,9 +25,8 @@ pub fn main() !void {
         std.fs.deleteTreeAbsolute(tmp_path) catch {};
     }
 
-    // var embedder = try dve.embed.NLEmbedder.init();
-    var embedder = try dve.embed.MpnetEmbedder.init(.{});
-    const vectors = try VectorEngine.init(allocator, tmp_dir, embedder.embedder());
+    // The engine owns its embedder; pass .{} to use the build's default model files.
+    const vectors = try VectorEngine.init(allocator, tmp_dir, .{});
     defer vectors.deinit();
 
     // Embed all documents.

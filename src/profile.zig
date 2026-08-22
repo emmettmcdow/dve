@@ -13,47 +13,42 @@ const VEC_SZ: usize = switch (embedding_model) {
 const VEC_TYPE = f32;
 const Vector = @Vector(VEC_SZ, VEC_TYPE);
 
-const Embedder = switch (embedding_model) {
-    .apple_nlembedding => embed.NLEmbedder,
-    .mpnet_embedding => embed.MpnetEmbedder,
-};
-
 const TestVecDB = dve.VectorEngine(embedding_model);
 const VecStorage = dve.vec_storage.Storage(VEC_SZ, VEC_TYPE);
 
 const words = [_][]const u8{
     // tech
-    "algorithm", "database", "network",      "server",       "client",    "cache",       "memory",      "processor",
-    "software",  "hardware", "kernel",        "compiler",     "runtime",   "library",     "framework",   "protocol",
-    "encryption","authentication","deployment","containerize",
+    "algorithm",    "database",       "network",    "server",       "client",         "cache",       "memory",       "processor",
+    "software",     "hardware",       "kernel",     "compiler",     "runtime",        "library",     "framework",    "protocol",
+    "encryption",   "authentication", "deployment", "containerize",
     // nature
-    "forest",    "mountain", "river",         "ocean",        "desert",    "meadow",      "canyon",      "glacier",
-    "waterfall", "volcano",  "island",        "peninsula",    "tundra",    "savanna",     "rainforest",  "estuary",
-    "boulder",   "pebble",   "horizon",       "twilight",
+    "forest",         "mountain",    "river",        "ocean",
+    "desert",       "meadow",         "canyon",     "glacier",      "waterfall",      "volcano",     "island",       "peninsula",
+    "tundra",       "savanna",        "rainforest", "estuary",      "boulder",        "pebble",      "horizon",      "twilight",
     // animals
-    "eagle",     "salmon",   "wolf",          "dolphin",      "elephant",  "cheetah",     "crocodile",   "penguin",
-    "octopus",   "butterfly","jaguar",        "mongoose",     "narwhal",   "platypus",    "quokka",      "falcon",
-    "gecko",     "ibis",     "lynx",          "marmot",
+    "eagle",        "salmon",         "wolf",       "dolphin",      "elephant",       "cheetah",     "crocodile",    "penguin",
+    "octopus",      "butterfly",      "jaguar",     "mongoose",     "narwhal",        "platypus",    "quokka",       "falcon",
+    "gecko",        "ibis",           "lynx",       "marmot",
     // food
-    "bread",     "cheese",   "mango",         "avocado",      "pasta",     "sushi",       "curry",       "noodle",
-    "soup",      "salad",    "coffee",        "chocolate",    "almond",    "blueberry",   "pumpkin",     "fennel",
-    "turmeric",  "tahini",   "kimchi",        "tempeh",
+          "bread",          "cheese",      "mango",        "avocado",
+    "pasta",        "sushi",          "curry",      "noodle",       "soup",           "salad",       "coffee",       "chocolate",
+    "almond",       "blueberry",      "pumpkin",    "fennel",       "turmeric",       "tahini",      "kimchi",       "tempeh",
     // verbs
-    "explore",   "discover", "build",         "analyze",      "create",    "transform",   "optimize",    "integrate",
-    "collaborate","innovate","migrate",       "deploy",       "monitor",   "evaluate",    "generate",    "simulate",
-    "iterate",   "validate", "benchmark",     "profile",
+    "explore",      "discover",       "build",      "analyze",      "create",         "transform",   "optimize",     "integrate",
+    "collaborate",  "innovate",       "migrate",    "deploy",       "monitor",        "evaluate",    "generate",     "simulate",
+    "iterate",      "validate",       "benchmark",  "profile",
     // adjectives
-    "efficient", "scalable", "robust",        "elegant",      "complex",   "dynamic",     "static",      "parallel",
-    "distributed","autonomous","resilient",   "flexible",     "modular",   "portable",    "reliable",    "secure",
-    "immutable", "concurrent","asynchronous", "deterministic",
+         "efficient",      "scalable",    "robust",       "elegant",
+    "complex",      "dynamic",        "static",     "parallel",     "distributed",    "autonomous",  "resilient",    "flexible",
+    "modular",      "portable",       "reliable",   "secure",       "immutable",      "concurrent",  "asynchronous", "deterministic",
     // abstract
-    "concept",   "theory",   "pattern",       "principle",    "paradigm",  "abstraction", "entropy",     "complexity",
-    "convergence","divergence","recursion",   "iteration",    "transformation","emergence","coherence",  "balance",
-    "threshold", "boundary", "gradient",      "dimension",
+    "concept",      "theory",         "pattern",    "principle",    "paradigm",       "abstraction", "entropy",      "complexity",
+    "convergence",  "divergence",     "recursion",  "iteration",    "transformation", "emergence",   "coherence",    "balance",
+    "threshold",    "boundary",       "gradient",   "dimension",
     // weather / society
-    "thunder",   "lightning","blizzard",      "drought",      "monsoon",   "tornado",     "hurricane",   "rainbow",
-    "culture",   "society",  "economy",       "technology",   "civilization","community", "heritage",    "tradition",
-    "pressure",  "humidity", "climate",       "innovation",
+       "thunder",        "lightning",   "blizzard",     "drought",
+    "monsoon",      "tornado",        "hurricane",  "rainbow",      "culture",        "society",     "economy",      "technology",
+    "civilization", "community",      "heritage",   "tradition",    "pressure",       "humidity",    "climate",      "innovation",
 };
 
 fn generateNote(buf: []u8, rng: std.Random, term_idx: *usize) usize {
@@ -83,16 +78,6 @@ fn generateNote(buf: []u8, rng: std.Random, term_idx: *usize) usize {
     return pos;
 }
 
-fn testEmbedder(allocator: std.mem.Allocator) !struct { e: *Embedder, iface: embed.Embedder } {
-    const e = try allocator.create(Embedder);
-    if (embedding_model == .mpnet_embedding) {
-        e.* = try embed.MpnetEmbedder.init(.{});
-    } else {
-        e.* = try embed.NLEmbedder.init();
-    }
-    return .{ .e = e, .iface = e.embedder() };
-}
-
 fn randomUnitVector(rng: std.Random) Vector {
     var v: Vector = @splat(0.0);
     var sum_sq: f32 = 0.0;
@@ -118,9 +103,7 @@ test "profile embedding" {
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
 
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     var path_buf: [32]u8 = undefined;

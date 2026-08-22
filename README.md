@@ -17,8 +17,7 @@ const dir = try std.fs.cwd().makeOpenPath("my_vectors", .{});
 
 // VectorEngine is generic over the embedding model, which is set at build time.
 const VectorEngine = dve.VectorEngine(dve.embedding_model);
-var embedder = try dve.embed.NLEmbedder.init();
-const vectors = try VectorEngine.init(allocator, dir, embedder.embedder());
+const vectors = try VectorEngine.init(allocator, dir, .{});
 defer vectors.deinit();
 
 // Embed text. The key identifies the entry (typically a file path).

@@ -77,6 +77,10 @@ pub const MpnetEmbedder = struct {
     model: Object,
     tokenizer: tokenizer_mod.WordPieceTokenizer,
     tokenizer_alloc: std.heap.ArenaAllocator,
+    /// The files this embedder actually loaded, after option/bundle/exe-relative resolution.
+    /// Owned by `tokenizer_alloc`.
+    loaded_model_path: [:0]const u8,
+    loaded_tokenizer_path: [:0]const u8,
 
     pub const VEC_SZ = 768;
     pub const VEC_TYPE = f32;
@@ -225,7 +229,18 @@ pub const MpnetEmbedder = struct {
             .model = model.retain(),
             .tokenizer = tok,
             .tokenizer_alloc = tokenizer_alloc,
+            .loaded_model_path = full_path,
+            .loaded_tokenizer_path = tokenizer_path,
         };
+    }
+
+    pub fn init_self(self: *MpnetEmbedder, opts: InitOptions) !void {
+        const obj = try MpnetEmbedder.init(opts);
+        self.model = obj.model;
+        self.tokenizer = obj.tokenizer;
+        self.tokenizer_alloc = obj.tokenizer_alloc;
+        self.loaded_model_path = obj.loaded_model_path;
+        self.loaded_tokenizer_path = obj.loaded_tokenizer_path;
     }
 
     pub fn embedder(self: *MpnetEmbedder) Embedder {
@@ -560,6 +575,12 @@ pub const NLEmbedder = struct {
             .embedder_obj = embedder_obj.retain(),
             .mutex = Mutex{},
         };
+    }
+
+    pub fn init_self(self: *NLEmbedder) !void {
+        const obj = try NLEmbedder.init();
+        self.embedder_obj = obj.embedder_obj;
+        self.mutex = obj.mutex;
     }
 
     pub fn embedder(self: *NLEmbedder) Embedder {

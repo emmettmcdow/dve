@@ -13,6 +13,22 @@ pub const SearchResult = struct {
     similarity: f32 = 0.0,
 };
 
+/// Optional overrides for the files an embedding model loads at startup. Both fields are
+/// absolute paths; a null field leaves the embedder's own resolution (bundle resource, then
+/// exe-relative) in place. Embedding models that ship no files of their own -- currently
+/// `.apple_nlembedding` -- ignore these.
+pub const InitOptions = struct {
+    /// Absolute path to the tokenizer file.
+    tokenizer_path: ?[]const u8 = null,
+    /// Absolute path to the model file or package directory.
+    model_path: ?[]const u8 = null,
+};
+
+const BaseEmbedder = union(EmbeddingModel) {
+    apple_nlembedding: *NLEmbedder,
+    mpnet_embedding: *MpnetEmbedder,
+};
+
 /// VectorEngine is the primary way to use the vector engine. It requires selecting an
 /// EmbeddingModel. The EmbeddingModel must match the Embedder passed into the initialization func.
 pub fn VectorEngine(embedding_model: EmbeddingModel) type {
@@ -66,6 +82,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
 
         const WorkQueue = UniqueCircularBuffer(EmbedJob, u64, EmbedJob.id);
 
+        base_embedder: BaseEmbedder,
         embedder: embed.Embedder,
         vec_storage: VecStorage,
         note_id_map: *NoteIdMap,
@@ -80,8 +97,30 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         pub fn init(
             allocator: std.mem.Allocator,
             basedir: std.fs.Dir,
-            embedder: embed.Embedder,
+            opts: InitOptions,
         ) !*Self {
+            const base_embedder = o: switch (embedding_model) {
+                .apple_nlembedding => {
+                    var e = try allocator.create(NLEmbedder);
+                    errdefer allocator.destroy(e);
+                    try e.init_self();
+                    break :o BaseEmbedder{ .apple_nlembedding = e };
+                },
+                .mpnet_embedding => {
+                    var e = try allocator.create(MpnetEmbedder);
+                    errdefer allocator.destroy(e);
+                    try e.init_self(.{
+                        .absolute_model_path = opts.model_path,
+                        .absolute_tokenizer_path = opts.tokenizer_path,
+                    });
+                    break :o BaseEmbedder{ .mpnet_embedding = e };
+                },
+            };
+            const embedder = switch (embedding_model) {
+                .apple_nlembedding => base_embedder.apple_nlembedding.embedder(),
+                .mpnet_embedding => base_embedder.mpnet_embedding.embedder(),
+            };
+
             var vecs = try VecStorage.init(allocator, basedir, .{});
             try vecs.load(embedder.path);
             const wq = try WorkQueue.init(allocator, 1024);
@@ -92,6 +131,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
 
             const self = try allocator.create(Self);
             self.* = .{
+                .base_embedder = base_embedder,
                 .embedder = embedder,
                 .vec_storage = vecs,
                 .note_id_map = note_id_map,
@@ -109,6 +149,10 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             }
             self.vec_storage.deinit();
             self.embedder.deinit();
+            switch (embedding_model) {
+                .apple_nlembedding => self.allocator.destroy(self.base_embedder.apple_nlembedding),
+                .mpnet_embedding => self.allocator.destroy(self.base_embedder.mpnet_embedding),
+            }
             self.work_queue.deinit();
             self.note_id_map.deinit();
             self.allocator.destroy(self.note_id_map);
@@ -526,9 +570,7 @@ test "embedText hello" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -550,9 +592,7 @@ test "embedText skip empties" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -567,9 +607,7 @@ test "embedText clear previous" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -588,9 +626,7 @@ test "search" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -612,8 +648,7 @@ test "search mpnet" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var e = try MpnetEmbedder.init(.{});
-    var db = try VectorEngine(.mpnet_embedding).init(arena.allocator(), tmpD.dir, e.embedder());
+    var db = try VectorEngine(.mpnet_embedding).init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -630,14 +665,57 @@ test "search mpnet" {
     try db.validate();
 }
 
+// Verifies the `opts` argument reaches the embedder: the files it loads are the ones named
+// here, not the ones it would have resolved on its own.
+test "init opts model paths" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Under test the default model files live in <cwd>/zig-out/share.
+    const cwd = try std.fs.cwd().realpathAlloc(alloc, ".");
+    const model_path = try std.fmt.allocPrint(
+        alloc,
+        "{s}/zig-out/{s}",
+        .{ cwd, MpnetEmbedder.MODEL_PATH },
+    );
+
+    // A copy of the tokenizer somewhere the default resolution would never look, so the
+    // assertion below fails if opts is dropped on the way to the embedder.
+    try std.fs.cwd().copyFile(
+        try std.fmt.allocPrint(alloc, "{s}/zig-out/{s}", .{ cwd, MpnetEmbedder.TOKENIZER_PATH }),
+        tmpD.dir,
+        "custom_tokenizer.json",
+        .{},
+    );
+    const tokenizer_path = try tmpD.dir.realpathAlloc(alloc, "custom_tokenizer.json");
+
+    var db = try VectorEngine(.mpnet_embedding).init(alloc, tmpD.dir, .{
+        .model_path = model_path,
+        .tokenizer_path = tokenizer_path,
+    });
+    defer db.deinit();
+
+    const mpnet = db.base_embedder.mpnet_embedding;
+    try expectEqualSlices(u8, model_path, mpnet.loaded_model_path);
+    try expectEqualSlices(u8, tokenizer_path, mpnet.loaded_tokenizer_path);
+
+    // And the engine built from those files works.
+    const path = "test.md";
+    try db.embedText(path, "pizza. pizza. pizza.");
+    var buffer: [10]SearchResult = undefined;
+    try expectEqual(3, try db.search("pizza", &buffer));
+    try db.validate();
+}
+
 test "uniqueSearch" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -657,9 +735,7 @@ test "search returns results with similarity" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -689,9 +765,7 @@ test "uniqueSearch returns results with similarity" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path1 = "test1.md";
@@ -744,9 +818,7 @@ test "rawVectorSearch hello" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -768,9 +840,7 @@ test "rawVectorSearch matches search" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -796,9 +866,7 @@ test "rawVectorSearch returns results with similarity" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -827,9 +895,7 @@ test "rawVectorSearch no matches" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     try db.embedText("test.md", "pizza");
@@ -847,9 +913,7 @@ test "rawVectorSearch empty database" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const query = try rawQueryVec(.apple_nlembedding, &db.embedder, arena.allocator(), "pizza");
@@ -862,9 +926,7 @@ test "rawVectorSearch cap results" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     for (0..5) |i| {
@@ -885,9 +947,7 @@ test "rawVectorSearch skips removed paths" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -908,8 +968,7 @@ test "rawVectorSearch mpnet" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var e = try MpnetEmbedder.init(.{});
-    var db = try VectorEngine(.mpnet_embedding).init(arena.allocator(), tmpD.dir, e.embedder());
+    var db = try VectorEngine(.mpnet_embedding).init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -932,9 +991,7 @@ test "embed chunk cleanup" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     // Make the threshold strict, results should be exact matches.
@@ -988,9 +1045,7 @@ test "search cap results" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     for (0..150) |i| {
@@ -1007,9 +1062,7 @@ test "search strip queries" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     var results: [1]SearchResult = undefined;
@@ -1047,9 +1100,7 @@ test "embedText same input same result" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1071,9 +1122,7 @@ test "embedText different input different result" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1096,9 +1145,7 @@ test "embedText updates only changed sentences" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1128,9 +1175,7 @@ test "embedText handle multiple remove gracefully" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1148,9 +1193,7 @@ test "populateHighlights" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     {
@@ -1176,8 +1219,7 @@ test "embed skip low-value" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var e = try MpnetEmbedder.init(.{});
-    var db = try VectorEngine(.mpnet_embedding).init(arena.allocator(), tmpD.dir, e.embedder());
+    var db = try VectorEngine(.mpnet_embedding).init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
     db.embedder.threshold = 0;
 
@@ -1221,9 +1263,7 @@ test "embedTextAsync" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path1 = "test1.md";
@@ -1246,9 +1286,7 @@ test "embedTextAsync" {
 test "embedTextAsync drains queue on shutdown" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, te.iface);
+    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
     defer db.deinit();
 
     const N = 60;
@@ -1273,9 +1311,7 @@ test "embedTextAsync drains queue on shutdown" {
 test "embedTextAsync frees jobs it replaces in the queue" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, te.iface);
+    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
     defer db.deinit();
 
     const N = 60;
@@ -1309,9 +1345,7 @@ test "embedTextAsync rejects after shutdown" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1334,7 +1368,7 @@ const Reopened = struct {
         const te = try testEmbedder(testing_allocator);
         errdefer testing_allocator.destroy(te.e);
         self.embedder = te.e;
-        self.db = try TestVecDB.init(self.arena.allocator(), dir, te.iface);
+        self.db = try TestVecDB.init(self.arena.allocator(), dir, .{});
         return self;
     }
 
@@ -1379,9 +1413,7 @@ test "embedText persists to disk" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1407,9 +1439,7 @@ test "embedText persists multiple sentences and paths to disk" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     try db.embedText("test1.md", "pizza. pizza. pizza.");
@@ -1436,9 +1466,7 @@ test "embedText persists removals to disk" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1465,9 +1493,7 @@ test "embedTextAsync persists to disk after shutdown" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1495,9 +1521,7 @@ test "embedTextAsync persists every queued job after shutdown" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const N = 10;
@@ -1526,9 +1550,7 @@ test "empty inputs" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    const te = try testEmbedder(testing_allocator);
-    defer testing_allocator.destroy(te.e);
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, te.iface);
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     var res: [1]SearchResult = undefined;

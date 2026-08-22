@@ -42,8 +42,6 @@ var mutex = std.Thread.Mutex{};
 var active_model: ActiveModel = undefined;
 var apple_db: ?*AppleVDB = null;
 var mpnet_db: ?*MpnetVDB = null;
-var apple_embedder: NLEmbedder = undefined;
-var mpnet_embedder: MpnetEmbedder = undefined;
 var initialized = false;
 
 const CError = enum(c_int) {
@@ -75,24 +73,16 @@ export fn dve_init(
     const model_slice = std.mem.sliceTo(model_path, 0);
     if (model_slice.len > 0) {
         const tokenizer_slice = std.mem.sliceTo(tokenizer_path, 0);
-        mpnet_embedder = MpnetEmbedder.init(.{
-            .absolute_model_path = model_slice,
-            .absolute_tokenizer_path = if (tokenizer_slice.len > 0) tokenizer_slice else null,
+        mpnet_db = MpnetVDB.init(allocator, dir, .{
+            .model_path = model_slice,
+            .tokenizer_path = if (tokenizer_slice.len > 0) tokenizer_slice else null,
         }) catch |err| {
-            std.log.err("dve_init: failed to init MpnetEmbedder: {}\n", .{err});
-            return @intFromEnum(CError.GenericFail);
-        };
-        mpnet_db = MpnetVDB.init(allocator, dir, mpnet_embedder.embedder()) catch |err| {
             std.log.err("dve_init: failed to init VectorEngine: {}\n", .{err});
             return @intFromEnum(CError.GenericFail);
         };
         active_model = .mpnet;
     } else {
-        apple_embedder = NLEmbedder.init() catch |err| {
-            std.log.err("dve_init: failed to init NLEmbedder: {}\n", .{err});
-            return @intFromEnum(CError.GenericFail);
-        };
-        apple_db = AppleVDB.init(allocator, dir, apple_embedder.embedder()) catch |err| {
+        apple_db = AppleVDB.init(allocator, dir, .{}) catch |err| {
             std.log.err("dve_init: failed to init VectorEngine: {}\n", .{err});
             return @intFromEnum(CError.GenericFail);
         };

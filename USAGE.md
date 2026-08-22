@@ -55,8 +55,8 @@ const dve = @import("dve");
 const dir = try std.fs.cwd().makeOpenPath("my_vectors", .{});
 
 const VectorEngine = dve.VectorEngine(dve.embedding_model);
-var embedder = try dve.embed.MpnetEmbedder.init(.{});
-const vectors = try VectorEngine.init(allocator, dir, embedder.embedder());
+// model files can be changed from their defaults using .{ .model_path = "...", .tokenizer_path = "..." }.
+const vectors = try VectorEngine.init(allocator, dir, .{});
 defer vectors.deinit();
 
 // Embed text. The key identifies the entry (typically a file path).

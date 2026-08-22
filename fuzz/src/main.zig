@@ -149,8 +149,7 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_
 
     try writeOut(allocator, "{{\"event\":\"start\",\"seed\":{d}}}\n", .{seed});
 
-    var embedder = try dve.embed.MpnetEmbedder.init(.{});
-    const engine = try VectorEngine.init(allocator, tmp_dir, embedder.embedder());
+    const engine = try VectorEngine.init(allocator, tmp_dir, .{});
     defer engine.deinit();
 
     // When path_constraints is enabled, tracks successfully embedded keys so
