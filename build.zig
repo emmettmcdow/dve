@@ -1,10 +1,5 @@
 pub fn build(b: *std.Build) !void {
     const debug = b.option(bool, "debug-output", "Show debug output") orelse false;
-    const embedding_model = b.option(
-        EmbeddingModel,
-        "embedding-model",
-        "Embedding model to use (apple_nlembedding or mpnet_embedding)",
-    ) orelse .mpnet_embedding;
     const test_filter: ?[]const u8 = b.option(
         []const u8,
         "test-filter",
@@ -20,11 +15,6 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const real_vec_sz: usize = switch (embedding_model) {
-        .apple_nlembedding => 512,
-        .mpnet_embedding => 768,
-    };
-
     ///////////////////////
     // Mpnet Model Fetch //
     ///////////////////////
@@ -32,14 +22,12 @@ pub fn build(b: *std.Build) !void {
     const mpnet_model_path = coreml_models.path("all_mpnet_base_v2/all_mpnet_base_v2.mlpackage");
     const mpnet_tokenizer_path = coreml_models.path("all_mpnet_base_v2/tokenizer.json");
 
-    // When mpnet is selected, install the runtime assets (model + tokenizer)
-    // to zig-out/share/ so the exe can find them at their default relative paths.
+    // Install the mpnet runtime assets (model + tokenizer) to zig-out/share/ so the
+    // exe can find them at their default relative paths.
     // This covers dve's own builds only -- a dependency's install steps write to
     // the dependency's private prefix, not the consumer's. Consumers call
     // `installModels` below instead.
-    if (embedding_model == .mpnet_embedding) {
-        for (addModelInstalls(b, coreml_models)) |s| b.getInstallStep().dependOn(s);
-    }
+    for (addModelInstalls(b, coreml_models)) |s| b.getInstallStep().dependOn(s);
 
     ////////////////////
     // Dependencies   //
@@ -64,16 +52,12 @@ pub fn build(b: *std.Build) !void {
     // Config modules //
     ////////////////////
     const real_options = b.addOptions();
-    real_options.addOption(usize, "vec_sz", real_vec_sz);
     real_options.addOption(bool, "debug", debug);
-    real_options.addOption(EmbeddingModel, "embedding_model", embedding_model);
     real_options.addOption(StorageQuantize, "quant", quant);
 
     // Fake config used for storage/util tests that don't need real embeddings.
     const fake_options = b.addOptions();
-    fake_options.addOption(usize, "vec_sz", @as(usize, 3));
     fake_options.addOption(bool, "debug", debug);
-    fake_options.addOption(EmbeddingModel, "embedding_model", EmbeddingModel.apple_nlembedding);
     fake_options.addOption(StorageQuantize, "quant", .none);
 
     ////////////////////
@@ -304,20 +288,19 @@ pub fn build(b: *std.Build) !void {
     // XCFramework   //
     ///////////////////
     // Builds DVECore.xcframework for use by Swift/C consumers.
-    // Always compiled with mpnet_embedding; model files are bundled in Resources/.
+    // Both models are compiled in; the C bindings pick one at runtime (bindings/c/src/intf.zig).
+    // The mpnet model files are bundled in Resources/ so that model works out of the box.
     const xcfw_step = b.step("xcframework", "Build DVECore.xcframework");
     {
         const arm_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos });
         const x86_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .macos });
         const xcfw_optimize: std.builtin.OptimizeMode = .ReleaseFast;
 
-        const mpnet_options = b.addOptions();
-        mpnet_options.addOption(usize, "vec_sz", @as(usize, 768));
-        mpnet_options.addOption(bool, "debug", false);
-        mpnet_options.addOption(EmbeddingModel, "embedding_model", EmbeddingModel.mpnet_embedding);
+        const xcfw_options = b.addOptions();
+        xcfw_options.addOption(bool, "debug", false);
         // Pinned like the other options above: the shipped framework's storage format does
         // not follow -Dstorage-quantize.
-        mpnet_options.addOption(StorageQuantize, "quant", StorageQuantize.none);
+        xcfw_options.addOption(StorageQuantize, "quant", StorageQuantize.none);
 
         // Tracy must always be disabled in the xcframework. When tracy_enable=true
         // Tracy starts C++ background threads (via global constructors) that
@@ -348,13 +331,13 @@ pub fn build(b: *std.Build) !void {
                 }),
             });
             lib.bundle_compiler_rt = true;
-            lib.root_module.addOptions("config", mpnet_options);
+            lib.root_module.addOptions("config", xcfw_options);
             lib.root_module.addImport("objc", objc_dep.module("objc"));
             lib.root_module.addImport("tracy", xcfw_tracy.module("tracy"));
             lib.root_module.addImport("dve", b.addModule("dve_xcfw", .{
                 .root_source_file = b.path("src/root.zig"),
                 .imports = &.{
-                    .{ .name = "config", .module = mpnet_options.createModule() },
+                    .{ .name = "config", .module = xcfw_options.createModule() },
                     .{ .name = "objc", .module = objc_dep.module("objc") },
                     .{ .name = "tracy", .module = xcfw_tracy.module("tracy") },
                 },
@@ -415,8 +398,8 @@ pub fn build(b: *std.Build) !void {
 /// Note `@import("dve")` resolves to this build script, not to the `dve` module --
 /// inside build.zig a dependency name refers to its build.zig struct.
 ///
-/// Only needed with the default `mpnet_embedding` model; `apple_nlembedding`
-/// requires no model files.
+/// Only needed if you use the `mpnet_embedding` model; `apple_nlembedding` is
+/// served by the OS and requires no model files.
 pub fn installModels(b: *std.Build, dve_dep: *std.Build.Dependency) void {
     const coreml_models = dve_dep.builder.dependency("coreml_models", .{});
     for (addModelInstalls(b, coreml_models)) |s| b.getInstallStep().dependOn(s);
@@ -438,10 +421,6 @@ fn addModelInstalls(b: *std.Build, coreml_models: *std.Build.Dependency) [2]*Ste
     return .{ &install_model.step, &install_tokenizer.step };
 }
 
-const EmbeddingModel = enum {
-    apple_nlembedding,
-    mpnet_embedding,
-};
 const StorageQuantize = enum { none, f_16, i_8 };
 
 const std = @import("std");

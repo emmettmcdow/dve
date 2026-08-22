@@ -3,14 +3,25 @@ The main interface for this library is defined in [vector.zig](src/vector.zig).
 
 ## Model selection
 
-dve supports two embedding backends:
+Every embedding backend is compiled into every build of dve. You pick one at the call site by
+naming it when you instantiate the engine:
 
-- **mpnet** (`sentence-transformers/all-mpnet-base-v2`) — default. Scores 88% on our benchmarks.
-- **Apple NaturalLanguage** — no model files required, good for quick prototyping. Scores 66%
-  on our benchmarks. Opt in with `.@"embedding-model" = .apple_nlembedding`.
+```zig
+const VectorEngine = dve.VectorEngine(.mpnet_embedding);
+```
 
-> **Note:** The database format differs between models. Use the same model consistently
-> for a given database directory.
+- **`.mpnet_embedding`** (`sentence-transformers/all-mpnet-base-v2`) — 768 dimensions, scores 88%
+  on our benchmarks. Needs model files; see [Install](#install) below.
+- **`.apple_nlembedding`** (Apple NaturalLanguage) — 512 dimensions, scores 66% on our benchmarks.
+  Served by the OS, so it needs no model files. Good for quick prototyping.
+
+You own the model files. `.mpnet_embedding` looks for them next to your executable
+(`<exe>/../share/`) or in the app bundle's `Resources/`.
+`@import("dve").installModels(b, dve_dep)` puts them there for you. Paths can be overridden
+per-instance with `.{ .model_path = "...", .tokenizer_path = "..." }`.
+
+> **Note:** The database format differs between models — 768-dim vectors are not readable as
+> 512-dim ones. Use the same model consistently for a given database directory.
 
 ## Zig
 
@@ -29,12 +40,11 @@ Then in your `build.zig`, fetch the dependency and add it to your compile target
 const dve_dep = b.dependency("dve", .{
     .target = target,
     .optimize = optimize,
-    // .@"embedding-model" = .apple_nlembedding, // lighter, no model download
 });
 const dve_module = dve_dep.module("dve");
 exe.root_module.addImport("dve", dve_module);
-// Install model files into your project's zig-out/share/ so the exe can find them.
-// Not needed with .apple_nlembedding.
+// Install the mpnet model files into your project's zig-out/share/ so the exe can find
+// them. Skip this if you only use .apple_nlembedding, which needs no model files.
 @import("dve").installModels(b, dve_dep);
 ```
 
@@ -46,7 +56,8 @@ const dve = @import("dve");
 // Open a directory to store the vector database.
 const dir = try std.fs.cwd().makeOpenPath("my_vectors", .{});
 
-const VectorEngine = dve.VectorEngine(dve.embedding_model);
+// Name the model you want; see "Model selection" above.
+const VectorEngine = dve.VectorEngine(.mpnet_embedding);
 // model files can be changed from their defaults using .{ .model_path = "...", .tokenizer_path = "..." }.
 const vectors = try VectorEngine.init(allocator, dir, .{});
 defer vectors.deinit();

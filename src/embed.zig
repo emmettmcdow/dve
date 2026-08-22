@@ -19,6 +19,13 @@ pub const EmbeddingModel = enum {
             .apple_nlembedding => NLEmbedder.REFERENCE_IMPLEMENTATION_NAME,
         };
     }
+
+    pub fn vecSize(self: EmbeddingModel) usize {
+        return switch (self) {
+            .mpnet_embedding => MpnetEmbedder.VEC_SZ,
+            .apple_nlembedding => NLEmbedder.VEC_SZ,
+        };
+    }
 };
 
 pub const EmbeddingModelOutput = union(EmbeddingModel) {

@@ -1,9 +1,4 @@
 const embed_mod = @import("embed.zig");
-const config = @import("config");
-
-/// The embedding model configured at build time.
-pub const embedding_model: embed_mod.EmbeddingModel =
-    @enumFromInt(@intFromEnum(config.embedding_model));
 
 pub const VectorEngine = @import("vector.zig").VectorEngine;
 pub const SearchResult = @import("vector.zig").SearchResult;

@@ -1,7 +1,7 @@
 const std = @import("std");
 const dve = @import("dve");
 
-const VectorEngine = dve.VectorEngine(dve.embedding_model);
+const VectorEngine = dve.VectorEngine(.mpnet_embedding);
 
 const DEFAULT_OPS_PER_WORKER: u32 = 1;
 const MAX_KEY_LEN: usize = 256;

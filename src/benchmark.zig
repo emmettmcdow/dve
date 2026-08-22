@@ -1,19 +1,16 @@
-var max_score: usize = 0;
-var score: usize = 0;
-
 const TextEntry = struct { path: []const u8, contents: []const u8 };
 
 const t1 = "binary single words";
-test t1 {
+fn binarySingleWords(comptime model: EmbeddingModel) !void {
     var curr_max_score: usize = 0;
     var curr_score: usize = 0;
-    defer reportTest(t1, curr_score, curr_max_score);
+    defer reportTest(model, t1, curr_score, curr_max_score);
 
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     const BiCase = struct { a: []const u8, b: []const u8, query: []const u8, want: []const u8 };
@@ -54,16 +51,16 @@ const SentenceCase = struct {
 };
 
 const t2 = "sentence similarity";
-test t2 {
+fn sentenceSimilarity(comptime model: EmbeddingModel) !void {
     var curr_max_score: usize = 0;
     var curr_score: usize = 0;
-    defer reportTest(t2, curr_score, curr_max_score);
+    defer reportTest(model, t2, curr_score, curr_max_score);
 
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     var searchBuf: [20]SearchResult = undefined;
@@ -123,16 +120,16 @@ test t2 {
 }
 
 const t3 = "sentence split - 1/3 match";
-test t3 {
+fn sentenceSplit(comptime model: EmbeddingModel) !void {
     var curr_max_score: usize = 0;
     var curr_score: usize = 0;
-    defer reportTest(t3, curr_score, curr_max_score);
+    defer reportTest(model, t3, curr_score, curr_max_score);
 
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     var searchBuf: [20]SearchResult = undefined;
@@ -180,16 +177,16 @@ test t3 {
 }
 
 const t4 = "query length parity";
-test t4 {
+fn queryLengthParity(comptime model: EmbeddingModel) !void {
     var curr_max_score: usize = 0;
     var curr_score: usize = 0;
-    defer reportTest(t4, curr_score, curr_max_score);
+    defer reportTest(model, t4, curr_score, curr_max_score);
 
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     var searchBuf: [20]SearchResult = undefined;
@@ -230,16 +227,16 @@ test t4 {
 }
 
 const t5 = "long complex sentences";
-test t5 {
+fn longComplexSentences(comptime model: EmbeddingModel) !void {
     var curr_max_score: usize = 0;
     var curr_score: usize = 0;
-    defer reportTest(t5, curr_score, curr_max_score);
+    defer reportTest(model, t5, curr_score, curr_max_score);
 
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     var searchBuf: [20]SearchResult = undefined;
@@ -307,9 +304,63 @@ test t5 {
     }
 }
 
-test "show results" {
-    reportTest("all", score, max_score);
+////////////////////////
+// Per-model test set //
+////////////////////////
+// One test per (case x model), named "<model>: <case>". Every model is compiled
+// into the binary, so `-Dtest-filter=<model>` is all it takes to run a single
+// model's suite -- including its totals row, which shares the prefix. Names are
+// string literals rather than decltests because Zig filters on the test name,
+// and a decltest is named after its identifier, not its value.
+//
+// Declaration order matters: Zig runs tests in the order declared, so each
+// model's totals test has to follow that model's cases.
+
+test "mpnet_embedding: binary single words" {
+    try binarySingleWords(.mpnet_embedding);
 }
+test "mpnet_embedding: sentence similarity" {
+    try sentenceSimilarity(.mpnet_embedding);
+}
+test "mpnet_embedding: sentence split - 1/3 match" {
+    try sentenceSplit(.mpnet_embedding);
+}
+test "mpnet_embedding: query length parity" {
+    try queryLengthParity(.mpnet_embedding);
+}
+test "mpnet_embedding: long complex sentences" {
+    try longComplexSentences(.mpnet_embedding);
+}
+test "mpnet_embedding: all" {
+    reportTotal(.mpnet_embedding);
+}
+
+test "apple_nlembedding: binary single words" {
+    try binarySingleWords(.apple_nlembedding);
+}
+test "apple_nlembedding: sentence similarity" {
+    try sentenceSimilarity(.apple_nlembedding);
+}
+test "apple_nlembedding: sentence split - 1/3 match" {
+    try sentenceSplit(.apple_nlembedding);
+}
+test "apple_nlembedding: query length parity" {
+    try queryLengthParity(.apple_nlembedding);
+}
+test "apple_nlembedding: long complex sentences" {
+    try longComplexSentences(.apple_nlembedding);
+}
+test "apple_nlembedding: all" {
+    reportTotal(.apple_nlembedding);
+}
+
+/////////////
+// Scoring //
+/////////////
+const t_all = "all";
+
+const Score = struct { got: usize = 0, total: usize = 0 };
+var totals = std.EnumArray(EmbeddingModel, Score).initFill(.{});
 
 fn outputContains(output: []SearchResult, path: []const u8) bool {
     for (output) |out_item| {
@@ -318,21 +369,27 @@ fn outputContains(output: []SearchResult, path: []const u8) bool {
     return false;
 }
 
-const Embedder = switch (embedding_model) {
-    .apple_nlembedding => embed.NLEmbedder,
-    .mpnet_embedding => embed.MpnetEmbedder,
-};
+fn reportTest(model: EmbeddingModel, label: []const u8, got: usize, total: usize) void {
+    report(model, label, got, total);
+    const t = totals.getPtr(model);
+    t.got += got;
+    t.total += total;
+}
 
-fn reportTest(label: []const u8, got: usize, total: usize) void {
+fn reportTotal(model: EmbeddingModel) void {
+    const t = totals.get(model);
+    report(model, t_all, t.got, t.total);
+}
+
+fn report(model: EmbeddingModel, label: []const u8, got: usize, total: usize) void {
     var buf: [50]u8 = undefined;
     const frac = std.fmt.bufPrint(&buf, "{d} / {d}", .{ got, total }) catch @panic("don't care");
-    std.debug.print("{s:<26} | {s:^13} | {d:.1}% \n", .{
+    std.debug.print("{s:<18} | {s:<26} | {s:^13} | {d:.1}% \n", .{
+        @tagName(model),
         label,
         frac,
         (@as(f32, @floatFromInt(got)) / @as(f32, @floatFromInt(total))) * 100,
     });
-    score += got;
-    max_score += total;
 }
 
 const std = @import("std");
@@ -340,6 +397,5 @@ const testing_allocator = std.testing.allocator;
 
 const dve = @import("dve");
 const embed = dve.embed;
+const EmbeddingModel = embed.EmbeddingModel;
 const SearchResult = dve.SearchResult;
-const embedding_model = dve.embedding_model;
-const TestVecDB = dve.VectorEngine(embedding_model);

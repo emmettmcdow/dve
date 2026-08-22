@@ -7,7 +7,6 @@ pub fn build(b: *std.Build) void {
     const dve_dep = b.dependency("dve", .{
         .target = target,
         .optimize = optimize,
-        .@"embedding-model" = .mpnet_embedding,
     });
     const dve_module = dve_dep.module("dve");
 

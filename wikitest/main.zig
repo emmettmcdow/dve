@@ -22,7 +22,9 @@ const dve = @import("dve");
 /// output dwarfs the harness's own, so raise the threshold.
 pub const std_options: std.Options = .{ .log_level = .warn };
 
-const VectorEngine = dve.VectorEngine(dve.embedding_model);
+/// Every model is compiled into the library; the consumer names the one it wants.
+const model: dve.embed.EmbeddingModel = .mpnet_embedding;
+const VectorEngine = dve.VectorEngine(model);
 
 const MAX_ARTICLE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -93,7 +95,7 @@ fn runEmbed(allocator: std.mem.Allocator, opts: Options) !void {
 
     std.debug.print(
         "model      {s} ({d} dims)\ncorpus     {s} ({d} articles selected)\ndatabase   {s}\n\n",
-        .{ @tagName(dve.embedding_model), dve.types.vec_sz, opts.corpus, names.len, opts.db },
+        .{ @tagName(model), model.vecSize(), opts.corpus, names.len, opts.db },
     );
 
     var load_timer = try std.time.Timer.start();
@@ -255,8 +257,8 @@ fn runStat(allocator: std.mem.Allocator, opts: Options) !void {
         "model      {s} ({d} dims)\nvectors    {d} occupied / {d} capacity\npaths      {d}\n" ++
             "load       {D}\npeak rss   {f}\n\nfiles:\n",
         .{
-            @tagName(dve.embedding_model),
-            dve.types.vec_sz,
+            @tagName(model),
+            model.vecSize(),
             db.vec_storage.vec_n,
             db.vec_storage.meta.capacity,
             db.note_id_map.count(),

@@ -32,10 +32,7 @@ const BaseEmbedder = union(EmbeddingModel) {
 /// VectorEngine is the primary way to use the vector engine. It requires selecting an
 /// EmbeddingModel. The EmbeddingModel must match the Embedder passed into the initialization func.
 pub fn VectorEngine(embedding_model: EmbeddingModel) type {
-    const VEC_SZ = switch (embedding_model) {
-        .apple_nlembedding => NLEmbedder.VEC_SZ,
-        .mpnet_embedding => MpnetEmbedder.VEC_SZ,
-    };
+    const VEC_SZ = embedding_model.vecSize();
     const VEC_TYPE = switch (embedding_model) {
         .apple_nlembedding => NLEmbedder.VEC_TYPE,
         .mpnet_embedding => MpnetEmbedder.VEC_TYPE,

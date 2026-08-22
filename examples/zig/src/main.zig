@@ -1,7 +1,7 @@
 const std = @import("std");
 const dve = @import("dve");
 
-const VectorEngine = dve.VectorEngine(dve.embedding_model);
+const VectorEngine = dve.VectorEngine(.mpnet_embedding);
 
 const DOCUMENTS = [_]struct { key: []const u8, text: []const u8 }{
     .{ .key = "solar-system", .text = "The solar system consists of the Sun and the objects that orbit it, including eight planets, their moons, and countless asteroids and comets." },

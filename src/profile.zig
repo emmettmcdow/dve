@@ -1,20 +1,12 @@
 const std = @import("std");
 const dve = @import("dve");
 const embed = dve.embed;
-const embedding_model = dve.embedding_model;
+const EmbeddingModel = embed.EmbeddingModel;
 const NoteID = dve.note_id_map.NoteID;
 
 const testing_allocator = std.testing.allocator;
 
-const VEC_SZ: usize = switch (embedding_model) {
-    .apple_nlembedding => embed.NLEmbedder.VEC_SZ,
-    .mpnet_embedding => embed.MpnetEmbedder.VEC_SZ,
-};
 const VEC_TYPE = f32;
-const Vector = @Vector(VEC_SZ, VEC_TYPE);
-
-const TestVecDB = dve.VectorEngine(embedding_model);
-const VecStorage = dve.vec_storage.Storage(VEC_SZ, VEC_TYPE);
 
 const words = [_][]const u8{
     // tech
@@ -78,7 +70,8 @@ fn generateNote(buf: []u8, rng: std.Random, term_idx: *usize) usize {
     return pos;
 }
 
-fn randomUnitVector(rng: std.Random) Vector {
+fn randomUnitVector(comptime VEC_SZ: usize, rng: std.Random) @Vector(VEC_SZ, VEC_TYPE) {
+    const Vector = @Vector(VEC_SZ, VEC_TYPE);
     var v: Vector = @splat(0.0);
     var sum_sq: f32 = 0.0;
     for (0..VEC_SZ) |i| {
@@ -94,7 +87,7 @@ const NOTE_COUNT = 100;
 const NOTE_BUF_SIZE = 512;
 const SEARCH_QUERIES = 20;
 
-test "profile embedding" {
+fn profileEmbedding(comptime model: EmbeddingModel) !void {
     var prng = std.Random.DefaultPrng.init(42);
     const rng = prng.random();
 
@@ -103,7 +96,7 @@ test "profile embedding" {
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
 
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
     var path_buf: [32]u8 = undefined;
@@ -138,14 +131,14 @@ test "profile embedding" {
 
     std.debug.print(
         \\
-        \\=== EMBEDDING ===
+        \\=== EMBEDDING ({s}) ===
         \\sentences:        {d}
         \\notes:            {d}
         \\total time:       {d:.1}s
         \\avg per sentence: {d:.1}ms
         \\sentences/sec:    {d:.1}
         \\
-    , .{ total_sentences, NOTE_COUNT, embed_s, ms_per_sentence, sentences_per_sec });
+    , .{ @tagName(model), total_sentences, NOTE_COUNT, embed_s, ms_per_sentence, sentences_per_sec });
 
     // === SEARCH (small corpus) ===
     var search_buf: [50]dve.SearchResult = undefined;
@@ -164,22 +157,25 @@ test "profile embedding" {
 
     std.debug.print(
         \\
-        \\=== SEARCH (small, ~{d} vecs) ===
+        \\=== SEARCH ({s}, small, ~{d} vecs) ===
         \\queries:         {d}
         \\avg per query:   {d:.2}ms
         \\
-    , .{ total_sentences, SEARCH_QUERIES, ms_per_query });
+    , .{ @tagName(model), total_sentences, SEARCH_QUERIES, ms_per_query });
 }
 
-test "profile search - large corpus" {
+fn profileSearchLargeCorpus(comptime model: EmbeddingModel) !void {
+    const VEC_SZ = comptime model.vecSize();
+    const VecStorage = dve.vec_storage.Storage(VEC_SZ, VEC_TYPE);
+
     var prng = std.Random.DefaultPrng.init(99);
     const rng = prng.random();
 
     std.debug.print(
         \\
-        \\=== SEARCH (large corpus) ===
+        \\=== SEARCH ({s}, large corpus, {d}-dim) ===
         \\
-    , .{});
+    , .{ @tagName(model), VEC_SZ });
 
     const sizes = [_]usize{ 1000, 5000, 10000 };
     inline for (sizes) |N| {
@@ -191,7 +187,7 @@ test "profile search - large corpus" {
 
         // Fill with random unit vectors (no CoreML)
         for (0..N) |i| {
-            const vec = randomUnitVector(rng);
+            const vec = randomUnitVector(VEC_SZ, rng);
             _ = try storage.put(@intCast(i), 0, 1, vec);
         }
 
@@ -199,7 +195,7 @@ test "profile search - large corpus" {
         var search_ns: u64 = 0;
 
         for (0..SEARCH_QUERIES) |_| {
-            const query = randomUnitVector(rng);
+            const query = randomUnitVector(VEC_SZ, rng);
             const t0: i128 = std.time.nanoTimestamp();
             _ = try storage.search(query, &search_buf, 0.5);
             const t1: i128 = std.time.nanoTimestamp();
@@ -209,4 +205,26 @@ test "profile search - large corpus" {
         const ms_per_query = @as(f64, @floatFromInt(search_ns)) / 1e6 / @as(f64, SEARCH_QUERIES);
         std.debug.print("N={d:<6}  avg: {d:.2}ms\n", .{ N, ms_per_query });
     }
+}
+
+////////////////////////
+// Per-model test set //
+////////////////////////
+// Same shape as src/benchmark.zig: one test per (case x model), named
+// "<model>: <case>", so `-Dtest-filter=<model>` profiles a single model.
+// The large-corpus search is worth running per model too -- it exercises
+// 512-wide vs 768-wide vectors, which is a real difference.
+
+test "mpnet_embedding: profile embedding" {
+    try profileEmbedding(.mpnet_embedding);
+}
+test "mpnet_embedding: profile search - large corpus" {
+    try profileSearchLargeCorpus(.mpnet_embedding);
+}
+
+test "apple_nlembedding: profile embedding" {
+    try profileEmbedding(.apple_nlembedding);
+}
+test "apple_nlembedding: profile search - large corpus" {
+    try profileSearchLargeCorpus(.apple_nlembedding);
 }

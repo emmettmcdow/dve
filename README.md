@@ -15,8 +15,8 @@ const dve = @import("dve");
 // Open a directory to store the vector database.
 const dir = try std.fs.cwd().makeOpenPath("my_vectors", .{});
 
-// VectorEngine is generic over the embedding model, which is set at build time.
-const VectorEngine = dve.VectorEngine(dve.embedding_model);
+// Select the model you want. See USAGE.md for available model options and tradeoffs.
+const VectorEngine = dve.VectorEngine(.mpnet_embedding);
 const vectors = try VectorEngine.init(allocator, dir, .{});
 defer vectors.deinit();
 
