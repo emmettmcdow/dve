@@ -100,6 +100,7 @@ fn runEmbed(allocator: std.mem.Allocator, opts: Options) !void {
 
     var load_timer = try std.time.Timer.start();
     const db = try VectorEngine.init(allocator, db_dir, .{});
+    defer db.deinit();
     const load_ns = load_timer.read();
 
     if (db.vec_storage.vec_n != 0) {
@@ -190,6 +191,7 @@ fn runSearch(allocator: std.mem.Allocator, opts: Options) !void {
 
     var load_timer = try std.time.Timer.start();
     const db = try VectorEngine.init(allocator, db_dir, .{});
+    defer db.deinit();
     const load_ns = load_timer.read();
 
     std.debug.print(
@@ -251,6 +253,7 @@ fn runStat(allocator: std.mem.Allocator, opts: Options) !void {
 
     var load_timer = try std.time.Timer.start();
     const db = try VectorEngine.init(allocator, db_dir, .{});
+    defer db.deinit();
     const load_ns = load_timer.read();
 
     std.debug.print(
