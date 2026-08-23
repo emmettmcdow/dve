@@ -12,11 +12,13 @@
 pub const EmbeddingModel = enum {
     apple_nlembedding,
     mpnet_embedding,
+    llama_nomic_embed_text_v1_5_f32,
 
     pub fn referenceImplementationName(self: EmbeddingModel) []const u8 {
         return switch (self) {
             .mpnet_embedding => MpnetEmbedder.REFERENCE_IMPLEMENTATION_NAME,
             .apple_nlembedding => NLEmbedder.REFERENCE_IMPLEMENTATION_NAME,
+            .llama_nomic_embed_text_v1_5_f32 => LlamaNomicEmbedTextV15F32.REFERENCE_IMPLEMENTATION_NAME,
         };
     }
 
@@ -24,6 +26,7 @@ pub const EmbeddingModel = enum {
         return switch (self) {
             .mpnet_embedding => MpnetEmbedder.VEC_SZ,
             .apple_nlembedding => NLEmbedder.VEC_SZ,
+            .llama_nomic_embed_text_v1_5_f32 => LlamaNomicEmbedTextV15F32.VEC_SZ,
         };
     }
 };
@@ -31,11 +34,13 @@ pub const EmbeddingModel = enum {
 pub const EmbeddingModelOutput = union(EmbeddingModel) {
     apple_nlembedding: *const @Vector(NLEmbedder.VEC_SZ, NLEmbedder.VEC_TYPE),
     mpnet_embedding: *const @Vector(MpnetEmbedder.VEC_SZ, MpnetEmbedder.VEC_TYPE),
+    llama_nomic_embed_text_v1_5_f32: *const @Vector(LlamaNomicEmbedTextV15F32.VEC_SZ, LlamaNomicEmbedTextV15F32.VEC_TYPE),
 
     pub fn slice(self: EmbeddingModelOutput) []const f32 {
         return switch (self) {
             .mpnet_embedding => |v| @as(*const [MpnetEmbedder.VEC_SZ]f32, @ptrCast(v)),
             .apple_nlembedding => |v| @as(*const [NLEmbedder.VEC_SZ]f32, @ptrCast(v)),
+            .llama_nomic_embed_text_v1_5_f32 => |v| @as(*const [LlamaNomicEmbedTextV15F32.VEC_SZ]f32, @ptrCast(v)),
         };
     }
 
@@ -43,6 +48,7 @@ pub const EmbeddingModelOutput = union(EmbeddingModel) {
         return switch (self) {
             .mpnet_embedding => MpnetEmbedder.VEC_SZ,
             .apple_nlembedding => NLEmbedder.VEC_SZ,
+            .llama_nomic_embed_text_v1_5_f32 => LlamaNomicEmbedTextV15F32.VEC_SZ,
         };
     }
 };
@@ -669,6 +675,100 @@ pub const NLEmbedder = struct {
     }
 };
 
+pub const LlamaNomicEmbedTextV15F32 = struct {
+    pub const VEC_SZ = 768;
+    pub const VEC_TYPE = f32;
+    pub const ID = EmbeddingModel.llama_nomic_embed_text_v1_5_f32;
+    pub const REFERENCE_IMPLEMENTATION_NAME = "llama-nomic-embed-text-v1-5-f32";
+    // Tuned against test-benchmark, which scores both matches and non-matches
+    // through this cutoff: 0.55 peaks at 89.6%, against 81.7% at 0.45 and 79.1%
+    // at 0.65. nomic-embed's similarities sit higher than mpnet's, so mpnet's
+    // 0.40 let far too much through.
+    pub const THRESHOLD = 0.55;
+    pub const STRICT_THRESHOLD = THRESHOLD + 0.1;
+    // Suffixed by storage type: a quantized database is not loadable by an unquantized
+    // build, so the two live side by side rather than one refusing the other's file.
+    pub const PATH = @tagName(ID) ++ db_suffix ++ ".db";
+
+    pub const MAX_CTX = 8192;
+
+    pub fn init() !LlamaNomicEmbedTextV15F32 {
+        // The bridge loads the model lazily on first embed, so there is nothing
+        // to set up here -- but fail loudly now rather than per-call if the
+        // backend was never linked.
+        if (comptime !llama.enabled) return llama.Error.LlamaNotLinked;
+        return .{};
+    }
+
+    pub fn init_self(self: *LlamaNomicEmbedTextV15F32) !void {
+        self.* = try LlamaNomicEmbedTextV15F32.init();
+    }
+
+    pub fn deinit(self: *LlamaNomicEmbedTextV15F32) void {
+        _ = self;
+        return;
+    }
+
+    pub fn embedder(self: *LlamaNomicEmbedTextV15F32) Embedder {
+        return .{
+            .ptr = self,
+            .splitFn = split,
+            .embedFn = embed,
+            .deinitFn = deinitFn,
+            .id = ID,
+            .threshold = THRESHOLD,
+            .strict_threshold = STRICT_THRESHOLD,
+            .path = PATH,
+        };
+    }
+
+    fn deinitFn(ptr: *anyopaque) void {
+        _ = ptr;
+        return;
+    }
+
+    fn split(self: *anyopaque, note: []const u8) SentenceSpliterator {
+        _ = self;
+        return SentenceSpliterator.init(note);
+    }
+
+    fn embed(ptr: *anyopaque, allocator: Allocator, str: []const u8) !?EmbeddingModelOutput {
+        _ = ptr;
+        const zone = tracy.beginZone(@src(), .{
+            .name = "embed.zig:LlamaNomicEmbedTextV15F32.embed",
+        });
+        defer zone.end();
+
+        if (str.len == 0) {
+            std.log.info("Skipping embed of zero-length string\n", .{});
+            return null;
+        }
+        if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
+            std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'\n", .{str});
+        }
+
+        // The bridge takes a C string; anything past MAX_CTX is truncated there.
+        const c_str = try allocator.dupeZ(u8, str);
+        defer allocator.free(c_str);
+
+        const VecType = @Vector(VEC_SZ, VEC_TYPE);
+        const vec_buf = try allocator.alignedAlloc(
+            VEC_TYPE,
+            std.mem.Alignment.of(VecType),
+            VEC_SZ,
+        );
+        errdefer allocator.free(vec_buf);
+
+        // llama_bridge.c serializes calls and L2-normalizes the result.
+        const written = try llama.embed(vec_buf, c_str);
+        assert(written == VEC_SZ);
+
+        return EmbeddingModelOutput{
+            .llama_nomic_embed_text_v1_5_f32 = @ptrCast(vec_buf.ptr),
+        };
+    }
+};
+
 pub const Chunk = struct {
     contents: []const u8,
     start_i: u32,
@@ -1198,6 +1298,30 @@ test "embed with punctuation" {
     _ = try e2.embed(allocator, "*foo bar*");
 }
 
+test "embed - LlamaNomicEmbedTextV15F32 solo" {
+    // The bridge is only compiled and linked for -Dembedding-model=llama_...
+    if (!llama.enabled) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var nl = try LlamaNomicEmbedTextV15F32.init();
+    defer nl.deinit();
+
+    var e = nl.embedder();
+
+    var output = try e.embed(allocator, "Hello world");
+    var vec = output.?.llama_nomic_embed_text_v1_5_f32.*;
+    var sum = @reduce(.Add, vec);
+    try std.testing.expectApproxEqAbs(0.23469175, sum, 1e-4);
+
+    output = try e.embed(allocator, "Hello again world");
+    vec = output.?.llama_nomic_embed_text_v1_5_f32.*;
+    sum = @reduce(.Add, vec);
+    try std.testing.expectApproxEqAbs(0.17591982, sum, 1e-4);
+}
+
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
@@ -1206,11 +1330,14 @@ const expectEqualStrings = std.testing.expectEqualStrings;
 const expectEqualSlices = std.testing.expectEqualSlices;
 const isAlphanumeric = std.ascii.isAlphanumeric;
 const parseFromSliceLeaky = std.json.parseFromSliceLeaky;
+const process = std.process;
 const tokenizer_mod = @import("tokenizer.zig");
 const db_suffix = @import("vec_util.zig").db_suffix;
 const validateL2 = @import("vec_util.zig").validateL2;
 const WordPieceTokenizer = tokenizer_mod.WordPieceTokenizer;
 const Mutex = std.Thread.Mutex;
+
+const llama = @import("llama.zig");
 
 const objc = @import("objc");
 const Object = objc.Object;

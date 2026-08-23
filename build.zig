@@ -11,6 +11,28 @@ pub fn build(b: *std.Build) !void {
         "storage-quantize",
         "Whether to quantize vectors before storage (none, f_16 or i_8)",
     ) orelse .none;
+    // Which embedding model to use is a call-site choice, but llama.cpp is an
+    // external dependency: it has to be linked or not at build time. Off by
+    // default, so dve still builds with no llama.cpp present.
+    const llama = b.option(
+        bool,
+        "llama",
+        "Link the llama.cpp embedding backend (default: false)",
+    ) orelse false;
+    // Root of a built llama.cpp checkout: needs include/, ggml/include/ and the
+    // shared libraries in build/bin/. Only consulted when -Dllama is set.
+    const llama_root = b.option(
+        []const u8,
+        "llama-path",
+        "Path to a built llama.cpp checkout (default: $HOME/llama.cpp)",
+    ) orelse b.pathJoin(&.{ std.posix.getenv("HOME") orelse ".", "llama.cpp" });
+    // Overrides the gguf baked into src/llama_bridge.c. The DVE_LLAMA_MODEL
+    // environment variable overrides both at run time.
+    const llama_model_path = b.option(
+        []const u8,
+        "llama-model",
+        "Path to the .gguf embedding model (default: <llama-path>/build/bin/nomic-embed-text-v1.5.f32.gguf)",
+    ) orelse b.pathJoin(&.{ llama_root, "build", "bin", "nomic-embed-text-v1.5.f32.gguf" });
 
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -54,11 +76,13 @@ pub fn build(b: *std.Build) !void {
     const real_options = b.addOptions();
     real_options.addOption(bool, "debug", debug);
     real_options.addOption(StorageQuantize, "quant", quant);
+    real_options.addOption(bool, "llama", llama);
 
     // Fake config used for storage/util tests that don't need real embeddings.
     const fake_options = b.addOptions();
     fake_options.addOption(bool, "debug", debug);
     fake_options.addOption(StorageQuantize, "quant", .none);
+    fake_options.addOption(bool, "llama", false);
 
     ////////////////////
     // Public Module  //
@@ -76,6 +100,13 @@ pub fn build(b: *std.Build) !void {
     dve_mod.linkFramework("NaturalLanguage", .{});
     dve_mod.linkFramework("CoreML", .{});
     dve_mod.linkFramework("Foundation", .{});
+    // Same idea for the llama bridge: carried on the module, so a consumer that
+    // builds with -Dllama gets the bridge and the libllama link for free.
+    const llama_bridge: ?LlamaBridge = if (llama)
+        llamaBridgeLib(b, target, optimize, llama_root, llama_model_path)
+    else
+        null;
+    if (llama_bridge) |bridge| bridge.link(dve_mod);
     // vstore.zig does its file IO through pfile.zig, a thin shim onto libc.
     dve_mod.link_libc = true;
     ////////////////
@@ -249,6 +280,8 @@ pub fn build(b: *std.Build) !void {
             .filters = if (test_filter != null) filters else &.{},
         });
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        // Compiles src/ directly, so it does not inherit the bridge from dve_mod.
+        if (llama_bridge) |bridge| bridge.link(t.root_module);
         const run = runTest(b, t, use_lldb);
         for (addModelInstalls(b, coreml_models)) |s| run.step.dependOn(s);
         test_embed.dependOn(&run.step);
@@ -265,6 +298,8 @@ pub fn build(b: *std.Build) !void {
             .filters = if (test_filter != null) filters else &.{},
         });
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        // Compiles src/ directly, so it does not inherit the bridge from dve_mod.
+        if (llama_bridge) |bridge| bridge.link(t.root_module);
         const run = runTest(b, t, use_lldb);
         for (addModelInstalls(b, coreml_models)) |s| run.step.dependOn(s);
         test_vector.dependOn(&run.step);
@@ -447,6 +482,9 @@ pub fn build(b: *std.Build) !void {
         // Pinned like the other options above: the shipped framework's storage format does
         // not follow -Dstorage-quantize.
         xcfw_options.addOption(StorageQuantize, "quant", StorageQuantize.none);
+        // The shipped framework never carries the llama.cpp backend: it would
+        // drag libllama.dylib and the libggml-*.dylib set into the bundle.
+        xcfw_options.addOption(bool, "llama", false);
 
         // Tracy must always be disabled in the xcframework. When tracy_enable=true
         // Tracy starts C++ background threads (via global constructors) that
@@ -567,6 +605,67 @@ fn addModelInstalls(b: *std.Build, coreml_models: *std.Build.Dependency) [2]*Ste
     );
     return .{ &install_model.step, &install_tokenizer.step };
 }
+
+/// src/llama_bridge.c as a static library of its own, linked against a prebuilt
+/// llama.cpp. Building it as one artifact means the public `dve` module and the
+/// in-repo targets share a single compile of the bridge, and the libllama link,
+/// its search path and its rpath travel to whatever links it.
+///
+/// src/llama.zig compiles to a stub unless -Dllama is set, so nothing here runs
+/// for the default build and llama.cpp does not need to be present.
+fn llamaBridgeLib(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    llama_root: []const u8,
+    llama_model_path: []const u8,
+) LlamaBridge {
+    const lib_dir = b.pathJoin(&.{ llama_root, "build", "bin" });
+    const lib = b.addLibrary(.{
+        .linkage = .static,
+        .name = "dve_llama_bridge",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    lib.root_module.addCSourceFile(.{
+        .file = b.path("src/llama_bridge.c"),
+        .flags = &.{
+            "-std=c11",
+            "-Wall",
+            "-Wextra",
+            b.fmt("-DDVE_LLAMA_MODEL_PATH=\"{s}\"", .{llama_model_path}),
+        },
+    });
+    lib.root_module.addIncludePath(b.path("src"));
+    lib.root_module.addIncludePath(.{
+        .cwd_relative = b.pathJoin(&.{ llama_root, "include" }),
+    });
+    lib.root_module.addIncludePath(.{
+        .cwd_relative = b.pathJoin(&.{ llama_root, "ggml", "include" }),
+    });
+    lib.root_module.addLibraryPath(.{ .cwd_relative = lib_dir });
+    lib.root_module.linkSystemLibrary("llama", .{});
+    return .{ .lib = lib, .lib_dir = lib_dir };
+}
+
+/// A built bridge, and the one call that attaches it to a module.
+const LlamaBridge = struct {
+    lib: *Step.Compile,
+    lib_dir: []const u8,
+
+    fn link(self: LlamaBridge, m: *std.Build.Module) void {
+        m.linkLibrary(self.lib);
+        // `-lllama` rides along with the archive, but a static library does not
+        // propagate its search path: the linker has to be told again where to
+        // find libllama, and dyld where to find it and the libggml-*.dylib it
+        // pulls in -- cmake leaves both wherever it built them.
+        m.addLibraryPath(.{ .cwd_relative = self.lib_dir });
+        m.addRPath(.{ .cwd_relative = self.lib_dir });
+    }
+};
 
 const StorageQuantize = enum { none, f_16, i_8 };
 

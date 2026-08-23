@@ -45,6 +45,7 @@ pub const InitOptions = struct {
 const BaseEmbedder = union(EmbeddingModel) {
     apple_nlembedding: *NLEmbedder,
     mpnet_embedding: *MpnetEmbedder,
+    llama_nomic_embed_text_v1_5_f32: *LlamaNomicEmbedTextV15F32,
 };
 
 /// VectorEngine is the primary way to use the vector engine. It requires selecting an
@@ -54,6 +55,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
     const VEC_TYPE = switch (embedding_model) {
         .apple_nlembedding => NLEmbedder.VEC_TYPE,
         .mpnet_embedding => MpnetEmbedder.VEC_TYPE,
+        .llama_nomic_embed_text_v1_5_f32 => LlamaNomicEmbedTextV15F32.VEC_TYPE,
     };
 
     const EmbedJob = struct {
@@ -146,10 +148,19 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                     });
                     break :o BaseEmbedder{ .mpnet_embedding = e };
                 },
+                .llama_nomic_embed_text_v1_5_f32 => {
+                    const e = try allocator.create(LlamaNomicEmbedTextV15F32);
+                    errdefer allocator.destroy(e);
+                    // The gguf is resolved by the bridge, not by opts: it comes
+                    // from -Dllama-model or DVE_LLAMA_MODEL.
+                    try e.init_self();
+                    break :o BaseEmbedder{ .llama_nomic_embed_text_v1_5_f32 = e };
+                },
             };
             const embedder = switch (embedding_model) {
                 .apple_nlembedding => base_embedder.apple_nlembedding.embedder(),
                 .mpnet_embedding => base_embedder.mpnet_embedding.embedder(),
+                .llama_nomic_embed_text_v1_5_f32 => base_embedder.llama_nomic_embed_text_v1_5_f32.embedder(),
             };
 
             var vecs = try VecStorage.init(allocator, basedir, .{ .path = embedder.path });
@@ -222,6 +233,9 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             switch (embedding_model) {
                 .apple_nlembedding => self.allocator.destroy(self.base_embedder.apple_nlembedding),
                 .mpnet_embedding => self.allocator.destroy(self.base_embedder.mpnet_embedding),
+                .llama_nomic_embed_text_v1_5_f32 => self.allocator.destroy(
+                    self.base_embedder.llama_nomic_embed_text_v1_5_f32,
+                ),
             }
             self.work_queue.deinit();
             self.note_id_map.deinit();
@@ -611,6 +625,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             return switch (embedding_model) {
                 .apple_nlembedding => NLEmbedder.PATH,
                 .mpnet_embedding => MpnetEmbedder.PATH,
+                .llama_nomic_embed_text_v1_5_f32 => LlamaNomicEmbedTextV15F32.PATH,
             };
         }
 
@@ -1061,6 +1076,10 @@ fn RawVec(comptime model: EmbeddingModel) type {
     return switch (model) {
         .apple_nlembedding => @Vector(NLEmbedder.VEC_SZ, NLEmbedder.VEC_TYPE),
         .mpnet_embedding => @Vector(MpnetEmbedder.VEC_SZ, MpnetEmbedder.VEC_TYPE),
+        .llama_nomic_embed_text_v1_5_f32 => @Vector(
+            LlamaNomicEmbedTextV15F32.VEC_SZ,
+            LlamaNomicEmbedTextV15F32.VEC_TYPE,
+        ),
     };
 }
 
@@ -1844,6 +1863,7 @@ const MpnetEmbedder = embed.MpnetEmbedder;
 /// by-value form copies 8 KB per candidate -- see experiments/results/storebench.md, where
 /// that was the whole cost of a whole-store scan.
 const storedDotAt = @import("vec_util.zig").storedDotAt;
+const LlamaNomicEmbedTextV15F32 = embed.LlamaNomicEmbedTextV15F32;
 const quant32to16 = @import("vec_util.zig").quant32to16;
 const quant32toi8 = @import("vec_util.zig").quant32toi8;
 const spawn = Thread.spawn;

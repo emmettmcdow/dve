@@ -14,6 +14,10 @@ const VectorEngine = dve.VectorEngine(.mpnet_embedding);
   on our benchmarks. Needs model files; see [Install](#install) below.
 - **`.apple_nlembedding`** (Apple NaturalLanguage) — 512 dimensions, scores 66% on our benchmarks.
   Served by the OS, so it needs no model files. Good for quick prototyping.
+- **`.llama_nomic_embed_text_v1_5_f32`** (llama.cpp / nomic-embed-text-v1.5) — 768 dimensions,
+  scores 90% on our benchmarks, with an 8192-token context. The one backend that is *not*
+  compiled in by default: it needs a prebuilt llama.cpp and `-Dllama`. See
+  [llama.cpp backend](#llamacpp-backend).
 
 You own the model files. `.mpnet_embedding` looks for them next to your executable
 (`<exe>/../share/`) or in the app bundle's `Resources/`.
@@ -22,6 +26,47 @@ per-instance with `.{ .model_path = "...", .tokenizer_path = "..." }`.
 
 > **Note:** The database format differs between models — 768-dim vectors are not readable as
 > 512-dim ones. Use the same model consistently for a given database directory.
+
+### llama.cpp backend
+
+This backend is the only one with a dependency outside the Zig package graph, so unlike the other
+two it is not compiled in by default: you opt in with `-Dllama`, and without that flag dve builds
+with no llama.cpp present. Selecting `.llama_nomic_embed_text_v1_5_f32` in a build that was not
+given `-Dllama` fails with `error.LlamaNotLinked`; `dve.llama.enabled` reports which you have.
+
+You need a llama.cpp checkout built as shared libraries, and the nomic-embed-text-v1.5 GGUF:
+
+```sh
+git clone https://github.com/ggml-org/llama.cpp ~/llama.cpp
+cmake -B ~/llama.cpp/build -S ~/llama.cpp -DBUILD_SHARED_LIBS=ON
+cmake --build ~/llama.cpp/build --config Release
+# then place nomic-embed-text-v1.5.f32.gguf in ~/llama.cpp/build/bin/
+```
+
+dve looks for `include/`, `ggml/include/` and the shared libraries in `build/bin/` under that
+checkout. Point it elsewhere with `-Dllama-path`, and override the GGUF it picks with
+`-Dllama-model`:
+
+```sh
+zig build -Dllama -Dllama-path=/opt/llama.cpp
+```
+
+A consumer forwards the same flags to the dependency:
+
+```zig
+const dve_dep = b.dependency("dve", .{
+    .target = target,
+    .optimize = optimize,
+    .llama = true,
+    .@"llama-path" = "/opt/llama.cpp",
+});
+```
+
+The build bakes the model path into the binary, and `DVE_LLAMA_MODEL` overrides it at run time.
+Set `DVE_LLAMA_VERBOSE` to let llama.cpp's own logging through; it is suppressed by default.
+
+The libllama link and its rpath travel with the `dve` module, so beyond the flags above a
+consumer needs nothing in its own `build.zig`.
 
 ## Zig
 

@@ -14,6 +14,18 @@ cd zig
 zig build run
 ```
 
+Pick a different embedding model with `-Dmodel`:
+
+```sh
+zig build run -Dmodel=apple_nlembedding
+zig build run -Dmodel=llama_nomic_embed_text_v1_5_f32
+```
+
+The llama model needs a prebuilt llama.cpp — see
+[llama.cpp backend](../USAGE.md#llamacpp-backend). The example passes `-Dllama` to dve for you
+when you select it, and looks in `$HOME/llama.cpp`; pass `-Dllama-path=...` if yours lives
+elsewhere.
+
 ## Swift (Experimental)
 
 > **Note:** The Swift example works but the bindings are experimental. First-class Swift support

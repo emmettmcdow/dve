@@ -1,7 +1,14 @@
 const std = @import("std");
 const dve = @import("dve");
+const example_config = @import("example_config");
 
-const VectorEngine = dve.VectorEngine(.mpnet_embedding);
+// Every model is compiled into the library, so this is just a name lookup --
+// pick it with `-Dmodel=` (see this example's README).
+const model: dve.embed.EmbeddingModel = @field(
+    dve.embed.EmbeddingModel,
+    @tagName(example_config.model),
+);
+const VectorEngine = dve.VectorEngine(model);
 
 const DOCUMENTS = [_]struct { key: []const u8, text: []const u8 }{
     .{ .key = "solar-system", .text = "The solar system consists of the Sun and the objects that orbit it, including eight planets, their moons, and countless asteroids and comets." },

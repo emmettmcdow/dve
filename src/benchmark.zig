@@ -354,6 +354,33 @@ test "apple_nlembedding: all" {
     reportTotal(.apple_nlembedding);
 }
 
+// The llama backend is only linked with -Dllama, so these skip by default
+// rather than failing a plain `zig build test`.
+test "llama_nomic_embed_text_v1_5_f32: binary single words" {
+    if (!dve.llama.enabled) return error.SkipZigTest;
+    try binarySingleWords(.llama_nomic_embed_text_v1_5_f32);
+}
+test "llama_nomic_embed_text_v1_5_f32: sentence similarity" {
+    if (!dve.llama.enabled) return error.SkipZigTest;
+    try sentenceSimilarity(.llama_nomic_embed_text_v1_5_f32);
+}
+test "llama_nomic_embed_text_v1_5_f32: sentence split - 1/3 match" {
+    if (!dve.llama.enabled) return error.SkipZigTest;
+    try sentenceSplit(.llama_nomic_embed_text_v1_5_f32);
+}
+test "llama_nomic_embed_text_v1_5_f32: query length parity" {
+    if (!dve.llama.enabled) return error.SkipZigTest;
+    try queryLengthParity(.llama_nomic_embed_text_v1_5_f32);
+}
+test "llama_nomic_embed_text_v1_5_f32: long complex sentences" {
+    if (!dve.llama.enabled) return error.SkipZigTest;
+    try longComplexSentences(.llama_nomic_embed_text_v1_5_f32);
+}
+test "llama_nomic_embed_text_v1_5_f32: all" {
+    if (!dve.llama.enabled) return error.SkipZigTest;
+    reportTotal(.llama_nomic_embed_text_v1_5_f32);
+}
+
 /////////////
 // Scoring //
 /////////////
