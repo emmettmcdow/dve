@@ -151,6 +151,27 @@ pub fn build(b: *std.Build) !void {
         test_pfile.dependOn(&runTest(b, t, use_lldb).step);
     }
 
+    const test_vstore = b.step("test-vstore", "run tests for src/vstore.zig");
+    {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/vstore.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+            .filters = if (test_filter != null) filters else &.{},
+        });
+        // vstore does its file IO through src/pfile.zig, straight onto libc.
+        t.root_module.link_libc = true;
+        t.root_module.addOptions("config", fake_options);
+        t.root_module.addImport("tracy", tracy_dep.module("tracy"));
+        if (tracy_enable) {
+            t.root_module.linkLibrary(tracy_dep.artifact("tracy"));
+            t.root_module.link_libcpp = true;
+        }
+        test_vstore.dependOn(&runTest(b, t, use_lldb).step);
+    }
+
     const test_note_id_map = b.step("test-note_id_map", "run tests for src/note_id_map.zig");
     {
         const t = b.addTest(.{
@@ -294,6 +315,7 @@ pub fn build(b: *std.Build) !void {
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(test_vec_storage);
     test_step.dependOn(test_pfile);
+    test_step.dependOn(test_vstore);
     test_step.dependOn(test_note_id_map);
     test_step.dependOn(test_util);
     test_step.dependOn(test_tokenizer);
