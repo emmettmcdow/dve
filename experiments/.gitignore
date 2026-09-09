@@ -1,0 +1,9 @@
+# Generated test data -- up to 32 GiB, regenerate with `make` + run.sh
+*.dat
+# Compiled harness binaries
+mkdata
+seq
+stride
+rand
+# Raw hyperfine JSON; the committed summary lives in results/*.md
+results/raw/
