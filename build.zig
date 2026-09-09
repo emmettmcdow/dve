@@ -135,6 +135,22 @@ pub fn build(b: *std.Build) !void {
         test_vec_storage.dependOn(&runTest(b, t, use_lldb).step);
     }
 
+    const test_pfile = b.step("test-pfile", "run tests for src/pfile.zig");
+    {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/pfile.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+            .filters = if (test_filter != null) filters else &.{},
+        });
+        // pfile is a thin shim straight onto libc -- open, pread, pwrite, fsync, fcntl --
+        // so it needs libc and nothing else. No config, no tracy.
+        t.root_module.link_libc = true;
+        test_pfile.dependOn(&runTest(b, t, use_lldb).step);
+    }
+
     const test_note_id_map = b.step("test-note_id_map", "run tests for src/note_id_map.zig");
     {
         const t = b.addTest(.{
@@ -277,6 +293,7 @@ pub fn build(b: *std.Build) !void {
 
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(test_vec_storage);
+    test_step.dependOn(test_pfile);
     test_step.dependOn(test_note_id_map);
     test_step.dependOn(test_util);
     test_step.dependOn(test_tokenizer);
