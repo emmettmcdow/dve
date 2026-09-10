@@ -428,21 +428,25 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             const old_vecs = try self.vec_storage.vecsForNote(allocator, note_id);
             defer allocator.free(old_vecs);
 
-            // TODO(cutover): remove before putting. Either order is correct -- a `put` can only
-            // claim a slot that is already free, so it can never land on a live vector -- but
-            // this order removes the old rows *after* the new ones are placed, so the new rows
-            // cannot reuse the slots the old ones are about to vacate. Steady state is two
-            // generations of every document on disk instead of one. Removing first halves both
-            // the file and the in-memory codes array that a search has to scan.
-            for (embedded_sentences) |sentence| {
-                _ = try self.vec_storage.put(note_id, sentence.start_i, sentence.end_i, sentence.vec.*);
-            }
-
+            // Remove before putting, so the new rows land in the slots the old ones vacate.
+            // Either order is correct -- a `put` can only claim a slot that is already free, so
+            // it can never land on a live vector -- but putting first leaves the old rows live
+            // while the new ones are placed, which forces every replaced document to occupy two
+            // generations' worth of slots.
+            //
+            // This order is also the better failure mode. If a `put` below fails partway, the
+            // document is left under-indexed, which a re-embed fixes. Putting first and failing
+            // partway leaves the old rows *and* some new ones covering the same offsets, which
+            // is a state `validate` rejects as overlapping.
             for (old_vecs) |old_v| {
                 self.vec_storage.rm(old_v.id) catch |e| switch (e) {
                     vec_storage.Error.MultipleRemove => continue,
                     else => unreachable,
                 };
+            }
+
+            for (embedded_sentences) |sentence| {
+                _ = try self.vec_storage.put(note_id, sentence.start_i, sentence.end_i, sentence.vec.*);
             }
         }
 
@@ -621,6 +625,34 @@ test "embedText clear previous" {
     try db.embedText(path, "flatiron");
     try expectEqual(0, try db.search("hello", &buf));
 
+    try db.validate();
+}
+
+test "embedText re-embedding a document reuses its slots" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    defer db.deinit();
+
+    // 20 sentences against the default capacity of 32. `replaceVectors` removes the old rows
+    // before putting the new ones, so the live count never exceeds 20 and the store never has
+    // to grow. Putting first would hold both generations live at once -- a peak of 40 -- and
+    // force a doubling to 64 on the very first re-embed, then leak the difference forever.
+    const sentences = 20;
+    const text = "pizza. " ** sentences;
+    const path = "test.md";
+
+    try db.embedText(path, text);
+    const capacity = db.vec_storage.meta.capacity;
+    try expectEqual(sentences, db.vec_storage.vec_n);
+
+    for (0..5) |_| {
+        try db.embedText(path, text);
+        try expectEqual(sentences, db.vec_storage.vec_n);
+        try expectEqual(capacity, db.vec_storage.meta.capacity);
+    }
     try db.validate();
 }
 

@@ -106,14 +106,12 @@ with ~880 bytes still free at 768xf32 -- enough for a 96-byte 1-bit code.
 - **`put` still grows the file one 4 KB chunk at a time.** A real cost at 20M inserts, but it
   belongs with the batched-scan work, not with reuse.
 - **The metadata write is not atomic.** Contained by the crc rather than prevented. See below.
-- **`replaceVectors` puts before it removes**, which is correct but costs 2x the slots. See the
-  id contract below.
 
 ## Slot reuse  [DONE -- af581da, was "priority 1"]
 
-`rm` tombstoned a slot and nothing ever claimed it again, so `replaceVectors` -- which puts a
-document's new vectors then removes the old -- leaked a slot per sentence on every re-embed.
-That was the only real v1 defect.
+`rm` tombstoned a slot and nothing ever claimed it again, so `replaceVectors` -- which replaces
+a document's vectors on every re-embed -- leaked a slot per sentence, forever. That was the only
+real v1 defect.
 
 **It needed no index and no compaction pass.** `vec_id`s are ephemeral: `SearchResult` carries
 path/start_i/end_i/similarity and no id, `note_id_map` has no `VectorID` at all, and inside
@@ -184,11 +182,20 @@ between them would have been an API defect, not a caller's problem. There is a t
 workload three ways (put-then-rm, rm-then-put, interleaved) and requires identical results.
 
 **But the ordering does matter for density, in the opposite direction to what that comment
-claimed.** `replaceVectors` puts the new rows *before* removing the old, so the old slots are
-still live when the puts run and the new rows cannot reuse them. Steady state is two generations
-of every document on disk rather than one -- the churn test shows `slot_n` settling at 16 for 8
-live vectors. Removing first would halve both the file and the in-memory codes array a search
-has to scan. Flagged as a TODO at the cutover.
+claimed.** Putting the new rows *before* removing the old leaves the old slots live while the
+puts run, so the new rows cannot reuse them: steady state is two generations of every document
+rather than one. The vstore churn test shows `slot_n` settling at 16 for 8 live vectors.
+
+`replaceVectors` has been reordered to remove first (93dd20e). This pays off immediately rather
+than at cutover -- `vec_storage.zig` also reuses slots (first-fit over unoccupied ones) and
+grows off the live count, so putting first made `vec_n` peak at 2x during every re-embed and
+forced a doubling. `"embedText re-embedding a document reuses its slots"` re-embeds a
+20-sentence document six times against the default capacity of 32 and requires no growth;
+with the old ordering it reports capacity 64.
+
+The reorder is also the better failure mode. If a `put` fails partway, the document is left
+under-indexed and a re-embed fixes it. Putting first and failing partway leaves the old rows
+*and* some new ones covering the same offsets -- a state `validate` rejects as overlapping.
 
 Reuse stops the file *growing*; it does not *shrink* one already bloated. `compact()` is the
 shrink tool and stays deferred, probably forever.
@@ -442,6 +449,3 @@ another. Numbers in this file now cite `experiments/` or say they are estimates.
   since `@Vector(768, f32)` is padded to 4096 bytes and aligned to 4096.
 - `get`/`getVec`/`search` now take `*Self`.
 - `rm` returns `!void` (was `Error!void`); `rmByDocId` can now fail.
-- **Reorder `replaceVectors` to remove before putting**, so the new rows reuse the slots the old
-  ones vacate. Either order is correct; this one halves steady-state slot count. TODO is in
-  place at src/vector.zig.
