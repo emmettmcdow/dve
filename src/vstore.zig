@@ -259,6 +259,10 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         /// Derived at open by `scan`, which reads every trailer anyway, so it costs no IO.
         /// Order is an implementation detail and is not part of the contract.
         free: std.ArrayList(VectorID) = .{},
+        /// Chunks the file is currently sized for. Only `put` grows the file, so the store
+        /// already knows this; tracking it keeps `put` off `lseek`, which it was calling on
+        /// every single insert to ask a question it could answer itself.
+        file_chunks: usize = 0,
 
         // ******************************************************************** Slot addressing
         /// An id is a generation and a slot packed together. The slot half addresses the
@@ -402,9 +406,12 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         /// exactly a hole, and its next generation is in the `vec_id` already being read.
         fn scan(self: *Self) !void {
             const size = try self.file.size();
+            // The one place the file's size is read. `put` is the only thing that grows it,
+            // so from here on the store tracks it rather than asking the kernel.
+            self.file_chunks = if (size > PAGE_SZ) (size - PAGE_SZ) / L.chunk_bytes else 0;
             // Nothing to scan unless the file reaches at least the first chunk's trailer.
             if (size <= chunkOff(0) + L.meta_off) return;
-            const n_chunks = (size - PAGE_SZ) / L.chunk_bytes;
+            const n_chunks = self.file_chunks;
 
             var trailer: [L.vecs_per_chunk * @sizeOf(VMeta)]u8 align(@alignOf(VMeta)) = undefined;
             var vec_n: usize = 0;
@@ -482,10 +489,14 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             errdefer if (reused) |r| self.free.appendAssumeCapacity(r);
 
             // Keep the file a whole number of chunks so the trailer of the last chunk always
-            // exists to be read back. A reused slot is by construction already backed by file.
+            // exists to be read back. A reused slot is by construction already backed by file,
+            // so only the extend path can need this at all.
             if (reused == null) {
-                const want = chunkOff(chunkCount(slot + 1));
-                if (try self.file.size() < want) try self.file.setSize(want);
+                const want = chunkCount(slot + 1);
+                if (want > self.file_chunks) {
+                    try self.file.setSize(chunkOff(want));
+                    self.file_chunks = want;
+                }
             }
 
             var m = VMeta{
@@ -1137,6 +1148,36 @@ test "reuse: rmByDocId frees a whole document's slots" {
     try expectEqual(@as(usize, 5), inst.slot_n);
     try expectEqual(@as(usize, 0), inst.free.items.len);
     try expectVec(&inst, keep, .{ 0, 1, 0 });
+    try inst.validate();
+}
+
+test "reuse: the cached file size survives a reopen and still grows the file" {
+    var tmpD = tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    const per_chunk = TestStorage.VECS_PER_CHUNK;
+    {
+        var inst = try open(tmpD.dir);
+        defer inst.deinit();
+        for (0..per_chunk) |i| {
+            _ = try inst.put(.{ .doc_id = 1, .start_i = i * 10, .end_i = i * 10 + 5 }, &.{ 1, 0, 0 });
+        }
+        try expectEqual(@as(usize, 1), inst.file_chunks);
+        try inst.flush();
+    }
+
+    // `put` trusts `file_chunks` rather than asking the kernel, so a reopen that mis-derived
+    // it would leave the next put writing past the end of the file.
+    var inst = try open(tmpD.dir);
+    defer inst.deinit();
+    try expectEqual(@as(usize, 1), inst.file_chunks);
+    try expectEqual(@as(u64, TestStorage.chunkOff(1)), try inst.file.size());
+
+    const spill = try inst.put(.{ .doc_id = 2, .start_i = 0, .end_i = 5 }, &.{ 0, 1, 0 });
+    try expectEqual(@as(usize, per_chunk), idSlot(spill));
+    try expectEqual(@as(usize, 2), inst.file_chunks);
+    try expectEqual(@as(u64, TestStorage.chunkOff(2)), try inst.file.size());
+    try expectVec(&inst, spill, .{ 0, 1, 0 });
     try inst.validate();
 }
 
