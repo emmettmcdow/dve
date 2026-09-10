@@ -105,6 +105,9 @@ with ~880 bytes still free at 768xf32 -- enough for a 96-byte 1-bit code.
   now tracks the chunk count itself (47cf2f7).
 - **`put` still grows the file one 4 KB chunk at a time.** A real cost at 20M inserts, but it
   belongs with the batched-scan work, not with reuse.
+- **The metadata write is not atomic.** Contained by the crc rather than prevented. See below.
+- **`replaceVectors` puts before it removes**, which is correct but costs 2x the slots. See the
+  id contract below.
 
 ## Slot reuse  [DONE -- af581da, was "priority 1"]
 
@@ -166,10 +169,26 @@ may be, under a new id. `get`/`getVec`/`rm` on a stale id behave exactly as befo
 `NoSuchVector`, `MultipleRemove` -- whether or not the slot has since been refilled. That is a
 real weakening of the old never-resurrected guarantee, and it is the reason generations exist.
 
-**`replaceVectors` ordering is load-bearing.** It puts the new vectors *then* removes the old, so
-old ids are still live while the puts run and no `put` can hand back a slot the caller is still
-holding. That was incidental; both ends are now commented. Generations mean a reordering fails
-loudly at `rm` rather than deleting live data, but it still fails.
+**There is no ordering contract between `put` and `rm`.** An earlier draft of this section said
+`replaceVectors`'s put-before-remove ordering was load-bearing. It is not, and the claim was a
+leftover from the pre-generation design that should have been re-derived once generations
+existed. The invariant that makes ordering irrelevant:
+
+> A `put` can only claim a slot that is already on the free list, and a slot only reaches the
+> free list by being removed. So no interleaving of `put` and `rm` can make a `put` land on a
+> live vector, and a stale id resolves to nothing whenever it went stale.
+
+This matters beyond tidiness: `put` and `rm` are both public, so a hidden sequencing requirement
+between them would have been an API defect, not a caller's problem. There is a test --
+`"reuse: put and rm can be interleaved in any order"` -- that runs the same replace-a-document
+workload three ways (put-then-rm, rm-then-put, interleaved) and requires identical results.
+
+**But the ordering does matter for density, in the opposite direction to what that comment
+claimed.** `replaceVectors` puts the new rows *before* removing the old, so the old slots are
+still live when the puts run and the new rows cannot reuse them. Steady state is two generations
+of every document on disk rather than one -- the churn test shows `slot_n` settling at 16 for 8
+live vectors. Removing first would halve both the file and the in-memory codes array a search
+has to scan. Flagged as a TODO at the cutover.
 
 Reuse stops the file *growing*; it does not *shrink* one already bloated. `compact()` is the
 shrink tool and stays deferred, probably forever.
@@ -307,6 +326,75 @@ the slack as an opaque per-slot scratch region it persists and never interprets 
 provides durable bytes, the index decides their meaning. Nothing is lost by deferring this: the
 slack already exists and is already unused.
 
+## Limits worth publishing
+
+**A store holds at most 2^32 = 4,294,967,296 vectors.** An id spends 32 bits on the slot index,
+so that is the hard cap and `put` returns `StoreFull` at it. The cap is on slots, so what it
+means in bytes depends on the config:
+
+| config | bytes/slot | max file | of which vector payload |
+|---|---:|---:|---:|
+| **768 x f32 (prod)** | 4096 | **16.0 TiB** (17.6 TB) | **12.0 TiB** (13.2 TB) |
+| 768 x f16 | 2048 | 8.0 TiB | 6.0 TiB |
+| 768 x i8 | 819.2 | 3.2 TiB | 3.0 TiB |
+
+The gap between file and payload is the ~24% page-alignment slack. Against the ~20M-vector
+design target this is ~215x of headroom, so it is a datapoint for users rather than a constraint
+on us. Two notes: the cap counts the slot high-water mark rather than live vectors, but because
+slots are reused a store only approaches it by *holding* that many at once, not by churning
+through them; and raising it later is a `SLOT_BITS` change plus a format decision, not a
+redesign.
+
+## Coalescing the free list -- worth doing, not a drop-in
+
+One `VectorID` per hole, 8 bytes each. Bounded by holes rather than by corpus, but the worst
+case is not small: deleting half a 20M-vector store costs ~80 MB, and 90% costs ~144 MB. The
+filesystem-indexing target makes the bad case likely rather than theoretical -- deleting a
+directory frees a long *contiguous* run of slots, which is exactly the shape a flat list stores
+worst and an extent list stores best (millions of entries versus one).
+
+The obvious fix is to store extents, `{start, len}`, and coalesce adjacent ones on free. The
+reason it is not a drop-in:
+
+**Generations are per-slot.** Today the free list holds ready-to-issue ids -- slot *and* its next
+generation, learned from the trailer the open scan was already reading. An extent cannot carry
+one generation for the whole run, so an extent-based list has to get the generation from
+somewhere else. Three options, none free:
+
+1. **Read it at `put` time.** One extra `pread` on the reuse path to fetch the slot's old
+   metadata before overwriting it. Simple and correct; costs a syscall per reused put, which is
+   the one thing the current design deliberately avoids.
+2. **Keep a separate per-slot generation array.** Removes the read, but it is resident for
+   *every* slot rather than every hole -- the id-to-slot map's failure mode in a new hat.
+3. **Hybrid.** Extents for long contiguous runs (a deleted directory), individual ids for
+   scattered holes (ordinary re-embed churn). Best behaviour, most code, and the split needs a
+   heuristic.
+
+Option 1 is probably right if this is ever built: the reuse path is already touching that slot's
+chunk, so the read is likely to hit page cache. Not urgent -- 80 MB in the bad case is real but
+survivable against a stated tolerance of a few gigabytes -- but worth revisiting before anyone
+points the store at a whole filesystem and then deletes a lot of it.
+
+## The metadata write is not atomic, and should be
+
+`put` writes the vector, then writes the 32-byte `VMeta` in one `pwrite`. That write is 32-byte
+aligned and never crosses a 4096-byte block, so on real hardware it will not tear -- but that is
+a property of the device rather than a guarantee we are owed, and `pfile.writeAt` loops on
+partial writes, so a crash mid-loop can leave a torn record.
+
+The blast radius today is bounded, not eliminated. The crc32 covers the vector plus the first 24
+metadata bytes, so almost any tear is *detected* -- that slot reads back `Corrupt` instead of
+serving wrong data. The exception is a tear confined to `flags`, which is outside the checksum:
+there the slot simply reads as not-occupied and the `put` is lost, which is the same outcome as
+crashing one instruction earlier. So: containment, not correctness.
+
+The format is already shaped for the fix. `crc32`, `flags` and `_pad` occupy bytes 24..32 -- an
+aligned 8-byte word. Writing the 24-byte payload first and then that word as a single 8-byte
+commit makes the commit atomic on any hardware worth the name. The cost is a third `pwrite` per
+put, which is why it is written down rather than done: `put` is the hot path, and this should
+land alongside the other `put` IO work (chunk-at-a-time growth) so the syscall budget is
+reasoned about once.
+
 ## Deferred, roughly in order
 
 1. **Batched open scan** (priority 1 now), 1 MiB reads. 45x measured, cold.
@@ -316,9 +404,13 @@ slack already exists and is already unused.
 3. **1-bit quantized cache** of the whole DB in memory: scan the codes, then confirm ~100
    candidates on disk. The ~880 bytes of slack per chunk at 768xf32 has room for a 96-byte code,
    so this needs no format change. The measurements make this mandatory, not optional.
-4. **RwLock**, once contention is real.
-5. **Transactions.**
-6. **`compact()`**, only if reclaiming space from a churned-down corpus turns out to matter.
+4. **Atomic metadata commit** -- split the 32-byte `VMeta` write into a 24-byte payload and an
+   8-byte commit word. Land it with the `put` IO work above so the syscall budget is costed once.
+5. **RwLock**, once contention is real.
+6. **Transactions.**
+7. **Coalescing the free list** into extents, if a churned-down corpus makes the flat list's
+   worst case (~80 MB at 20M half-deleted) actually bite.
+8. **`compact()`**, only if reclaiming space from a churned-down corpus turns out to matter.
 
 **On the sidecar index, twice reversed.** It was first justified by two grounds, then dropped
 when both dissolved (reuse needed only an in-memory free list, which is now built and shipped;
@@ -350,3 +442,6 @@ another. Numbers in this file now cite `experiments/` or say they are estimates.
   since `@Vector(768, f32)` is padded to 4096 bytes and aligned to 4096.
 - `get`/`getVec`/`search` now take `*Self`.
 - `rm` returns `!void` (was `Error!void`); `rmByDocId` can now fail.
+- **Reorder `replaceVectors` to remove before putting**, so the new rows reuse the slots the old
+  ones vacate. Either order is correct; this one halves steady-state slot count. TODO is in
+  place at src/vector.zig.

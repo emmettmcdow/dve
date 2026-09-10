@@ -23,6 +23,25 @@
 //! Reuse stops the file growing; it does not shrink one already bloated. That is compaction,
 //! and it stays deferred.
 //!
+//! `put` and `rm` may be interleaved in any order. A `put` can only claim a slot that is
+//! already on the free list, and a slot only gets there by being removed, so no ordering can
+//! make a `put` land on a live vector; generations make a stale id resolve to nothing whenever
+//! it went stale. There is no hidden sequencing contract between the two.
+//!
+//! **Capacity: 2^32 = 4,294,967,296 vectors per file.** An id spends 32 bits on the slot, so
+//! that is the hard cap, and `put` returns `StoreFull` at it. What that means in bytes depends
+//! on the config, because the cap is on slots rather than on size:
+//!
+//!   | config    | bytes/slot | max file  | of which vector payload |
+//!   |-----------|-----------:|----------:|------------------------:|
+//!   | 768 x f32 |       4096 |  16.0 TiB |    12.0 TiB (24% slack) |
+//!   | 768 x f16 |       2048 |   8.0 TiB |                 6.0 TiB |
+//!   | 768 x i8  |      819.2 |   3.2 TiB |                 3.0 TiB |
+//!
+//! Against the ~20M-vector design target that is ~215x of headroom. Note the cap is on the
+//! slot high-water mark, not on live vectors -- but since slots are reused, a store only
+//! approaches it by holding that many vectors at once, not by churning through them.
+//!
 //! File layout:
 //!
 //!   +===========+-------------------+-------------------+-------------------+
@@ -258,6 +277,11 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         /// stack: the most recently freed slot is the one most likely still in page cache.
         /// Derived at open by `scan`, which reads every trailer anyway, so it costs no IO.
         /// Order is an implementation detail and is not part of the contract.
+        ///
+        /// One entry per hole, 8 bytes each, so this is bounded by holes rather than by
+        /// corpus -- but the worst case is not small: deleting half a 20M-vector store costs
+        /// ~80 MB. See "Coalescing the free list" in `vec_storage2.md` for the extent-based
+        /// version and the reason it is not a drop-in.
         free: std.ArrayList(VectorID) = .{},
         /// Chunks the file is currently sized for. Only `put` grows the file, so the store
         /// already knows this; tracking it keeps `put` off `lseek`, which it was calling on
@@ -512,6 +536,18 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             // trailer standing: for a fresh slot that means "not used", which the open scan
             // skips, and for a reused one "used, not occupied", which the open scan puts back
             // on the free list. Either way the half-written vector bytes are never read.
+            //
+            // TODO: the metadata write is not atomic and should be. It is 32 bytes, 32-byte
+            // aligned, and never crosses a 4096-byte block, so on real hardware it will not
+            // tear -- but that is a property of the device, not a guarantee we are owed, and
+            // `pfile.writeAt` loops on partial writes, so a crash mid-loop can leave a torn
+            // record. Today the crc32 turns a tear into a detected `Corrupt` on that one slot
+            // rather than silent corruption, which is containment, not correctness.
+            //
+            // The format is already shaped for the fix: `crc32`, `flags` and `_pad` occupy
+            // bytes 24..32, an aligned 8-byte word, so splitting this into a 24-byte payload
+            // write followed by a single 8-byte commit word would make the commit atomic on
+            // any hardware worth the name. Cost is a third pwrite per put.
             try self.file.writeAt(std.mem.asBytes(vec)[0..L.vec_bytes], vecOff(slot));
             try self.file.writeAt(std.mem.asBytes(&m), metaOff(slot));
 
@@ -1149,6 +1185,68 @@ test "reuse: rmByDocId frees a whole document's slots" {
     try expectEqual(@as(usize, 0), inst.free.items.len);
     try expectVec(&inst, keep, .{ 0, 1, 0 });
     try inst.validate();
+}
+
+test "reuse: put and rm can be interleaved in any order" {
+    // The one property that keeps `put` and `rm` independent of each other: a `put` can only
+    // ever claim a slot that is already on the free list, and a slot only gets there by being
+    // removed first. So no ordering of the two can make a `put` land on a live vector, and
+    // generations make every stale id resolve to nothing regardless of when it went stale.
+    // Three orderings of the same replace-a-document workload, all of which must agree.
+    const Order = enum { put_then_rm, rm_then_put, interleaved };
+
+    for (std.enums.values(Order)) |ord| {
+        var tmpD = tmpDir(.{ .iterate = true });
+        defer tmpD.cleanup();
+        var inst = try open(tmpD.dir);
+        defer inst.deinit();
+
+        var old: [4]VectorID = undefined;
+        for (&old, 0..) |*id, i| {
+            id.* = try inst.put(.{ .doc_id = 1, .start_i = i * 10, .end_i = i * 10 + 5 }, &.{ 1, 0, 0 });
+        }
+
+        var new: [4]VectorID = undefined;
+        switch (ord) {
+            .put_then_rm => {
+                for (&new, 0..) |*id, i| {
+                    id.* = try inst.put(.{ .doc_id = 2, .start_i = i * 10, .end_i = i * 10 + 5 }, &.{ 0, 1, 0 });
+                }
+                for (old) |id| try inst.rm(id);
+            },
+            .rm_then_put => {
+                for (old) |id| try inst.rm(id);
+                for (&new, 0..) |*id, i| {
+                    id.* = try inst.put(.{ .doc_id = 2, .start_i = i * 10, .end_i = i * 10 + 5 }, &.{ 0, 1, 0 });
+                }
+            },
+            .interleaved => {
+                for (0..4) |i| {
+                    try inst.rm(old[i]);
+                    new[i] = try inst.put(
+                        .{ .doc_id = 2, .start_i = i * 10, .end_i = i * 10 + 5 },
+                        &.{ 0, 1, 0 },
+                    );
+                }
+            },
+        }
+
+        // Same answer every time: four live vectors, all of them the new ones, and every old
+        // id dead. `rm_then_put` and `interleaved` reuse the slots and so never grow the file;
+        // `put_then_rm` cannot, because the old slots were still live when the puts ran.
+        try expectEqual(@as(usize, 4), inst.len());
+        for (old) |id| {
+            try expect((try inst.get(id)) == null);
+            try expectVecError(&inst, id, Error.NoSuchVector);
+            try std.testing.expectError(Error.MultipleRemove, inst.rm(id));
+        }
+        for (new) |id| {
+            try expectEqual(@as(DocID, 2), (try inst.get(id)).?.doc_id);
+            try expectVec(&inst, id, .{ 0, 1, 0 });
+        }
+        try expectEqual(@as(usize, if (ord == .put_then_rm) 8 else 4), inst.slot_n);
+        try inst.validate();
+    }
 }
 
 test "reuse: the cached file size survives a reopen and still grows the file" {
