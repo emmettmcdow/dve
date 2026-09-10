@@ -428,10 +428,16 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             const old_vecs = try self.vec_storage.vecsForNote(allocator, note_id);
             defer allocator.free(old_vecs);
 
+            // Put before remove, and do not reorder. The store reuses freed slots, so removing
+            // first would put the old slots on the free list while `old_vecs` still holds ids
+            // pointing at them, and these puts could then land on top of a row we are about to
+            // remove. Ids are generation-tagged, so the reordered version fails loudly at the
+            // `rm` below rather than deleting live data -- but it still fails.
             for (embedded_sentences) |sentence| {
                 _ = try self.vec_storage.put(note_id, sentence.start_i, sentence.end_i, sentence.vec.*);
             }
 
+            // Safe only because the puts above ran first: every id here is still live.
             for (old_vecs) |old_v| {
                 self.vec_storage.rm(old_v.id) catch |e| switch (e) {
                     vec_storage.Error.MultipleRemove => continue,

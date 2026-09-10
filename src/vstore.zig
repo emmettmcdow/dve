@@ -9,12 +9,19 @@
 //! Nothing is cached in memory: every operation reads or writes the file directly, and a
 //! single mutex serializes the whole public surface.
 //!
-//! v1 is append-only. `rm` leaves a tombstone and the slot is never reused, because reuse
-//! requires an id-to-slot index -- without one, a reused slot would either resurrect a dead
-//! id or break the arithmetic that makes `get` O(1). The consequence is that a document
-//! re-embedded repeatedly grows the file without bound, since `replaceVectors` puts the new
-//! vectors before removing the old. Reclaiming that space needs either the index (enabling
-//! reuse) or a compaction pass, and both are deliberately deferred.
+//! Slots are reused. `rm` leaves a tombstone on disk and puts the slot on an in-memory free
+//! list, which the open scan rebuilds from the metadata it already reads -- no index, no
+//! sidecar file, no format change. `put` refills a hole before extending the file, so a
+//! document re-embedded repeatedly reaches a steady size instead of growing without bound.
+//!
+//! Reuse is made safe by packing a generation into the id alongside the slot, so refilling a
+//! slot issues a *new* id and a caller holding the old one is told its vector is gone rather
+//! than handed someone else's. The generation costs nothing: `VMeta.vec_id` is already 64
+//! bits on disk, and every read path already fetches the metadata it lives in. See "Slot
+//! addressing" below.
+//!
+//! Reuse stops the file growing; it does not shrink one already bloated. That is compaction,
+//! and it stays deferred.
 //!
 //! File layout:
 //!
@@ -41,6 +48,7 @@ pub const Error = error{
     NoSuchVector,
     Corrupt,
     RangeTooLarge,
+    StoreFull,
 };
 
 /// On MacOS the memory page is 16KB, but the disk block is still 4KB, and 4KB is what most
@@ -243,20 +251,57 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         mutex: std.Thread.Mutex = .{},
         /// Live vectors. Derived at open, maintained thereafter.
         vec_n: usize = 0,
-        /// Slots ever allocated. v1 is append-only, so this only grows; freed slots become
-        /// tombstones rather than being reused, because reuse would need the id-to-slot
-        /// index we have deliberately deferred.
+        /// High-water mark: slots ever allocated, live or not. Only grows, because it is what
+        /// bounds every whole-store scan. Reuse refills holes below it rather than raising it.
         slot_n: usize = 0,
+        /// Free slots, as ready-to-issue ids already carrying their next generation. A LIFO
+        /// stack: the most recently freed slot is the one most likely still in page cache.
+        /// Derived at open by `scan`, which reads every trailer anyway, so it costs no IO.
+        /// Order is an implementation detail and is not part of the contract.
+        free: std.ArrayList(VectorID) = .{},
 
         // ******************************************************************** Slot addressing
-        /// v1 hands out ids equal to the slot index, but that is an allocator detail and not
-        /// a promise: `vec_id` is written into every metadata entry, so once an index exists
-        /// slots can be reused and relocated without a format change.
-        fn slotOf(id: VectorID) usize {
-            return id;
+        /// An id is a generation and a slot packed together. The slot half addresses the
+        /// bytes; the generation half is what makes reuse safe -- refilling slot 7 issues a
+        /// new id, so a caller holding the old one gets `null`/`NoSuchVector`/`MultipleRemove`
+        /// rather than someone else's vector.
+        ///
+        /// This is free. `VMeta.vec_id` is already 64 bits on disk, so the generation rides
+        /// along in metadata that every read path already fetches, and validating a stale id
+        /// is one comparison against bytes already in hand. Files written before generations
+        /// existed read back as generation 0, so the format is unchanged.
+        const SLOT_BITS = 32;
+        const SLOT_MASK: VectorID = (1 << SLOT_BITS) - 1;
+        const MAX_SLOT: usize = SLOT_MASK;
+        const MAX_GEN: u64 = (1 << (64 - SLOT_BITS)) - 1;
+
+        comptime {
+            // The pack needs a 64-bit id. Nothing here targets a 32-bit platform, but the
+            // failure would be silent truncation, so assert rather than assume.
+            assert(@bitSizeOf(VectorID) >= 64);
         }
-        fn idOf(slot: usize) VectorID {
-            return slot;
+
+        fn slotOf(id: VectorID) usize {
+            return @intCast(id & SLOT_MASK);
+        }
+        fn genOf(id: VectorID) u64 {
+            return @as(u64, @intCast(id)) >> SLOT_BITS;
+        }
+        fn idOf(slot: usize, gen: u64) VectorID {
+            assert(slot <= MAX_SLOT);
+            assert(gen <= MAX_GEN);
+            return (@as(VectorID, @intCast(gen)) << SLOT_BITS) | @as(VectorID, slot);
+        }
+
+        /// The id a slot will be handed out under next time. Null once the generation is
+        /// exhausted, which retires the slot: 2^32 reuses of one slot is not a case worth
+        /// wrapping for, and refusing to wrap removes ABA from consideration entirely.
+        /// Takes the slot from its position in the trailer, never from `vec_id`, so a corrupt
+        /// id cannot misdirect a write.
+        fn nextId(slot: usize, prev_vec_id: u64) ?VectorID {
+            const gen = prev_vec_id >> SLOT_BITS;
+            if (gen >= MAX_GEN) return null;
+            return idOf(slot, gen + 1);
         }
 
         fn chunkOff(chunk_i: usize) u64 {
@@ -286,6 +331,7 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             errdefer file.close();
 
             var self = Self{ .allocator = allocator, .dir = dir, .file = file };
+            errdefer self.free.deinit(allocator);
 
             const size = try file.size();
             if (size == 0) {
@@ -298,6 +344,7 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            self.free.deinit(self.allocator);
             self.file.close();
         }
 
@@ -346,9 +393,13 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             }
         }
 
-        /// Rebuilds the live count and the slot high-water mark by walking every chunk's
-        /// metadata trailer. This is what buys us an immutable header. It costs one read per
-        /// chunk at open, which a sidecar index would later make a cold-start-only cost.
+        /// Rebuilds the live count, the slot high-water mark, and the free list by walking
+        /// every chunk's metadata trailer. This is what buys us an immutable header. It costs
+        /// one read per chunk at open, which a sidecar index would later make a cold-start-
+        /// only cost.
+        ///
+        /// The free list rides along for nothing: a slot that is used but not occupied is
+        /// exactly a hole, and its next generation is in the `vec_id` already being read.
         fn scan(self: *Self) !void {
             const size = try self.file.size();
             // Nothing to scan unless the file reaches at least the first chunk's trailer.
@@ -359,6 +410,7 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             var vec_n: usize = 0;
             var slot_n: usize = 0;
 
+            self.free.clearRetainingCapacity();
             for (0..n_chunks) |c| {
                 const got = try self.file.readAt(&trailer, chunkOff(c) + L.meta_off);
                 if (got != trailer.len) break; // truncated tail: stop where the file stops
@@ -367,12 +419,23 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
                     if (!m.isUsed()) continue;
                     const slot = c * L.vecs_per_chunk + i;
                     slot_n = slot + 1;
-                    if (m.isOccupied()) vec_n += 1;
+                    if (m.isOccupied()) {
+                        vec_n += 1;
+                    } else if (nextId(slot, m.vec_id)) |id| {
+                        try self.free.append(self.allocator, id);
+                    }
                 }
             }
 
             self.vec_n = vec_n;
             self.slot_n = slot_n;
+            self.assertCounts();
+        }
+
+        /// Every used slot is either live or free. A retired slot -- one whose generation is
+        /// exhausted -- is neither, which is why this is `<=` rather than `==`.
+        fn assertCounts(self: *const Self) void {
+            assert(self.vec_n + self.free.items.len <= self.slot_n);
         }
 
         fn metaAt(trailer: []align(@alignOf(VMeta)) const u8, i: usize) *const VMeta {
@@ -407,13 +470,23 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             if (meta.start_i > std.math.maxInt(u32) or meta.end_i > std.math.maxInt(u32)) {
                 return Error.RangeTooLarge;
             }
-            const slot = self.slot_n;
-            const id = idOf(slot);
+            // Refill a hole if there is one, otherwise extend. A popped id already carries
+            // the generation `scan` or `rm` computed for it, so the slot about to be
+            // overwritten never has to be read back.
+            const reused = self.free.pop();
+            if (reused == null and self.slot_n > MAX_SLOT) return Error.StoreFull;
+            const id = reused orelse idOf(self.slot_n, 0);
+            const slot = slotOf(id);
+            // A failed put must not swallow the slot it popped. `pop` leaves the capacity
+            // behind, so putting it back cannot fail in turn.
+            errdefer if (reused) |r| self.free.appendAssumeCapacity(r);
 
             // Keep the file a whole number of chunks so the trailer of the last chunk always
-            // exists to be read back.
-            const want = chunkOff(chunkCount(slot + 1));
-            if (try self.file.size() < want) try self.file.setSize(want);
+            // exists to be read back. A reused slot is by construction already backed by file.
+            if (reused == null) {
+                const want = chunkOff(chunkCount(slot + 1));
+                if (try self.file.size() < want) try self.file.setSize(want);
+            }
 
             var m = VMeta{
                 .doc_id = meta.doc_id,
@@ -424,13 +497,16 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             };
             m.crc32 = crcOf(vec, m);
 
-            // Vector first, metadata second: a crash between them leaves a slot that is not
-            // marked used, which the open scan simply skips.
+            // Vector first, metadata second. A crash between them leaves the slot's old
+            // trailer standing: for a fresh slot that means "not used", which the open scan
+            // skips, and for a reused one "used, not occupied", which the open scan puts back
+            // on the free list. Either way the half-written vector bytes are never read.
             try self.file.writeAt(std.mem.asBytes(vec)[0..L.vec_bytes], vecOff(slot));
             try self.file.writeAt(std.mem.asBytes(&m), metaOff(slot));
 
-            self.slot_n = slot + 1;
+            if (slot + 1 > self.slot_n) self.slot_n = slot + 1;
             self.vec_n += 1;
+            self.assertCounts();
             return id;
         }
 
@@ -441,7 +517,8 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             return m;
         }
 
-        /// Null for an id that was never handed out or whose vector has been removed.
+        /// Null for an id that was never handed out, or whose vector has been removed --
+        /// including the case where the slot behind it has since been refilled under a new id.
         pub fn get(self: *Self, id: VectorID) !?Row {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -452,7 +529,9 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             const slot = slotOf(id);
             if (slot >= self.slot_n) return null;
             const m = try self.readMeta(slot);
-            if (!m.isOccupied()) return null;
+            // The generation check is what makes reuse safe, and it is free: the metadata is
+            // already in hand, so a stale id costs one comparison rather than a wrong answer.
+            if (!m.isOccupied() or m.vec_id != id) return null;
             return rowOf(m);
         }
 
@@ -477,7 +556,7 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             const slot = slotOf(id);
             if (slot >= self.slot_n) return Error.NoSuchVector;
             const m = try self.readMeta(slot);
-            if (!m.isOccupied()) return Error.NoSuchVector;
+            if (!m.isOccupied() or m.vec_id != id) return Error.NoSuchVector;
 
             const n = try self.file.readAt(std.mem.asBytes(out)[0..L.vec_bytes], vecOff(slot));
             if (n != L.vec_bytes) return Error.Corrupt;
@@ -494,17 +573,29 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             const slot = slotOf(id);
             if (slot >= self.slot_n) return Error.MultipleRemove;
             var m = try self.readMeta(slot);
-            if (!m.isOccupied()) return Error.MultipleRemove;
+            // `m.vec_id != id` is a stale id whose slot has been refilled. Without the
+            // generation this would silently delete whoever holds the slot now.
+            if (!m.isOccupied() or m.vec_id != id) return Error.MultipleRemove;
             assert(self.vec_n > 0);
 
+            // Reserve the free-list space before the write, so a slot cannot be freed on disk
+            // and then lost in memory because the list could not grow.
+            if (nextId(slot, m.vec_id) != null) try self.free.ensureUnusedCapacity(self.allocator, 1);
+
             // Only the flags byte changes, and it is outside the checksum's coverage, so the
-            // vector never has to be re-read. The bytes stay on disk as a tombstone.
+            // vector never has to be re-read. The bytes stay on disk as a tombstone until a
+            // later `put` claims the slot.
             m.flags &= ~FLAG_OCCUPIED;
             try self.file.writeAt(
                 std.mem.asBytes(&m)[@offsetOf(VMeta, "flags")..][0..1],
                 metaOff(slot) + @offsetOf(VMeta, "flags"),
             );
             self.vec_n -= 1;
+
+            // Null once the generation is exhausted, which retires the slot rather than
+            // wrapping an id back onto one a caller might still be holding.
+            if (nextId(slot, m.vec_id)) |next| self.free.appendAssumeCapacity(next);
+            self.assertCounts();
         }
 
         /// Generates a new ID for an existing VectorRow.
@@ -718,6 +809,11 @@ fn open(dir: std.fs.Dir) !TestStorage {
     return TestStorage.init(testing_allocator, dir, .{ .path = DB });
 }
 
+/// Ids are opaque to callers, but the reuse tests need to talk about the slot and generation
+/// halves directly -- "did this land on the same slot" is the whole thing being tested.
+const idSlot = TestStorage.slotOf;
+const idGen = TestStorage.genOf;
+
 fn expectVecError(inst: *TestStorage, id: VectorID, want: anyerror) !void {
     var scratch: TestArray = undefined;
     try std.testing.expectError(want, inst.getVec(id, &scratch));
@@ -843,9 +939,10 @@ test "ids stay distinct across a delete" {
     try inst.rm(a);
     const b = try inst.put(.{ .doc_id = 2, .start_i = 0, .end_i = 5 }, &.{ 0, 1, 0 });
 
-    // v1 is append-only, so a freed slot is never reused and a stale id can never resolve to
-    // a different vector.
+    // `b` reuses `a`'s slot, but at the next generation, so the ids differ and the stale one
+    // still resolves to nothing.
     try expect(a != b);
+    try expectEqual(idSlot(a), idSlot(b));
     try expect((try inst.get(a)) == null);
     try expectEqual(@as(DocID, 2), (try inst.get(b)).?.doc_id);
 }
@@ -866,6 +963,181 @@ test "copy" {
     try expectEqual(a.start_i, b.start_i);
     try expectEqual(a.end_i, b.end_i);
     try expectVec(&inst, new_id, .{ 1, 0, 0 });
+}
+
+// ********************************************************************************** Slot reuse
+test "reuse: a freed slot is refilled rather than appended" {
+    var tmpD = tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var inst = try open(tmpD.dir);
+    defer inst.deinit();
+
+    const a = try inst.put(.{ .doc_id = 1, .start_i = 0, .end_i = 5 }, &.{ 1, 0, 0 });
+    const b = try inst.put(.{ .doc_id = 2, .start_i = 0, .end_i = 5 }, &.{ 0, 1, 0 });
+    const c = try inst.put(.{ .doc_id = 3, .start_i = 0, .end_i = 5 }, &.{ 0, 0, 1 });
+    try expectEqual(@as(usize, 3), inst.slot_n);
+
+    try inst.rm(b);
+    const d = try inst.put(.{ .doc_id = 4, .start_i = 0, .end_i = 5 }, &.{ -1, 0, 0 });
+
+    // The hole is refilled, so the high-water mark does not move.
+    try expectEqual(idSlot(b), idSlot(d));
+    try expectEqual(idGen(b) + 1, idGen(d));
+    try expectEqual(@as(usize, 3), inst.slot_n);
+    try expectEqual(@as(usize, 3), inst.len());
+
+    // ...and the neighbours are untouched.
+    try expectVec(&inst, a, .{ 1, 0, 0 });
+    try expectVec(&inst, c, .{ 0, 0, 1 });
+    try expectVec(&inst, d, .{ -1, 0, 0 });
+    try expectEqual(@as(DocID, 4), (try inst.get(d)).?.doc_id);
+    try inst.validate();
+}
+
+test "reuse: a stale id is rejected on every path once its slot is refilled" {
+    var tmpD = tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var inst = try open(tmpD.dir);
+    defer inst.deinit();
+
+    const stale = try inst.put(.{ .doc_id = 1, .start_i = 0, .end_i = 5 }, &.{ 1, 0, 0 });
+    try inst.rm(stale);
+    const live = try inst.put(.{ .doc_id = 2, .start_i = 10, .end_i = 20 }, &.{ 0, 1, 0 });
+    try expectEqual(idSlot(stale), idSlot(live));
+
+    // The slot is occupied again, so every one of these would answer for the *new* vector if
+    // the id carried no generation. That is the bug the generation exists to prevent.
+    try expect((try inst.get(stale)) == null);
+    try expectVecError(&inst, stale, Error.NoSuchVector);
+    try std.testing.expectError(Error.MultipleRemove, inst.rm(stale));
+
+    // The failed rm must not have touched the live vector.
+    try expectEqual(@as(usize, 1), inst.len());
+    try expectEqual(@as(DocID, 2), (try inst.get(live)).?.doc_id);
+    try expectVec(&inst, live, .{ 0, 1, 0 });
+}
+
+test "reuse: the free list is rebuilt at open" {
+    var tmpD = tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var holes: [2]VectorID = undefined;
+    {
+        var inst = try open(tmpD.dir);
+        defer inst.deinit();
+        for (four_rows, 0..) |r, i| {
+            const id = try inst.put(
+                .{ .doc_id = r.doc_id, .start_i = r.start_i, .end_i = r.end_i },
+                &r.vec,
+            );
+            if (i == 1) holes[0] = id;
+            if (i == 3) holes[1] = id;
+        }
+        try inst.rm(holes[0]);
+        try inst.rm(holes[1]);
+        try inst.flush();
+    }
+
+    var inst = try open(tmpD.dir);
+    defer inst.deinit();
+    try expectEqual(@as(usize, 2), inst.free.items.len);
+    try expectEqual(@as(usize, 4), inst.slot_n);
+
+    // Two puts fit in the two holes; the third has to extend.
+    const x = try inst.put(.{ .doc_id = 7, .start_i = 0, .end_i = 1 }, &.{ 1, 0, 0 });
+    const y = try inst.put(.{ .doc_id = 8, .start_i = 0, .end_i = 1 }, &.{ 0, 1, 0 });
+    try expectEqual(@as(usize, 4), inst.slot_n);
+    try expect(idSlot(x) != idSlot(y));
+    for ([_]VectorID{ x, y }) |id| {
+        try expect(idSlot(id) == idSlot(holes[0]) or idSlot(id) == idSlot(holes[1]));
+    }
+    for (holes) |h| try expect((try inst.get(h)) == null);
+
+    const z = try inst.put(.{ .doc_id = 9, .start_i = 0, .end_i = 1 }, &.{ 0, 0, 1 });
+    try expectEqual(@as(usize, 5), inst.slot_n);
+    try expectEqual(@as(u64, 0), idGen(z));
+    try inst.validate();
+}
+
+test "reuse: generations keep climbing across reopens" {
+    var tmpD = tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var id: VectorID = undefined;
+    for (0..5) |cycle| {
+        var inst = try open(tmpD.dir);
+        defer inst.deinit();
+
+        const fresh = try inst.put(.{ .doc_id = 1, .start_i = 0, .end_i = 5 }, &.{ 1, 0, 0 });
+        // Always the same slot, never the same id: the generation is what carries across the
+        // reopen, and it is read back off disk rather than held in memory.
+        try expectEqual(@as(usize, 0), idSlot(fresh));
+        try expectEqual(@as(u64, cycle), idGen(fresh));
+        try expectEqual(@as(usize, 1), inst.slot_n);
+        if (cycle > 0) try expect((try inst.get(id)) == null);
+
+        id = fresh;
+        try inst.rm(id);
+        try inst.flush();
+    }
+}
+
+test "reuse: churn at a fixed live count leaves the file bounded" {
+    var tmpD = tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var inst = try open(tmpD.dir);
+    defer inst.deinit();
+
+    // What `vector.zig` does on every re-embed: put the new vectors, then remove the old.
+    // Append-only, this grew by 8 slots a cycle forever -- the defect reuse exists to fix.
+    var live: [8]VectorID = undefined;
+    for (&live, 0..) |*slot_id, i| {
+        slot_id.* = try inst.put(.{ .doc_id = 1, .start_i = i * 10, .end_i = i * 10 + 5 }, &.{ 1, 0, 0 });
+    }
+
+    for (0..20) |_| {
+        var next: [8]VectorID = undefined;
+        for (&next, 0..) |*slot_id, i| {
+            slot_id.* = try inst.put(
+                .{ .doc_id = 1, .start_i = i * 10, .end_i = i * 10 + 5 },
+                &.{ 0, 1, 0 },
+            );
+        }
+        for (live) |old| try inst.rm(old);
+        live = next;
+
+        try expectEqual(@as(usize, 8), inst.len());
+        try inst.validate();
+    }
+
+    // Steady state is two generations of one document, not twenty-one.
+    try expectEqual(@as(usize, 16), inst.slot_n);
+    try expectEqual(@as(usize, 8), inst.free.items.len);
+}
+
+test "reuse: rmByDocId frees a whole document's slots" {
+    var tmpD = tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var inst = try open(tmpD.dir);
+    defer inst.deinit();
+
+    for (0..4) |i| {
+        _ = try inst.put(.{ .doc_id = 1, .start_i = i * 10, .end_i = i * 10 + 5 }, &.{ 1, 0, 0 });
+    }
+    const keep = try inst.put(.{ .doc_id = 2, .start_i = 0, .end_i = 5 }, &.{ 0, 1, 0 });
+    try expectEqual(@as(usize, 5), inst.slot_n);
+
+    try inst.rmByDocId(1);
+    try expectEqual(@as(usize, 4), inst.free.items.len);
+    try expectEqual(@as(usize, 1), inst.len());
+
+    for (0..4) |i| {
+        _ = try inst.put(.{ .doc_id = 3, .start_i = i * 10, .end_i = i * 10 + 5 }, &.{ 0, 0, 1 });
+    }
+    try expectEqual(@as(usize, 5), inst.slot_n);
+    try expectEqual(@as(usize, 0), inst.free.items.len);
+    try expectVec(&inst, keep, .{ 0, 1, 0 });
+    try inst.validate();
 }
 
 // *************************************************************************************** Reopen
@@ -955,9 +1227,11 @@ test "reopen: tombstones survive and do not inflate the count" {
     // A removed slot must not come back to life just because the bytes are still on disk.
     try expectVecError(&inst2, ids[0], Error.NoSuchVector);
 
-    // The high-water mark is recovered too, so new ids do not collide with tombstoned ones.
+    // The free list is recovered too, so this lands on a tombstoned slot -- but under a new
+    // id, which is what keeps every id above resolving to nothing.
     const fresh = try inst2.put(.{ .doc_id = 9, .start_i = 40, .end_i = 50 }, &.{ 1, 0, 0 });
     for (ids) |id| try expect(fresh != id);
+    try expect(idSlot(fresh) == idSlot(ids[0]) or idSlot(fresh) == idSlot(ids[2]));
 }
 
 test "opening a non-existent db creates an empty one" {
@@ -1360,7 +1634,8 @@ test "churn: multi-cycle reopen with interleaved insert and delete" {
         for (cycle3) |r| {
             const id = try inst.put(.{ .doc_id = r.doc_id, .start_i = r.start_i, .end_i = r.end_i }, &r.vec);
             try live.put(id, r);
-            // Append-only: a new id never lands on a tombstone.
+            // These do land on the tombstoned slots -- that is the point -- but never under
+            // a tombstoned id.
             for (delete_ids) |hole| try expect(id != hole);
         }
         try verifyAll(&inst, &live);
