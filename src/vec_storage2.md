@@ -2,11 +2,12 @@
 
 `src/vstore.zig`. Page-aligned, disk-resident replacement for `vec_storage.zig`.
 
-## Status (2026-09-09)
+## Status (2026-09-10)
 
-Store is complete and green: `zig build test-vstore` is 56/56 (44 store + 12 `pfile`),
-full `zig build test` is 152/154 with the 2 pre-existing skips. Nothing committed yet;
-`vstore.zig`, `pfile.zig`, and this file are untracked, `build.zig` is modified.
+Store is complete and green: `zig build test-vstore` is 63/63 (51 store + 12 `pfile`),
+full `zig build test` is 226/228 with the 2 pre-existing skips. Committed, including
+slot reuse. `zig build test` did not run the store's tests until 43ce0e3 wired
+`test-vstore` into the aggregate, which is why the total jumped from 154 to 228.
 
 **Not yet wired into `vector.zig`** -- both stores coexist until the cutover at the bottom
 of this file. Every API `vector.zig` touches exists in `vstore.zig`; the diff is naming and
@@ -23,8 +24,8 @@ undecided.
 
 Two independent tracks, neither blocking the other:
 
-- **Storage:** slot reuse -> cutover to `vector.zig` -> wikitest. Settled work, no open design
-  questions, and unaffected by whatever the index turns out to be.
+- **Storage:** slot reuse (**done**, af581da) -> cutover to `vector.zig` -> wikitest. Settled
+  work, no open design questions, and unaffected by whatever the index turns out to be.
 - **Index:** binary-recall experiment -> Hamming scan throughput -> pick an index. Both are
   measurements, neither touches `vstore.zig`.
 
@@ -57,11 +58,13 @@ The build target needs `link_libc = true` -- currently only `test-vstore` has it
   metadata, deliberately excluding `flags`. `rm` can then flip one byte without re-reading
   and re-hashing the vector, while a torn write that leaves `occupied` set over half-stale
   data is still caught. A one-byte flag update cannot itself tear.
-- **ids are stored, not inferred.** `vec_id` lives in every metadata entry. v1's allocator
-  happens to hand out `id == slot`, but that is an allocator detail, so slots can later be
-  reused or relocated with no format change. Reuse turns out not to need an index (priority 1),
-  but keeping the id on disk is what makes a future relocating layout possible.
-- **Append-only.** `rm` tombstones; slots are never reused. See the caveat below.
+- **ids are stored, not inferred.** `vec_id` lives in every metadata entry, which is what
+  paid for slot reuse: the generation is already on disk in bytes every read path fetches.
+  Keeping the id on disk is also what makes a future relocating layout possible.
+- **Slots are reused, and ids carry a generation.** `rm` tombstones on disk and pushes the
+  slot onto an in-memory free list that the open scan rebuilds. An id is
+  `(generation << 32) | slot`, so refilling a slot issues a new id and a stale one still
+  resolves to nothing. See "Slot reuse" below.
 - **IO is libc, not `std.fs.File`.** POSIX positional IO is a stable interface; the standard
   library's buffered Reader/Writer is not, and rewriting it is what broke `vec_storage.zig`
   at 0.15. `pfile.zig` owns the three things the standard library had been hiding: partial
@@ -94,48 +97,90 @@ with ~880 bytes still free at 768xf32 -- enough for a 96-byte 1-bit code.
 
 ## Known v1 costs
 
-- **Unbounded growth on re-embed.** `vector.zig` `replaceVectors` puts the new vectors then
-  removes the old on every re-embed, so an actively edited document accumulates tombstones
-  forever. The old implementation reused holes and did not. Not a correctness problem, but it
-  is the only real defect -- see priority 1 below.
 - **Open scans every trailer.** One 32-byte `pread` per chunk at startup, O(n) per open, and
   measured at **30.5 us/chunk cold** -- ~10 minutes at 20M vectors. This is the single worst
-  scaling problem in the design. See priority 2.
-- **`put` costs two pwrites**, `get` one pread, `rm` one pread plus a one-byte pwrite.
+  scaling problem in the design, and now the top priority. See below.
+- **`put` costs two pwrites**, `get` one pread, `rm` one pread plus a one-byte pwrite. `put`
+  also called `lseek` on every insert to check whether the file needed extending; the store
+  now tracks the chunk count itself (47cf2f7).
+- **`put` still grows the file one 4 KB chunk at a time.** A real cost at 20M inserts, but it
+  belongs with the batched-scan work, not with reuse.
 
-## Priority 1: slot reuse via an in-memory free list
+## Slot reuse  [DONE -- af581da, was "priority 1"]
 
-`rm` tombstones and slots are never reused, so `replaceVectors` grows the file forever on an
-actively edited corpus. This is the only real v1 defect.
+`rm` tombstoned a slot and nothing ever claimed it again, so `replaceVectors` -- which puts a
+document's new vectors then removes the old -- leaked a slot per sentence on every re-embed.
+That was the only real v1 defect.
 
-**It needs no index and no compaction pass.** `vec_id`s are ephemeral: `SearchResult` carries
+**It needed no index and no compaction pass.** `vec_id`s are ephemeral: `SearchResult` carries
 path/start_i/end_i/similarity and no id, `note_id_map` has no `VectorID` at all, and inside
 `vector.zig` ids appear only as `rm(old_v.id)` within `replaceVectors` plus one test helper --
 `put`'s return is discarded. No id is persisted, exposed to consumers, or held across a process
 boundary.
 
-So: **build a free list during the open scan.** The scan already reads every metadata entry, so
-the list is free -- no extra IO, no new file, no format change, no generation stamping, no
-stale-index recovery path. `put` pops a free slot; `get(id)` stays pure arithmetic against
-`id == slot` with zero resident memory. A bitmap costs 8 KB at 65k slots, 128 KB at 1M.
+**The free list is built during the open scan.** The scan already reads every metadata entry, so
+a slot that is used but not occupied is exactly a hole and the list costs no extra IO, no new
+file, and no format change. `put` pops before it extends; `get(id)` stays pure arithmetic. It is
+a LIFO stack of ids, 8 bytes per *hole* rather than per slot.
 
-Note the inversion: the open scan is what makes the sidecar index unnecessary. Keeping the scan
-is what lets us delete the index, not the other way round.
+Note the inversion: the open scan is what makes the sidecar index unnecessary for reuse. Keeping
+the scan is what lets us delete the index, not the other way round.
 
-Two things this requires:
+### Generations, and why they were free
 
-- **Document the id contract:** an id is valid until the vector is removed, and a removed id may
-  be reissued to a later `put`. That is a real weakening of today's never-resurrected guarantee.
-- **`replaceVectors` ordering becomes load-bearing.** It puts the new vectors *then* removes the
-  old, so old ids are still live while the puts run and no `put` can hand back a slot the caller
-  is still holding. Safe today, but incidental -- it needs a comment at both ends saying so, or a
-  reordering breaks reuse in a way no current test would catch.
+Reuse without them is silently wrong: after slot 7 is freed and refilled, a caller holding the
+old id 7 would `get` someone else's row and `rm` someone else's vector, and `MultipleRemove`
+would stop being detectable. So an id is now `(generation << 32) | slot`.
+
+The alternative on the table was a separate id-to-slot map with monotonically increasing ids.
+Generations won on every axis:
+
+| | generation-tagged ids | id-to-slot map |
+|---|---|---|
+| memory @20M | 8 B x *holes* | 8-16 B x *every slot*, ~320 MB, resident forever |
+| `get(id)` | arithmetic, as today | hash lookup |
+| disk format | unchanged -- `vec_id` was already `u64` | unchanged |
+| extra IO | none; `scan` reads the trailer anyway | none; same scan rebuilds it |
+| stale-id check | one comparison on metadata already in hand | map miss |
+
+The decisive evidence was in the tests. Three existing cases assert things that were true only
+because the store was append-only -- `"ids stay distinct across a delete"`, `"reopen: tombstones
+survive..."`, and churn cycle 3. **With generations all three pass unchanged**, because a reused
+slot yields a different id. Without them all three become false and the store quietly loses a
+guarantee it documents. All 56 tests that existed before reuse still pass untouched.
+
+A slot whose generation is exhausted (2^32 reuses) is retired rather than wrapped, which removes
+ABA from consideration entirely.
+
+### Crash consistency is unchanged
+
+`put` still writes the vector before the metadata. A crash between them leaves the reused slot's
+old trailer standing -- used, not occupied -- so the next scan puts it straight back on the free
+list and the half-written vector bytes are never read. A crash after the metadata write leaves
+the slot occupied at the new generation. Both states are correct with no recovery path.
+
+### The id contract
+
+An id is valid until its vector is removed. A removed id is never reissued; the slot behind it
+may be, under a new id. `get`/`getVec`/`rm` on a stale id behave exactly as before -- `null`,
+`NoSuchVector`, `MultipleRemove` -- whether or not the slot has since been refilled. That is a
+real weakening of the old never-resurrected guarantee, and it is the reason generations exist.
+
+**`replaceVectors` ordering is load-bearing.** It puts the new vectors *then* removes the old, so
+old ids are still live while the puts run and no `put` can hand back a slot the caller is still
+holding. That was incidental; both ends are now commented. Generations mean a reordering fails
+loudly at `rm` rather than deleting live data, but it still fails.
 
 Reuse stops the file *growing*; it does not *shrink* one already bloated. `compact()` is the
-shrink tool and stays deferred, probably forever -- it is only worth it if a corpus churns down
-hard and the slack is worth reclaiming.
+shrink tool and stays deferred, probably forever.
 
-## Priority 2: batching the open scan  [REVISED -- was "not doing"]
+The payoff is bigger than disk. Every whole-store read path -- `search`, `vecsForDoc`,
+`validate` -- walks chunks up to the high-water mark regardless of how many slots are live, and
+the planned in-memory codes array is scanned linearly on every query. A dead slot costs query
+bandwidth on every search, forever, so keeping the slot space dense is a search optimisation
+that happens to also stop the file growing.
+
+## Priority 1: batching the open scan  [REVISED twice -- was "priority 2", before that "not doing"]
 
 **This section previously said "investigated and dropped." That was wrong, and the reason it
 was wrong is instructive.** The 2x figure it cited was measured entirely in RAM, on a 256 MiB
@@ -264,21 +309,20 @@ slack already exists and is already unused.
 
 ## Deferred, roughly in order
 
-1. **Slot reuse** (priority 1). Fixes unbounded growth, and keeps the in-memory codes array
-   dense -- a dead slot costs query bandwidth on every search, forever.
-2. **Batched open scan** (priority 2), 1 MiB reads. 45x measured, cold.
-3. **Sidecar index**, back on the list: even batched, a cold open at 20M vectors is ~14 seconds,
+1. **Batched open scan** (priority 1 now), 1 MiB reads. 45x measured, cold.
+2. **Sidecar index**, back on the list: even batched, a cold open at 20M vectors is ~14 seconds,
    so the scan cannot be the startup path. Must also persist the quantized codes -- recomputing
    them means re-reading 82 GB. Still never inside the data file, still never fatal to lose.
-4. **1-bit quantized cache** of the whole DB in memory: scan the codes, then confirm ~100
+3. **1-bit quantized cache** of the whole DB in memory: scan the codes, then confirm ~100
    candidates on disk. The ~880 bytes of slack per chunk at 768xf32 has room for a 96-byte code,
    so this needs no format change. The measurements make this mandatory, not optional.
-5. **RwLock**, once contention is real.
-6. **Transactions.**
-7. **`compact()`**, only if reclaiming space from a churned-down corpus turns out to matter.
+4. **RwLock**, once contention is real.
+5. **Transactions.**
+6. **`compact()`**, only if reclaiming space from a churned-down corpus turns out to matter.
 
 **On the sidecar index, twice reversed.** It was first justified by two grounds, then dropped
-when both dissolved (reuse needs only an in-memory free list; the scan looked cheap). The
+when both dissolved (reuse needed only an in-memory free list, which is now built and shipped;
+the scan looked cheap). The
 measurements put it back: the scan is cheap only warm, and at filesystem scale a cold open is
 ~10 minutes. It returns as a cache of *codes plus structure*, still never in the data file, and
 still never fatal to lose.
