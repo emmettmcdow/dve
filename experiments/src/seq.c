@@ -17,6 +17,13 @@ int main(int argc, char **argv) {
     prefer_p_cores();
     int fd = open_ro(path, has_nocache(argc, argv));
     uint64_t size = file_size_of(fd);
+    /* The loop reads whole blocks only, so a block larger than the file would
+     * time zero reads and report it as a very fast scan. */
+    if ((uint64_t)bs > size) {
+        fprintf(stderr, "block %zu exceeds file size %llu\n", bs,
+                (unsigned long long)size);
+        return 2;
+    }
     char *buf = alloc_aligned(bs);
     volatile uint64_t sink = 0;
     uint64_t off = 0;

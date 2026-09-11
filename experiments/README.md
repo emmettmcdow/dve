@@ -26,13 +26,47 @@ is larger than RAM, so nothing caches and every read hits the device.
 brew install hyperfine     # prerequisite
 make
 ./run.sh --smoke           # 64 MiB + 256 MiB, a few seconds; checks the plumbing
-./run.sh                   # 4 GiB + 32 GiB, the real thing
+./run.sh                   # 4 GiB + 32 GiB, the real thing -- about half an hour
 ./run.sh --purge           # additionally `sudo purge` before each run
 make clean-data            # reclaim the 36 GiB
 ```
 
 Results land in `results/<tag>.md`, raw hyperfine JSON in `results/raw/`. Data files and
 binaries are gitignored; the result markdown is committed.
+
+### Running part of it
+
+A full run is dominated by its two 4 KiB-granularity cold benches -- `cold_seq_4096` and
+`cold_stride_4096_32` are four minutes *per run*, twenty-five of the thirty. Waiting behind
+them to re-measure something that takes five seconds is how a harness stops being used, so
+every bench can be selected individually:
+
+```sh
+./run.sh --only seq --regime cold --blocks 1M,64M   # just the big-block question
+./run.sh --only rand                                # refresh one row
+./run.sh --list                                     # what would run, without running it
+./run.sh --only seq --regime warm --runs 3          # fewer repetitions
+```
+
+| flag | effect |
+|---|---|
+| `--only LIST` | benches to run: `seq`, `stride`, `rand` (default: all three) |
+| `--regime LIST` | `warm`, `cold` (default: both) |
+| `--blocks LIST` | sequential block sizes; `K`/`M`/`G` suffixes accepted |
+| `--runs N` | timed runs per bench, overriding the per-regime default |
+| `--list` | print the plan and exit |
+| `--fresh` | discard this tag's raw results first |
+
+`--only rand` and friends also skip generating the data file they do not read, which matters
+when the unwanted one is 32 GiB.
+
+**Partial runs accumulate.** Raw results are per-bench files and the report renders whatever
+exists, so a subset refreshes its own rows and leaves the rest of `results/<tag>.md` standing;
+a bench that has never run shows as `—`. That only stays honest while the results are
+comparable, so `run.sh` records the geometry it ran at -- file sizes and the random-read count
+-- in `results/raw/<tag>_meta.json` and discards the tag's results if a later run changes it.
+Block sizes are deliberately not part of that check: each writes its own file, so adding one
+does not invalidate the others.
 
 ### Design notes
 
@@ -52,7 +86,9 @@ purpose -- concurrency is a separate question and would confound this one.
 
 **Run lengths.** hyperfine times the whole process, so a run must dwarf ~4 ms of startup. This
 is why `rand` does 100,000 reads and divides, rather than measuring `log2(20M) ~ 24` reads
-directly: 24 reads is ~2 ms and startup would swamp it.
+directly: 24 reads is ~2 ms and startup would swamp it. `seq` refuses a block larger than the
+file for the same reason in reverse: the loop reads whole blocks only, so it would time zero
+reads and report the result as an extremely fast scan.
 
 ### Sanity checks
 

@@ -218,36 +218,85 @@ Measured, cold (Apple M5, 24 GB RAM):
 
 | pattern | rate | per unit |
 |---|---|---|
+| sequential, 4 MiB blocks | **6,636 MiB/s** | -- |
 | sequential, 1 MiB blocks | 5,699 MiB/s | -- |
 | sequential, 128 KiB blocks | 2,474 MiB/s | -- |
 | sequential, 4 KiB blocks | **135 MiB/s** | 29 us/block |
 | 32 B trailer per 4 KiB chunk (today's scan) | -- | **30.5 us/chunk** |
 | random 4 KiB read | 15,605 IOPS | **64 us** |
 
+The 4 MiB row is from the 2026-09-10 re-run, which also re-measured every other row: all four
+cold numbers reproduced within 3.3% two days later, which is this machine's run-to-run spread
+and is why the differences under 5% in the block sweep below are not read as signal. (The warm
+numbers move more, up to 12%, as cache-resident measurements do.) See "Block size" below for
+why the sweep stopped at 4 MiB.
+
 Warm, for contrast: 10,978 MiB/s sequential, 1.6 us per random read. **The warm and cold
 regimes differ by 40x on the pattern we care about**, which is exactly why the earlier
 extrapolation from a warm 256 MiB measurement was worthless.
 
 Note the trailer scan costs the same as reading every byte in the file (1.06x of a full 4 KiB
-scan). At 768xf32 each 32-byte trailer sits in its own 4 KiB block, so "read only the metadata"
+scan, 1.07x on the re-run). At 768xf32 each 32-byte trailer sits in its own 4 KiB block, so "read only the metadata"
 touches every block anyway. Reading 0.8% of the bytes buys nothing.
 
 Projected to the 20M-vector target (81.9 GB on disk at 768xf32):
 
 - **today's scan:** 20M x 30.5 us = **~10 minutes** at every cold open.
-- **batched at 1 MiB:** 78,125 MiB / 5,699 MiB/s = **~14 seconds**.
-- **45x**, not 2x.
+- **batched at 4 MiB:** 78,125 MiB / 6,636 MiB/s = **~12 seconds**.
+- **52x**, not 2x.
 
-Fourteen seconds is still far too slow for app launch, so batching alone does not save the
+Twelve seconds is still far too slow for app launch, so batching alone does not save the
 scan -- the sidecar index does, and batching is what makes the unavoidable cold rebuild
-tolerable. Both are needed at this scale. Use 1 MiB blocks, not the 128 KiB the warm curve
-suggested: warm was cache-bound above 1 MiB, cold is still climbing at 1 MiB.
+tolerable. Both are needed at this scale.
+
+### Block size: 4 MiB, and the curve is flat above it  [measured 2026-09-10]
+
+The 1 MiB figure above was the largest block the original sweep tried, so it was a floor
+rather than an optimum -- the cold curve was still climbing when the measurements stopped.
+Sweeping past it (`./run.sh --only seq --regime cold --blocks 1M,2M,4M,8M,16M,32M,64M`, same
+32 GiB F_NOCACHE file):
+
+| block | cold MiB/s | 81.9 GB scan | vs. 1 MiB |
+|---|---|---|---|
+| 1 MiB | 5,510 | 14.2 s | 1.00x |
+| 2 MiB | 6,384 | 12.2 s | 1.16x |
+| **4 MiB** | **6,636** | **11.8 s** | **1.20x** |
+| 8 MiB | 6,693 | 11.7 s | 1.21x |
+| 16 MiB | 6,337 | 12.3 s | 1.15x |
+| 32 MiB | 6,634 | 11.8 s | 1.20x |
+| 64 MiB | 6,627 | 11.8 s | 1.20x |
+
+**The knee is at 4 MiB and there is nothing above it.** 4 -> 8 MiB buys 0.6%, and the spread
+across 8..64 MiB is 5% with no trend -- the same run-to-run variance that puts today's 1 MiB
+number 3% below the 5,699 MiB/s measured on 2026-09-08. So the honest reading is that the
+device saturates somewhere around 4 MiB at roughly 6.6 GiB/s single-threaded, and bigger
+batches are free to want but buy nothing.
+
+Take **4 MiB**: it captures the whole win, and a scan buffer is resident memory competing with
+a ~1 GB embedding model on a 24 GB machine, so there is no reason to pay 64 MiB for 0%. The
+*warm* curve gives a second reason not to: it peaks at 1-4 MiB (12,291 MiB/s) and falls to
+8,418 MiB/s by 16 MiB, so an oversized block is not merely neutral once the file does fit in
+cache -- which is the regime a small store, or the tail of a big one, actually runs in.
+
+Two things this does *not* say. **Bigger blocks are not the remaining 2x.** 6.6 GiB/s
+single-threaded is likely a queue-depth limit rather than a bandwidth one -- one thread with
+one pread outstanding leaves the device idle between syscalls -- so the next real gain is
+concurrent reads, which `experiments/` deliberately does not measure yet (README: "concurrency
+is a separate question and would confound this one"). And **11.8 s is an IO ceiling, not a
+build time.** The initial index build also quantizes every vector it reads; to stay IO-bound
+at 4 MiB the 768xf32 -> 96-byte code path has to sustain ~6.6 GiB/s on one core. If it does
+not, the batch size stops mattering and the scan becomes compute-bound -- which is the same
+question as the unmeasured Hamming scan throughput below, approached from the other side.
 
 ## The disk-read budget, and what it implies
 
 The crossover the experiment was built to find:
 
-> **An index must probe fewer than 1.07% of the corpus to beat a full sequential scan.**
+> **An index must probe fewer than 0.92% of the corpus to beat a full sequential scan.**
+
+That was 1.07% before the block sweep. The crossover is a ratio of a full scan to one
+random read, so making the scan 1.2x faster tightened it by the same factor -- the budget
+for an index got *smaller* as a result of the batching win, not larger.
 
 That sounds permissive until it is turned into a latency budget. At 64 us per cold random read,
 an interactive query can afford **~150 reads per 10 ms**. So:
@@ -404,8 +453,9 @@ reasoned about once.
 
 ## Deferred, roughly in order
 
-1. **Batched open scan** (priority 1 now), 1 MiB reads. 45x measured, cold.
-2. **Sidecar index**, back on the list: even batched, a cold open at 20M vectors is ~14 seconds,
+1. **Batched open scan** (priority 1 now), 4 MiB reads. 52x measured, cold; the block-size
+   curve is flat above 4 MiB, so this is the whole single-threaded win.
+2. **Sidecar index**, back on the list: even batched, a cold open at 20M vectors is ~12 seconds,
    so the scan cannot be the startup path. Must also persist the quantized codes -- recomputing
    them means re-reading 82 GB. Still never inside the data file, still never fatal to lose.
 3. **1-bit quantized cache** of the whole DB in memory: scan the codes, then confirm ~100
