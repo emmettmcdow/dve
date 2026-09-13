@@ -2,16 +2,16 @@
 
 `src/vstore.zig`. Page-aligned, disk-resident replacement for `vec_storage.zig`.
 
-## Status (2026-09-11)
+## Status (2026-09-13)
 
-Store is complete and green: `zig build test-vstore` is 65/65 (53 store + 12 `pfile`),
-full `zig build test` is 230/232 with the 2 pre-existing skips. Committed, including
-slot reuse and the batched open scan. `zig build test` did not run the store's tests until
-43ce0e3 wired `test-vstore` into the aggregate, which is why the total jumped from 154 to 228.
+Store is complete and green, and **`vector.zig` is cut over** (b052fa3). `vec_storage.zig`
+stays in the tree, still built and still tested, so the two can be measured against each
+other -- see "Measured against v1" below. The database filename gained a `-v2` fragment: the
+two formats share nothing, so under one name an upgrade is a hard `IncompatibleDatabase`,
+and under two it is a rebuild that leaves the old file intact.
 
-**Not yet wired into `vector.zig`** -- both stores coexist until the cutover at the bottom
-of this file. Every API `vector.zig` touches exists in `vstore.zig`; the diff is naming and
-signatures only.
+`zig build test` did not run the store's tests until 43ce0e3 wired `test-vstore` into the
+aggregate, which is why the total jumped from 154 to 228.
 
 Design target is **indexing an entire filesystem**: ~20M vectors, ~82 GB on disk at 768xf32.
 Optimise for `put` and `search`; `get`/`rm` are barely used (`vector.zig` uses a vector id in
@@ -25,8 +25,8 @@ undecided.
 Two independent tracks, neither blocking the other:
 
 - **Storage:** slot reuse (**done**, af581da) -> batched open scan (**done**) -> cutover to
-  `vector.zig` -> wikitest. Settled work, no open design questions, and unaffected by whatever
-  the index turns out to be.
+  `vector.zig` (**done**, b052fa3) -> wikitest. Settled work, no open design questions, and
+  unaffected by whatever the index turns out to be.
 - **Index:** binary-recall experiment -> Hamming scan throughput -> pick an index. Both are
   measurements, neither touches `vstore.zig`.
 
@@ -35,7 +35,8 @@ Priorities within storage were re-derived from `experiments/` after conclusions 
 
 File IO goes through `src/pfile.zig`, a thin shim onto libc: `open`, `close`, `pread`,
 `pwrite`, `lseek`, `ftruncate`, `fsync`, `fcntl`. No `std.fs.File` anywhere in the store.
-The build target needs `link_libc = true` -- currently only `test-vstore` has it.
+Every build target that reaches it needs `link_libc = true`: the `dve` module carries it, so
+every test and consumer that imports `vector.zig` inherits it, and the xcframework sets it too.
 
 ## Settled design
 
@@ -306,6 +307,63 @@ at 4 MiB the 768xf32 -> 96-byte code path has to sustain ~6.6 GiB/s on one core.
 not, the batch size stops mattering and the scan becomes compute-bound -- which is the same
 question as the unmeasured Hamming scan throughput below, approached from the other side.
 
+## Measured against `vec_storage.zig`  [2026-09-13, `experiments/results/storebench.md`]
+
+Note "v1" elsewhere in this file means *this store's* first version. In this section, and in
+`experiments/storebench`, the two names are the two stores: the old RAM-resident
+`vec_storage.zig` against `vstore.zig`.
+
+`experiments/storebench` drives both over the same synthetic corpus, no embedder. The prior
+going in was that a disk-resident store would lose badly to one holding every vector in RAM.
+**It does not.** Warm, 768xf32, insert-only, and the multiplier says which one wins:
+
+| | 20k | 100k | 500k |
+|---|---:|---:|---:|
+| put | *vec_storage* 1.9x | vstore 1.25x | **vstore 4.5x** |
+| open | vstore 4.6x | vstore 4.0x | vstore 2.9x |
+| search | vstore 1.5x | vstore 1.4x | vstore 1.2x |
+| on disk | *vec_storage* 1.24x | even | *vec_storage* 1.26x |
+
+`vstore` loses put only at the smallest size and wins everything but disk by 500k. The old
+store's put rate falls 10x across the sweep -- it doubles a `[]@Vector(768, f32)` and
+reallocates, copies and memsets an array that is 2 GB by the end -- while `vstore`'s is flat,
+because two `pwrite`s cost the same at any size. On the realistic workload, persisting once per
+document as `embedText` does, the old store takes **5m 14s against 3.77s** at 20k vectors:
+`save` rewrites the entire capacity every call, so ingest is quadratic in the corpus. And it is
+being timed on the weaker guarantee -- `save` returns once the bytes are in the page cache,
+`flush` waits for `F_FULLFSYNC`.
+
+**Everything above is warm**, which flatters `vstore` by up to 40x on exactly the pattern that
+matters. Cold is unmeasured and is the number that decides anything.
+
+### The measurement found two defects, both now fixed (e9bf899)
+
+`vstore`'s search was *worse* than the old store's at cutover. Neither cause was a design
+difference:
+
+| | ms/query @100k |
+|---|---:|
+| as cut over | 164.1 |
+| batched whole-store reads | 100.1 |
+| `storedDotAt`, no by-value copy | **41.5** |
+
+1. **The 4 MiB batched read had landed in `scan` and nowhere else.** `search`, `vecsForDoc`
+   and `validate` walked the same chunks one `pread` at a time, which at 768xf32 is a syscall
+   per vector. `ChunkWalker` is now that loop, written once -- four call sites is where the
+   shape was finally visible enough to compress, which it was not when `scan` was alone.
+2. **`storedDot` takes its operands by value and zig pads `@Vector(768, f32)` to 4096 bytes**,
+   so the inner loop copied 8 KB per candidate -- twice the bytes the scan itself reads. The
+   scan was bounded by the copies rather than by the data.
+
+The second is the one worth remembering: **a whole-store scan can be bound by something that
+is not IO and not arithmetic.** That is a warning for the in-memory codes scan too, whose
+~20 ms estimate assumes it is bandwidth-bound -- an @Vector wide enough to be padded, passed by
+value in its inner loop, would halve it for reasons that have nothing to do with the design.
+
+`vec_storage.zig` still pays the copy that (2) removes, so the search column above is not
+like-for-like and the real gap is smaller than shown. It was left alone on purpose -- it is the
+store being replaced.
+
 ## The disk-read budget, and what it implies
 
 The crossover the experiment was built to find:
@@ -497,15 +555,19 @@ another. Numbers in this file now cite `experiments/` or say they are estimates.
 
 ## Open questions
 
+- **Every storebench number is warm.** The cold regime is what decides the design and it is
+  unmeasured for these two stores. `--reuse` plus `sudo purge` between phases is the way in.
 - **No benchmark on a real corpus yet.** The wikitest run is the check that matters and has
-  not happened, because it needs the cutover.
+  not happened. It no longer waits on the cutover.
 - **The in-memory Hamming scan is unmeasured.** ~20 ms/query at 20M vectors is 1.9 GB divided
   by an assumed ~100 GB/s of memory bandwidth. It is the load-bearing number for the whole
   search design and deserves the same treatment the disk numbers just got -- next experiment.
 - **How many sentences a real filesystem produces**, which sets whether 20M is the right target
   at all. Everything above is sized off an estimate of ~100-500 sentences per document.
 
-## Cutover checklist for `vector.zig`
+## Cutover checklist for `vector.zig`  [DONE -- b052fa3]
+
+Kept as the record of what changed, and of what a consumer outside this repo has to do.
 
 - `note_id` -> `doc_id`; `vecsForNote` -> `vecsForDoc`; `VecForNoteEntry` is gone (`Row`).
 - `init(alloc, dir, .{})` + `load(path)` -> `init(alloc, dir, .{ .path = path })`.
@@ -515,3 +577,7 @@ another. Numbers in this file now cite `experiments/` or say they are estimates.
   since `@Vector(768, f32)` is padded to 4096 bytes and aligned to 4096.
 - `get`/`getVec`/`search` now take `*Self`.
 - `rm` returns `!void` (was `Error!void`); `rmByDocId` can now fail.
+- `replaceVectors` no longer swallows everything `rm` returns. Only `MultipleRemove` is
+  benign; an IO error or a torn record has to reach the caller rather than hit `unreachable`.
+- `build.zig` links libc wherever `vector.zig` now reaches `pfile.zig`, which is the `dve`
+  module itself, every test that imports it, and the xcframework.

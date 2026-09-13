@@ -316,6 +316,28 @@ pub fn build(b: *std.Build) !void {
         wikitest_step.dependOn(b.getInstallStep());
     }
 
+    ///////////////////
+    // Storebench    //
+    ///////////////////
+    // A/B harness: vec_storage.zig (v1, RAM-resident) against vstore.zig (v2, disk-resident).
+    // Builds only -- invoke the binary yourself:
+    //   zig build storebench -Doptimize=ReleaseFast
+    //   ./zig-out/bin/storebench --n 100000
+    const storebench_step = b.step("storebench", "Build the v1-vs-v2 storage benchmark");
+    {
+        const exe = b.addExecutable(.{
+            .name = "storebench",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("experiments/storebench/main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addImport("dve", dve_mod);
+        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
+        storebench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(test_vec_storage);
     test_step.dependOn(test_pfile);
