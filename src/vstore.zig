@@ -455,47 +455,25 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             self.file_chunks = if (size > PAGE_SZ) (size - PAGE_SZ) / L.chunk_bytes else 0;
             // Nothing to scan unless the file reaches at least the first chunk's trailer.
             if (size <= chunkOff(0) + L.meta_off) return;
-            const n_chunks = self.file_chunks;
-
-            // Whole chunks per read, and never zero: a vector too large to fit a batch on its
-            // own falls back to one chunk per read, which is what the scan did everywhere
-            // before batching. Clamped to the file as well, so opening a two-vector store
-            // reserves two chunks rather than 4 MiB.
-            const per_batch = @max(1, SCAN_BATCH_BYTES / L.chunk_bytes);
-            const batch_chunks = @min(n_chunks, per_batch);
-            const buf = try self.allocator.alignedAlloc(u8, .@"16", batch_chunks * L.chunk_bytes);
-            defer self.allocator.free(buf);
-
             var vec_n: usize = 0;
             var slot_n: usize = 0;
 
             self.free.clearRetainingCapacity();
-            var c: usize = 0;
-            while (c < n_chunks) {
-                // The last batch is short whenever the chunk count is not a multiple of the
-                // batch, which is the common case rather than an edge one.
-                const want = @min(batch_chunks, n_chunks - c);
-                const got = try self.file.readAt(buf[0 .. want * L.chunk_bytes], chunkOff(c));
-                // A short read means the file stops inside this batch. Walk the whole chunks
-                // it did return -- a partial chunk has no complete trailer -- and stop there.
-                const full = got / L.chunk_bytes;
-                for (0..full) |b| {
-                    const chunk = buf[b * L.chunk_bytes ..][0..L.chunk_bytes];
-                    const trailer = chunk[L.meta_off..];
-                    for (0..L.vecs_per_chunk) |i| {
-                        const m = metaAt(@alignCast(trailer), i);
-                        if (!m.isUsed()) continue;
-                        const slot = (c + b) * L.vecs_per_chunk + i;
-                        slot_n = slot + 1;
-                        if (m.isOccupied()) {
-                            vec_n += 1;
-                        } else if (nextId(slot, m.vec_id)) |id| {
-                            try self.free.append(self.allocator, id);
-                        }
+            var walker = try ChunkWalker.init(self, self.file_chunks);
+            defer walker.deinit();
+            while (try walker.next()) |chunk| {
+                const trailer = chunk.bytes[L.meta_off..];
+                for (0..L.vecs_per_chunk) |i| {
+                    const m = metaAt(@alignCast(trailer), i);
+                    if (!m.isUsed()) continue;
+                    const slot = chunk.index * L.vecs_per_chunk + i;
+                    slot_n = slot + 1;
+                    if (m.isOccupied()) {
+                        vec_n += 1;
+                    } else if (nextId(slot, m.vec_id)) |id| {
+                        try self.free.append(self.allocator, id);
                     }
                 }
-                if (full < want) break; // truncated tail: stop where the file stops
-                c += want;
             }
 
             self.vec_n = vec_n;
@@ -701,15 +679,83 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         }
 
         // *********************************************************************** Whole-store
-        /// One chunk-sized aligned buffer, so a scan is one read per chunk rather than one
-        /// per vector and per trailer.
-        fn allocChunkBuf(self: *Self) ![]align(VEC_ALIGN) u8 {
-            return self.allocator.alignedAlloc(u8, .@"16", L.chunk_bytes);
-        }
-
         fn vecAt(buf: []align(VEC_ALIGN) const u8, i: usize) *const Array {
             return @ptrCast(@alignCast(buf[i * L.stride ..][0..L.vec_bytes]));
         }
+
+        /// Hands out the store's chunks in order, reading `SCAN_BATCH_BYTES` of them per
+        /// `pread`. Every whole-store path -- `scan`, `search`, `vecsForDoc`, `validate` --
+        /// wants exactly this, and one `pread` per chunk is the slowest way to get it. At
+        /// 768xf32 a chunk is a single 4 KB block, so that shape costs a syscall per vector:
+        /// measured cold it is 135 MiB/s against 6,636 MiB/s for 4 MiB reads, and measured
+        /// warm the ~1.6 us syscall dwarfs the ~60 ns of dot product it exists to feed.
+        ///
+        /// Batching reads the vector bytes even where only the trailer is wanted. That costs
+        /// nothing: at this layout a trailer-only walk still touches every block of the file,
+        /// and is measured at 1.06x of a full read for none of the batching win.
+        const ChunkWalker = struct {
+            store: *Self,
+            buf: []align(VEC_ALIGN) u8,
+            n_chunks: usize,
+            /// Index of the first chunk held in `buf`.
+            base: usize = 0,
+            /// Whole chunks currently in `buf`.
+            have: usize = 0,
+            /// Offset into the current batch, in chunks.
+            at: usize = 0,
+            /// Set when a short read says the file stops inside the batch just handed back.
+            /// A partial chunk has no complete trailer, so the walk ends where the file does.
+            truncated: bool = false,
+
+            const Chunk = struct {
+                /// Absolute chunk index, which is what turns a position in the trailer into a
+                /// slot number.
+                index: usize,
+                bytes: []align(VEC_ALIGN) const u8,
+            };
+
+            fn init(store: *Self, n_chunks: usize) !ChunkWalker {
+                // Clamped to the file, so opening a two-vector store reserves two chunks
+                // rather than 4 MiB. The @max is the guard for a vector too large to fit a
+                // whole batch, which falls back to one chunk per read.
+                const per_batch = @max(1, SCAN_BATCH_BYTES / L.chunk_bytes);
+                const batch_chunks = @min(@max(n_chunks, 1), per_batch);
+                return .{
+                    .store = store,
+                    .buf = try store.allocator.alignedAlloc(u8, .@"16", batch_chunks * L.chunk_bytes),
+                    .n_chunks = n_chunks,
+                };
+            }
+
+            fn deinit(self: *ChunkWalker) void {
+                self.store.allocator.free(self.buf);
+            }
+
+            fn next(self: *ChunkWalker) !?Chunk {
+                if (self.at == self.have) {
+                    if (self.truncated) return null;
+                    self.base += self.have;
+                    if (self.base >= self.n_chunks) return null;
+                    // The last batch is short whenever the chunk count is not a multiple of
+                    // the batch, which is the common case rather than an edge one.
+                    const want = @min(self.buf.len / L.chunk_bytes, self.n_chunks - self.base);
+                    const got = try self.store.file.readAt(
+                        self.buf[0 .. want * L.chunk_bytes],
+                        chunkOff(self.base),
+                    );
+                    self.have = got / L.chunk_bytes;
+                    self.truncated = self.have < want;
+                    self.at = 0;
+                    if (self.have == 0) return null;
+                }
+                const i = self.at;
+                self.at += 1;
+                return .{
+                    .index = self.base + i,
+                    .bytes = @alignCast(self.buf[i * L.chunk_bytes ..][0..L.chunk_bytes]),
+                };
+            }
+        };
 
         pub fn search(self: *Self, query: *const Array, buf: []SearchEntry, threshold: f32) !usize {
             const zone = tracy.beginZone(@src(), .{ .name = "vstore.zig:search" });
@@ -733,20 +779,16 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             };
             var pq = std.PriorityQueue(Cand, void, Cand.order).init(arena.allocator(), undefined);
 
-            const chunk = try self.allocChunkBuf();
-            defer self.allocator.free(chunk);
-
-            const n_chunks = chunkCount(self.slot_n);
-            for (0..n_chunks) |c| {
-                const got = try self.file.readAt(chunk, chunkOff(c));
-                if (got != chunk.len) break;
-                const trailer = chunk[L.meta_off..];
+            var walker = try ChunkWalker.init(self, chunkCount(self.slot_n));
+            defer walker.deinit();
+            while (try walker.next()) |chunk| {
+                const trailer = chunk.bytes[L.meta_off..];
                 for (0..L.vecs_per_chunk) |i| {
-                    const slot = c * L.vecs_per_chunk + i;
+                    const slot = chunk.index * L.vecs_per_chunk + i;
                     if (slot >= self.slot_n) break;
                     const m = metaAt(@alignCast(trailer), i);
                     if (!m.isOccupied()) continue;
-                    const sim = storedDot(vec_sz, vec_type, vecAt(chunk, i).*, query.*);
+                    const sim = storedDotAt(vec_sz, vec_type, vecAt(chunk.bytes, i), query);
                     // The row is already in hand from the trailer we just read; re-reading it
                     // per result would cost a syscall each.
                     if (sim > threshold) try pq.add(.{ .row = rowOf(m.*), .sim = sim });
@@ -775,15 +817,14 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             var results: std.ArrayList(Row) = .{};
             errdefer results.deinit(allocator);
 
-            var trailer: [L.vecs_per_chunk * @sizeOf(VMeta)]u8 align(@alignOf(VMeta)) = undefined;
-            const n_chunks = chunkCount(self.slot_n);
-            for (0..n_chunks) |c| {
-                const got = try self.file.readAt(&trailer, chunkOff(c) + L.meta_off);
-                if (got != trailer.len) break;
+            var walker = try ChunkWalker.init(self, chunkCount(self.slot_n));
+            defer walker.deinit();
+            while (try walker.next()) |chunk| {
+                const trailer = chunk.bytes[L.meta_off..];
                 for (0..L.vecs_per_chunk) |i| {
-                    const slot = c * L.vecs_per_chunk + i;
+                    const slot = chunk.index * L.vecs_per_chunk + i;
                     if (slot >= self.slot_n) break;
-                    const m = metaAt(&trailer, i);
+                    const m = metaAt(@alignCast(trailer), i);
                     if (!m.isOccupied() or m.doc_id != doc_id) continue;
                     try results.append(allocator, rowOf(m.*));
                 }
@@ -821,23 +862,22 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             defer arena.deinit();
             const a = arena.allocator();
 
-            const chunk = try self.allocChunkBuf();
-            defer self.allocator.free(chunk);
-
             var docs_seen = std.AutoHashMap(DocID, void).init(a);
             const n_chunks = chunkCount(self.slot_n);
-            for (0..n_chunks) |c| {
-                const got = try self.file.readAt(chunk, chunkOff(c));
-                if (got != chunk.len) return Error.Corrupt;
-                const trailer = chunk[L.meta_off..];
+            var walker = try ChunkWalker.init(self, n_chunks);
+            defer walker.deinit();
+            var seen_chunks: usize = 0;
+            while (try walker.next()) |chunk| {
+                seen_chunks += 1;
+                const trailer = chunk.bytes[L.meta_off..];
                 for (0..L.vecs_per_chunk) |i| {
-                    const slot = c * L.vecs_per_chunk + i;
+                    const slot = chunk.index * L.vecs_per_chunk + i;
                     if (slot >= self.slot_n) break;
                     const m = metaAt(@alignCast(trailer), i);
                     if (!m.isOccupied()) continue;
 
                     if (m.doc_id == 0) return Error.UninitializedDocID;
-                    const vec = vecAt(chunk, i);
+                    const vec = vecAt(chunk.bytes, i);
                     if (crcOf(vec, m.*) != m.crc32) {
                         std.log.warn("vstore: checksum mismatch at slot {d}", .{slot});
                         return Error.Corrupt;
@@ -846,6 +886,9 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
                     try docs_seen.put(m.doc_id, {});
                 }
             }
+            // The walker stops where the file stops. A store whose slots run past its bytes is
+            // truncated, which the per-chunk loop used to catch as a short read.
+            if (seen_chunks != n_chunks) return Error.Corrupt;
 
             var it = docs_seen.keyIterator();
             while (it.next()) |doc_id| {
@@ -2014,6 +2057,7 @@ const tracy = @import("tracy");
 const pfile = @import("pfile.zig");
 const types = @import("types.zig");
 const storedDot = @import("vec_util.zig").storedDot;
+const storedDotAt = @import("vec_util.zig").storedDotAt;
 const validateL2 = @import("vec_util.zig").validateL2;
 const VectorID = types.VectorID;
 

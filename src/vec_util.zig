@@ -80,6 +80,55 @@ pub fn storedDot(comptime N: usize, comptime T: type, a: @Vector(N, T), b: @Vect
     }
 }
 
+/// `storedDot` over operands that stay where they are. Zig pads `@Vector(768, f32)` to 4096
+/// bytes, so passing two of them by value copies 8 KB per call -- twice the bytes a whole-store
+/// scan reads out of the file. That makes the copies, not the data, the thing that bounds the
+/// scan, which is the wrong thing to be bounded by. This reads through the pointers in
+/// fixed-width lanes instead.
+///
+/// Summation order differs from `storedDot`'s full-width `@reduce`, so the two can disagree in
+/// the last ulp or so. Both are approximations of the same sum and neither is the "true" one;
+/// nothing here compares similarities for exact equality.
+pub fn storedDotAt(comptime N: usize, comptime T: type, a: *const [N]T, b: *const [N]T) f32 {
+    // 16 lanes is four NEON registers' worth of f32, wide enough to keep the unit busy and
+    // narrow enough that the accumulator stays in registers across the loop.
+    const LANES = 16;
+    switch (@typeInfo(T)) {
+        .float => {
+            var acc: @Vector(LANES, f32) = @splat(0);
+            var i: usize = 0;
+            while (i + LANES <= N) : (i += LANES) {
+                const va: @Vector(LANES, f32) = @floatCast(@as(@Vector(LANES, T), a[i..][0..LANES].*));
+                const vb: @Vector(LANES, f32) = @floatCast(@as(@Vector(LANES, T), b[i..][0..LANES].*));
+                acc += va * vb;
+            }
+            var total = @reduce(.Add, acc);
+            while (i < N) : (i += 1) {
+                total += @as(f32, @floatCast(a[i])) * @as(f32, @floatCast(b[i]));
+            }
+            return total;
+        },
+        .int => {
+            // Same widening and the same reason for it as `storedDot`'s integer path: an i8
+            // product overflows i8 on the first term, and zig 0.15.2 mis-lowers wide
+            // non-power-of-two integer vector arithmetic.
+            var acc: @Vector(LANES, i32) = @splat(0);
+            var i: usize = 0;
+            while (i + LANES <= N) : (i += LANES) {
+                const va: @Vector(LANES, i32) = @intCast(@as(@Vector(LANES, T), a[i..][0..LANES].*));
+                const vb: @Vector(LANES, i32) = @intCast(@as(@Vector(LANES, T), b[i..][0..LANES].*));
+                acc += va * vb;
+            }
+            var raw: i32 = @reduce(.Add, acc);
+            while (i < N) : (i += 1) raw += @as(i32, a[i]) * @as(i32, b[i]);
+
+            const scale = i8Scale(N);
+            return @as(f32, @floatFromInt(raw)) / (scale * scale);
+        },
+        else => @compileError("no dot product for stored type " ++ @typeName(T)),
+    }
+}
+
 /// How far a stored unit vector's norm may drift from 1.0 purely by being stored as T.
 fn l2Tolerance(comptime N: usize, comptime T: type) f32 {
     switch (@typeInfo(T)) {
