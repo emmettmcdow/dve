@@ -79,6 +79,20 @@ pub const PAGE_SZ: usize = 4096;
 /// the natural size is already a multiple of 16.
 pub const VEC_ALIGN: usize = 16;
 
+/// How much of the file the open scan reads per `pread`. The scan touches every block of the
+/// file whichever way it is done -- at 768xf32 each 32-byte trailer sits alone in its own 4 KB
+/// block -- so the only question is how large a bite to take, and one syscall per chunk is the
+/// slowest possible answer.
+///
+/// **This is a hardware-dependent tuning knob, not a correctness one.** On an Apple M5 Mac,
+/// cold sequential throughput climbs to ~6.6 GiB/s by 4 MiB and is then flat out to 64 MiB,
+/// while 1 MiB gives up ~20%; anything in 1-8 MiB lands within a few percent of the fastest
+/// value measured, and the optimum will sit elsewhere on other devices. 4 MiB takes the whole
+/// win without holding more resident memory than it has to -- a scan buffer competes with a
+/// ~1 GB embedding model -- and the *warm* curve peaks at 1-4 MiB and falls off above it,
+/// which is the regime a small store actually runs in. See "Block size" in `vec_storage2.md`.
+pub const SCAN_BATCH_BYTES: usize = 4 << 20;
+
 const MAGIC: [8]u8 = "DVEVSTOR".*;
 const FMT_V: u16 = 1;
 
@@ -423,8 +437,14 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
 
         /// Rebuilds the live count, the slot high-water mark, and the free list by walking
         /// every chunk's metadata trailer. This is what buys us an immutable header. It costs
-        /// one read per chunk at open, which a sidecar index would later make a cold-start-
-        /// only cost.
+        /// one read per `SCAN_BATCH_BYTES` of file at open, which a sidecar index would later
+        /// make a cold-start-only cost.
+        ///
+        /// The batch holds whole chunks and the trailers are read out of it in place, so this
+        /// reads the vector bytes too and throws them away. That is not the waste it looks
+        /// like: a trailer-only scan still touches every block of the file, and measured cold
+        /// it costs the same 1.06x of a full read while giving up the 52x that reading in
+        /// 4 MiB bites buys.
         ///
         /// The free list rides along for nothing: a slot that is used but not occupied is
         /// exactly a hole, and its next generation is in the `vec_id` already being read.
@@ -437,25 +457,45 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             if (size <= chunkOff(0) + L.meta_off) return;
             const n_chunks = self.file_chunks;
 
-            var trailer: [L.vecs_per_chunk * @sizeOf(VMeta)]u8 align(@alignOf(VMeta)) = undefined;
+            // Whole chunks per read, and never zero: a vector too large to fit a batch on its
+            // own falls back to one chunk per read, which is what the scan did everywhere
+            // before batching. Clamped to the file as well, so opening a two-vector store
+            // reserves two chunks rather than 4 MiB.
+            const per_batch = @max(1, SCAN_BATCH_BYTES / L.chunk_bytes);
+            const batch_chunks = @min(n_chunks, per_batch);
+            const buf = try self.allocator.alignedAlloc(u8, .@"16", batch_chunks * L.chunk_bytes);
+            defer self.allocator.free(buf);
+
             var vec_n: usize = 0;
             var slot_n: usize = 0;
 
             self.free.clearRetainingCapacity();
-            for (0..n_chunks) |c| {
-                const got = try self.file.readAt(&trailer, chunkOff(c) + L.meta_off);
-                if (got != trailer.len) break; // truncated tail: stop where the file stops
-                for (0..L.vecs_per_chunk) |i| {
-                    const m = metaAt(&trailer, i);
-                    if (!m.isUsed()) continue;
-                    const slot = c * L.vecs_per_chunk + i;
-                    slot_n = slot + 1;
-                    if (m.isOccupied()) {
-                        vec_n += 1;
-                    } else if (nextId(slot, m.vec_id)) |id| {
-                        try self.free.append(self.allocator, id);
+            var c: usize = 0;
+            while (c < n_chunks) {
+                // The last batch is short whenever the chunk count is not a multiple of the
+                // batch, which is the common case rather than an edge one.
+                const want = @min(batch_chunks, n_chunks - c);
+                const got = try self.file.readAt(buf[0 .. want * L.chunk_bytes], chunkOff(c));
+                // A short read means the file stops inside this batch. Walk the whole chunks
+                // it did return -- a partial chunk has no complete trailer -- and stop there.
+                const full = got / L.chunk_bytes;
+                for (0..full) |b| {
+                    const chunk = buf[b * L.chunk_bytes ..][0..L.chunk_bytes];
+                    const trailer = chunk[L.meta_off..];
+                    for (0..L.vecs_per_chunk) |i| {
+                        const m = metaAt(@alignCast(trailer), i);
+                        if (!m.isUsed()) continue;
+                        const slot = (c + b) * L.vecs_per_chunk + i;
+                        slot_n = slot + 1;
+                        if (m.isOccupied()) {
+                            vec_n += 1;
+                        } else if (nextId(slot, m.vec_id)) |id| {
+                            try self.free.append(self.allocator, id);
+                        }
                     }
                 }
+                if (full < want) break; // truncated tail: stop where the file stops
+                c += want;
             }
 
             self.vec_n = vec_n;
@@ -1540,6 +1580,52 @@ test "many vectors per chunk: the chunk boundary is not a special case" {
         try expectVec(&inst, ids[i], .{ @floatFromInt(i % 2), @floatFromInt((i + 1) % 2), 0 });
     }
     try inst.validate();
+}
+
+test "scan: the open scan spans several read batches" {
+    // A 1536xf32 vector puts two pages in every chunk, so a 4 MiB batch covers 512 of them and
+    // 515 vectors make two batches: one full, one three chunks short.
+    const N = 1536;
+    const Multi = VStore(N, f32);
+    const per_batch = SCAN_BATCH_BYTES / Multi.CHUNK_BYTES;
+    try expectEqual(@as(usize, 1), Multi.VECS_PER_CHUNK);
+    try expect(per_batch > 1);
+
+    var tmpD = tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    const vec = try testing_allocator.create([N]f32);
+    defer testing_allocator.destroy(vec);
+    vec.* = @splat(1.0 / @sqrt(@as(f32, N)));
+
+    const n = per_batch + 3;
+    const ids = try testing_allocator.alloc(VectorID, n);
+    defer testing_allocator.free(ids);
+    {
+        var inst = try Multi.init(testing_allocator, tmpD.dir, .{ .path = DB });
+        defer inst.deinit();
+        for (0..n) |i| {
+            ids[i] = try inst.put(.{ .doc_id = @intCast(i + 1), .start_i = i, .end_i = i + 1 }, vec);
+        }
+        // One hole in the first batch and one in the second, so the rebuilt free list has to
+        // survive a batch boundary and not just a chunk one.
+        try inst.rm(ids[1]);
+        try inst.rm(ids[n - 1]);
+        try inst.flush();
+    }
+
+    var inst2 = try Multi.init(testing_allocator, tmpD.dir, .{ .path = DB });
+    defer inst2.deinit();
+    try expectEqual(n - 2, inst2.len());
+    try expectEqual(n, inst2.slot_n);
+    try expectEqual(@as(usize, 2), inst2.free.items.len);
+    try expect((try inst2.get(ids[1])) == null);
+    try expect((try inst2.get(ids[n - 1])) == null);
+    // The chunks either side of the boundary, and one in the short final batch, read back whole.
+    for ([_]usize{ per_batch - 1, per_batch, n - 2 }) |i| {
+        try expectEqual(@as(DocID, @intCast(i + 1)), (try inst2.get(ids[i])).?.doc_id);
+    }
+    try inst2.validate();
 }
 
 // **************************************************************************************** Search

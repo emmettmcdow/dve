@@ -2,12 +2,12 @@
 
 `src/vstore.zig`. Page-aligned, disk-resident replacement for `vec_storage.zig`.
 
-## Status (2026-09-10)
+## Status (2026-09-11)
 
-Store is complete and green: `zig build test-vstore` is 63/63 (51 store + 12 `pfile`),
-full `zig build test` is 226/228 with the 2 pre-existing skips. Committed, including
-slot reuse. `zig build test` did not run the store's tests until 43ce0e3 wired
-`test-vstore` into the aggregate, which is why the total jumped from 154 to 228.
+Store is complete and green: `zig build test-vstore` is 65/65 (53 store + 12 `pfile`),
+full `zig build test` is 230/232 with the 2 pre-existing skips. Committed, including
+slot reuse and the batched open scan. `zig build test` did not run the store's tests until
+43ce0e3 wired `test-vstore` into the aggregate, which is why the total jumped from 154 to 228.
 
 **Not yet wired into `vector.zig`** -- both stores coexist until the cutover at the bottom
 of this file. Every API `vector.zig` touches exists in `vstore.zig`; the diff is naming and
@@ -24,8 +24,9 @@ undecided.
 
 Two independent tracks, neither blocking the other:
 
-- **Storage:** slot reuse (**done**, af581da) -> cutover to `vector.zig` -> wikitest. Settled
-  work, no open design questions, and unaffected by whatever the index turns out to be.
+- **Storage:** slot reuse (**done**, af581da) -> batched open scan (**done**) -> cutover to
+  `vector.zig` -> wikitest. Settled work, no open design questions, and unaffected by whatever
+  the index turns out to be.
 - **Index:** binary-recall experiment -> Hamming scan throughput -> pick an index. Both are
   measurements, neither touches `vstore.zig`.
 
@@ -97,14 +98,16 @@ with ~880 bytes still free at 768xf32 -- enough for a 96-byte 1-bit code.
 
 ## Known v1 costs
 
-- **Open scans every trailer.** One 32-byte `pread` per chunk at startup, O(n) per open, and
-  measured at **30.5 us/chunk cold** -- ~10 minutes at 20M vectors. This is the single worst
-  scaling problem in the design, and now the top priority. See below.
+- **Open scans every trailer.** Still O(n) per open, but read in 4 MiB batches rather than one
+  32-byte `pread` per chunk -- ~12 seconds at 20M vectors rather than ~10 minutes. Batching is
+  done; the remaining cost is what the sidecar index is for. See below.
 - **`put` costs two pwrites**, `get` one pread, `rm` one pread plus a one-byte pwrite. `put`
   also called `lseek` on every insert to check whether the file needed extending; the store
   now tracks the chunk count itself (47cf2f7).
-- **`put` still grows the file one 4 KB chunk at a time.** A real cost at 20M inserts, but it
-  belongs with the batched-scan work, not with reuse.
+- **`put` still grows the file one 4 KB chunk at a time.** A real cost at 20M inserts. It was
+  filed under the batched-scan work; batching the *scan* did not touch it, so it now belongs
+  with the `put` IO work (see the atomic metadata commit below), where the syscall budget can
+  be reasoned about once.
 - **The metadata write is not atomic.** Contained by the crc rather than prevented. See below.
 
 ## Slot reuse  [DONE -- af581da, was "priority 1"]
@@ -206,7 +209,22 @@ the planned in-memory codes array is scanned linearly on every query. A dead slo
 bandwidth on every search, forever, so keeping the slot space dense is a search optimisation
 that happens to also stop the file growing.
 
-## Priority 1: batching the open scan  [REVISED twice -- was "priority 2", before that "not doing"]
+## Batching the open scan  [DONE -- 2026-09-11. REVISED twice before that: was "priority 1", "priority 2", and before that "not doing"]
+
+`scan` reads `SCAN_BATCH_BYTES` (4 MiB) of whole chunks per `pread` and walks the trailers out of
+that buffer in place. Two consequences worth naming. The batch holds **whole chunks**, so the
+scan now reads the vector bytes as well and discards them -- which costs nothing, because a
+trailer-only scan already touched every block of the file (see the 1.06x figure below) and the
+batched read is 52x faster regardless. And the buffer is clamped to the file, so a two-vector
+store allocates two chunks rather than 4 MiB; the `@max(1, ...)` on the other side is a guard for
+a vector larger than a whole batch, which no compilable vector size currently reaches.
+
+The constant is deliberately a constant and not an option: the measurements below say the whole
+1-8 MiB range is within a few percent of the best value on this machine, so it is a
+hardware-dependent tuning knob with a wide flat optimum, not something a caller should be asked
+to choose. `"scan: the open scan spans several read batches"` covers the boundary -- a full batch,
+a short trailing one, and a freed slot either side of the seam so the rebuilt free list is
+exercised across it.
 
 **This section previously said "investigated and dropped." That was wrong, and the reason it
 was wrong is instructive.** The 2x figure it cited was measured entirely in RAM, on a 256 MiB
@@ -453,21 +471,19 @@ reasoned about once.
 
 ## Deferred, roughly in order
 
-1. **Batched open scan** (priority 1 now), 4 MiB reads. 52x measured, cold; the block-size
-   curve is flat above 4 MiB, so this is the whole single-threaded win.
-2. **Sidecar index**, back on the list: even batched, a cold open at 20M vectors is ~12 seconds,
+1. **Sidecar index**, back on the list: even batched, a cold open at 20M vectors is ~12 seconds,
    so the scan cannot be the startup path. Must also persist the quantized codes -- recomputing
    them means re-reading 82 GB. Still never inside the data file, still never fatal to lose.
-3. **1-bit quantized cache** of the whole DB in memory: scan the codes, then confirm ~100
+2. **1-bit quantized cache** of the whole DB in memory: scan the codes, then confirm ~100
    candidates on disk. The ~880 bytes of slack per chunk at 768xf32 has room for a 96-byte code,
    so this needs no format change. The measurements make this mandatory, not optional.
-4. **Atomic metadata commit** -- split the 32-byte `VMeta` write into a 24-byte payload and an
+3. **Atomic metadata commit** -- split the 32-byte `VMeta` write into a 24-byte payload and an
    8-byte commit word. Land it with the `put` IO work above so the syscall budget is costed once.
-5. **RwLock**, once contention is real.
-6. **Transactions.**
-7. **Coalescing the free list** into extents, if a churned-down corpus makes the flat list's
+4. **RwLock**, once contention is real.
+5. **Transactions.**
+6. **Coalescing the free list** into extents, if a churned-down corpus makes the flat list's
    worst case (~80 MB at 20M half-deleted) actually bite.
-8. **`compact()`**, only if reclaiming space from a churned-down corpus turns out to matter.
+7. **`compact()`**, only if reclaiming space from a churned-down corpus turns out to matter.
 
 **On the sidecar index, twice reversed.** It was first justified by two grounds, then dropped
 when both dissolved (reuse needed only an in-memory free list, which is now built and shipped;
