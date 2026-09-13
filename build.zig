@@ -76,6 +76,8 @@ pub fn build(b: *std.Build) !void {
     dve_mod.linkFramework("NaturalLanguage", .{});
     dve_mod.linkFramework("CoreML", .{});
     dve_mod.linkFramework("Foundation", .{});
+    // vstore.zig does its file IO through pfile.zig, a thin shim onto libc.
+    dve_mod.link_libc = true;
     ////////////////
     // Unit Tests //
     ////////////////
@@ -108,6 +110,8 @@ pub fn build(b: *std.Build) !void {
             t.root_module.linkFramework("NaturalLanguage", .{});
             t.root_module.linkFramework("CoreML", .{});
             t.root_module.linkFramework("Foundation", .{});
+            // vector.zig -> vstore.zig -> pfile.zig, which is a thin shim onto libc.
+            t.root_module.link_libc = true;
             if (tr_enable) {
                 t.root_module.linkLibrary(tr.artifact("tracy"));
                 t.root_module.link_libcpp = true;
@@ -384,6 +388,7 @@ pub fn build(b: *std.Build) !void {
             lib.root_module.linkFramework("NaturalLanguage", .{});
             lib.root_module.linkFramework("CoreML", .{});
             lib.root_module.linkFramework("Foundation", .{});
+            lib.root_module.link_libc = true;
             // Set the install name at link time so install_name_tool is not needed.
             lib.install_name = "@rpath/DVECore.framework/DVECore";
             libs[i] = lib.getEmittedBin();

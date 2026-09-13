@@ -3,12 +3,17 @@ pub const ValidationError = error{NotL2};
 /// Filename fragment identifying which storage type a database on disk holds. Quantized
 /// vectors share neither the element type nor the byte width of unquantized ones, so each
 /// setting gets its own files: rebuilding under a different -Dstorage-quantize leaves the
-/// other's database intact instead of colliding with it. Empty for `.none`, so existing
-/// unquantized databases keep the names they already have.
+/// other's database intact instead of colliding with it.
+///
+/// `-v2` marks the `vstore.zig` format. It shares nothing with the `vec_storage.zig` file
+/// that used to live under the unsuffixed name, and opening one as the other is a hard
+/// `IncompatibleDatabase`. Giving the new format its own name turns that failure into a
+/// rebuild -- an upgraded install opens an empty store and re-indexes -- and leaves the old
+/// file untouched for a migration that may never be written.
 pub const db_suffix = switch (config.quant) {
-    .none => "",
-    .f_16 => "-f16",
-    .i_8 => "-i8",
+    .none => "-v2",
+    .f_16 => "-f16-v2",
+    .i_8 => "-i8-v2",
 };
 
 /// Components of an L2-normalized vector have an RMS of exactly 1/sqrt(N), so the range

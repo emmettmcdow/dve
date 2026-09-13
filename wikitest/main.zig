@@ -169,13 +169,13 @@ fn runEmbed(allocator: std.mem.Allocator, opts: Options) !void {
     const elapsed = total_timer.read();
     std.debug.print(
         "\nembedded {d} articles ({d} skipped) -> {d} vectors in {D}\n" ++
-            "capacity {d} slots, {d} paths, {f} on disk, {f} peak rss\n",
+            "{d} slots allocated, {d} paths, {f} on disk, {f} peak rss\n",
         .{
             done,
             skipped,
             db.vec_storage.vec_n,
             elapsed,
-            db.vec_storage.meta.capacity,
+            db.vec_storage.slot_n,
             db.note_id_map.count(),
             fmtBytes(dirSize(db_dir) catch 0),
             fmtBytes(rssBytes()),
@@ -257,13 +257,13 @@ fn runStat(allocator: std.mem.Allocator, opts: Options) !void {
     const load_ns = load_timer.read();
 
     std.debug.print(
-        "model      {s} ({d} dims)\nvectors    {d} occupied / {d} capacity\npaths      {d}\n" ++
+        "model      {s} ({d} dims)\nvectors    {d} live / {d} slots\npaths      {d}\n" ++
             "load       {D}\npeak rss   {f}\n\nfiles:\n",
         .{
             @tagName(model),
             model.vecSize(),
             db.vec_storage.vec_n,
-            db.vec_storage.meta.capacity,
+            db.vec_storage.slot_n,
             db.note_id_map.count(),
             load_ns,
             fmtBytes(rssBytes()),

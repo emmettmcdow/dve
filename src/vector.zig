@@ -63,7 +63,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
 
     return struct {
         const Self = @This();
-        pub const VecStorage = vec_storage.Storage(VEC_SZ, STORED_VEC_TYPE);
+        pub const VecStorage = vstore.VStore(VEC_SZ, STORED_VEC_TYPE);
         pub const quant = config.quant;
 
         /// Converts a vector as the embedder produced it into the form VecStorage holds.
@@ -118,8 +118,8 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 .mpnet_embedding => base_embedder.mpnet_embedding.embedder(),
             };
 
-            var vecs = try VecStorage.init(allocator, basedir, .{});
-            try vecs.load(embedder.path);
+            var vecs = try VecStorage.init(allocator, basedir, .{ .path = embedder.path });
+            errdefer vecs.deinit();
             const wq = try WorkQueue.init(allocator, 1024);
 
             const note_id_map = try allocator.create(NoteIdMap);
@@ -183,17 +183,17 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             const query_vec_union = (try self.embedder.embed(arena.allocator(), query)) orelse {
                 return 0;
             };
-            const query_vec = toStored(@field(query_vec_union, @tagName(embedding_model)).*);
+            const query_vec: StoredArray = toStored(@field(query_vec_union, @tagName(embedding_model)).*);
             const vec_res = try arena.allocator().alloc(VecStorage.SearchEntry, max_results);
 
             debugSearchHeader(query);
             const found_n = try self.vec_storage.search(
-                query_vec,
+                &query_vec,
                 vec_res,
                 self.embedder.threshold,
             );
             for (0..found_n) |i| {
-                const p = self.note_id_map.getPath(vec_res[i].row.note_id) orelse continue;
+                const p = self.note_id_map.getPath(vec_res[i].row.doc_id) orelse continue;
                 buf[i] = SearchResult{
                     .path = p,
                     .start_i = vec_res[i].row.start_i,
@@ -219,19 +219,19 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             if (query.len == 0) return 0;
 
             const query_vec_union = (try self.embedder.embed(arena.allocator(), query)) orelse return 0;
-            const query_vec = toStored(@field(query_vec_union, @tagName(embedding_model)).*);
+            const query_vec: StoredArray = toStored(@field(query_vec_union, @tagName(embedding_model)).*);
 
             debugSearchHeader(query);
             var search_results: [1000]VecStorage.SearchEntry = undefined;
             const found_n = try self.vec_storage.search(
-                query_vec,
+                &query_vec,
                 &search_results,
                 self.embedder.threshold,
             );
             var unique_found_n: usize = 0;
             outer: for (0..@min(found_n, buf.len)) |i| {
                 const row = search_results[i].row;
-                const path = self.note_id_map.getPath(row.note_id) orelse continue;
+                const path = self.note_id_map.getPath(row.doc_id) orelse continue;
                 for (0..unique_found_n) |j| {
                     if (std.mem.eql(u8, buf[j].path, path)) continue :outer;
                 }
@@ -280,7 +280,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 )) orelse continue;
                 const chunk_vec = @field(chunk_vec_union, @tagName(embedding_model)).*;
 
-                const similar = vec_storage.cosine_similarity(
+                const similar = vstore.cosine_similarity(
                     VEC_SZ,
                     VEC_TYPE,
                     chunk_vec,
@@ -342,7 +342,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
 
         /// Persist changes to disk.
         pub fn save(self: *Self) !void {
-            return self.vec_storage.save(self.embedder.path);
+            return self.vec_storage.flush();
         }
 
         fn embedTextInternal(self: *Self, path: []const u8, contents: []const u8) !void {
@@ -425,7 +425,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             note_id: NoteID,
             embedded_sentences: []const EmbeddedSentence,
         ) !void {
-            const old_vecs = try self.vec_storage.vecsForNote(allocator, note_id);
+            const old_vecs = try self.vec_storage.vecsForDoc(allocator, note_id);
             defer allocator.free(old_vecs);
 
             // Remove before putting, so the new rows land in the slots the old ones vacate.
@@ -439,14 +439,21 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             // partway leaves the old rows *and* some new ones covering the same offsets, which
             // is a state `validate` rejects as overlapping.
             for (old_vecs) |old_v| {
-                self.vec_storage.rm(old_v.id) catch |e| switch (e) {
-                    vec_storage.Error.MultipleRemove => continue,
-                    else => unreachable,
+                // Only a double-remove is benign here: the row came from `vecsForDoc`, so
+                // anything else -- an IO error, a torn record -- is a real failure and has to
+                // reach the caller rather than be swallowed as "already gone".
+                self.vec_storage.rm(old_v.vec_id) catch |e| switch (e) {
+                    error.MultipleRemove => continue,
+                    else => return e,
                 };
             }
 
             for (embedded_sentences) |sentence| {
-                _ = try self.vec_storage.put(note_id, sentence.start_i, sentence.end_i, sentence.vec.*);
+                _ = try self.vec_storage.put(.{
+                    .doc_id = note_id,
+                    .start_i = sentence.start_i,
+                    .end_i = sentence.end_i,
+                }, sentence.vec);
             }
         }
 
@@ -459,7 +466,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         pub fn removePath(self: *Self, path: []const u8) !void {
             if (path.len == 0) return Error.InvalidPath;
             if (self.note_id_map.getId(path)) |note_id| {
-                self.vec_storage.rmByNoteId(note_id);
+                try self.vec_storage.rmByDocId(note_id);
             }
             try self.note_id_map.removePath(path);
         }
@@ -492,17 +499,17 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
-            const vec = toStored(raw_vec);
+            const vec: StoredArray = toStored(raw_vec);
 
             const max_results = buf.len;
             const vec_res = try arena.allocator().alloc(VecStorage.SearchEntry, max_results);
             const found_n = try self.vec_storage.search(
-                vec,
+                &vec,
                 vec_res,
                 self.embedder.threshold,
             );
             for (0..found_n) |i| {
-                const p = self.note_id_map.getPath(vec_res[i].row.note_id) orelse continue;
+                const p = self.note_id_map.getPath(vec_res[i].row.doc_id) orelse continue;
                 buf[i] = SearchResult{
                     .path = p,
                     .start_i = vec_res[i].row.start_i,
@@ -561,13 +568,16 @@ fn wordlike(contents: []const u8) bool {
 const TestVecDB = VectorEngine(.apple_nlembedding);
 // Follows the build's quantization setting -- tests that read vectors back out of storage
 // get them in whatever type they were stored as, not necessarily the embedder's f32.
-const TestVector = TestVecDB.VecStorage.Vector;
+const TestVector = TestVecDB.VecStorage.Array;
+/// The element type `TestVector` is made of, named once so the tests below can compare two
+/// stored vectors without restating whatever -Dstorage-quantize picked.
+const STORED_VEC_TYPE_T = @typeInfo(TestVector).array.child;
 fn getVectorsForPath(db: *TestVecDB, path: []const u8, buf: []TestVector) !usize {
     const note_id = db.note_id_map.getId(path) orelse return 0;
-    const vec_rows = try db.vec_storage.vecsForNote(testing_allocator, note_id);
+    const vec_rows = try db.vec_storage.vecsForDoc(testing_allocator, note_id);
     defer testing_allocator.free(vec_rows);
     for (vec_rows, 0..) |v, i| {
-        buf[i] = db.vec_storage.getVec(v.row.vec_id);
+        try db.vec_storage.getVec(v.vec_id, &buf[i]);
     }
     return vec_rows.len;
 }
@@ -636,22 +646,21 @@ test "embedText re-embedding a document reuses its slots" {
     var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
     defer db.deinit();
 
-    // 20 sentences against the default capacity of 32. `replaceVectors` removes the old rows
-    // before putting the new ones, so the live count never exceeds 20 and the store never has
-    // to grow. Putting first would hold both generations live at once -- a peak of 40 -- and
-    // force a doubling to 64 on the very first re-embed, then leak the difference forever.
+    // `replaceVectors` removes the old rows before putting the new ones, so every re-embed
+    // refills the slots it just freed and the high-water mark never moves. Putting first would
+    // hold both generations live at once, settling at two slots per sentence forever.
     const sentences = 20;
     const text = "pizza. " ** sentences;
     const path = "test.md";
 
     try db.embedText(path, text);
-    const capacity = db.vec_storage.meta.capacity;
     try expectEqual(sentences, db.vec_storage.vec_n);
+    try expectEqual(sentences, db.vec_storage.slot_n);
 
     for (0..5) |_| {
         try db.embedText(path, text);
         try expectEqual(sentences, db.vec_storage.vec_n);
-        try expectEqual(capacity, db.vec_storage.meta.capacity);
+        try expectEqual(sentences, db.vec_storage.slot_n);
     }
     try db.validate();
 }
@@ -1147,7 +1156,7 @@ test "embedText same input same result" {
     var updated_vecs: [1]TestVector = undefined;
     try expectEqual(1, try getVectorsForPath(db, path, &updated_vecs));
 
-    try std.testing.expect(@reduce(.And, initial_vecs[0] == updated_vecs[0]));
+    try std.testing.expect(std.mem.eql(STORED_VEC_TYPE_T, &initial_vecs[0], &updated_vecs[0]));
 
     try db.validate();
 }
@@ -1170,7 +1179,7 @@ test "embedText different input different result" {
     try expectEqual(1, try getVectorsForPath(db, path, &updated_vecs));
 
     // Vector should be different (apple != banana)
-    try std.testing.expect(!@reduce(.And, initial_vecs[0] == updated_vecs[0]));
+    try std.testing.expect(!std.mem.eql(STORED_VEC_TYPE_T, &initial_vecs[0], &updated_vecs[0]));
 
     try db.validate();
 }
@@ -1198,9 +1207,9 @@ test "embedText updates only changed sentences" {
     var updated_vecs: [3]TestVector = undefined;
     try expectEqual(3, try getVectorsForPath(db, path, &updated_vecs));
 
-    try std.testing.expect(@reduce(.And, initial_vecs[0] == updated_vecs[0]));
-    try std.testing.expect(!@reduce(.And, initial_vecs[1] == updated_vecs[1]));
-    try std.testing.expect(@reduce(.And, initial_vecs[2] == updated_vecs[2]));
+    try std.testing.expect(std.mem.eql(STORED_VEC_TYPE_T, &initial_vecs[0], &updated_vecs[0]));
+    try std.testing.expect(!std.mem.eql(STORED_VEC_TYPE_T, &initial_vecs[1], &updated_vecs[1]));
+    try std.testing.expect(std.mem.eql(STORED_VEC_TYPE_T, &initial_vecs[2], &updated_vecs[2]));
 
     try db.validate();
 }
@@ -1649,4 +1658,4 @@ const types = @import("types.zig");
 const UniqueCircularBuffer = util.UniqueCircularBuffer;
 const util = @import("util.zig");
 const VectorID = types.VectorID;
-const vec_storage = @import("vec_storage.zig");
+const vstore = @import("vstore.zig");
