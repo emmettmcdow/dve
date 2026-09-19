@@ -46,11 +46,17 @@ const Options = struct {
     /// Cosine floor that defines a "real" result, matching `MpnetEmbedder.THRESHOLD`. The
     /// threshold sweep below asks what a Hamming cutoff costs to catch everything above it.
     cos_threshold: f32 = 0.36,
+    /// Code width in bits. Must be a multiple of 64 and at most DIM.
+    bits: usize = DIM,
+    /// Skip the threshold sweep, which is width-independent and slow.
+    no_sweep: bool = false,
 };
 
+/// The embedding's width. The *code's* width is `opts.bits`, which is a separate thing: a
+/// shorter code is a smaller codes cache and a proportionally faster scan, since the scan is
+/// purely memory-bound (`experiments/results/hamscan.md`). What it costs in recall is the
+/// question this sweep exists to answer.
 const DIM = 768;
-const CODE_BYTES = DIM / 8; // 96
-const CODE_WORDS = CODE_BYTES / 8; // 12 u64s
 const TOP = 10;
 /// Above this, two chunks are the same text. The corpus has a lot of these.
 const DUP_COS: f32 = 0.99;
@@ -111,11 +117,19 @@ pub fn main() !void {
         \\
         \\corpus     {s}/{s}
         \\vectors    {d} live, {d} sampled, {d} dims
+        \\code       {d} bits ({d} bytes), {d:.2} GB for 35M vectors
         \\queries    {d}, drawn from the corpus, each excluded from its own results
         \\ground truth: exact cosine top-{d}
         \\
         \\
-    , .{ opts.dir, opts.file, live, n, DIM, opts.queries, TOP });
+    , .{
+        opts.dir,   opts.file,
+        live,       n,
+        DIM,        opts.bits,
+        opts.bits / 8,
+        @as(f64, @floatFromInt(opts.bits / 8)) * 35e6 / 1e9,
+        opts.queries, TOP,
+    });
 
     // ------------------------------------------------------------------- shared parameters
     const mean = try gpa.alloc(f32, DIM);
@@ -123,7 +137,10 @@ pub fn main() !void {
     componentMean(vecs, n, mean);
 
     // One rotation, shared by both simhash variants so they differ only in the centering.
-    const rot = try gpa.alloc(f32, DIM * DIM);
+    // `bits` rows of DIM, so a narrower code is a projection onto fewer random hyperplanes
+    // rather than a truncation of the same ones.
+    const words = opts.bits / 64;
+    const rot = try gpa.alloc(f32, opts.bits * DIM);
     defer gpa.free(rot);
     for (rot) |*r| r.* = rng.floatNorm(f32);
 
@@ -159,14 +176,14 @@ pub fn main() !void {
     // ------------------------------------------------------------------------- the variants
     printHeader();
     for (std.enums.values(Variant)) |variant| {
-        const codes = try gpa.alignedAlloc(u64, .@"8", n * CODE_WORDS);
+        const codes = try gpa.alignedAlloc(u64, .@"8", n * words);
         defer gpa.free(codes);
-        try encode(gpa, variant, vecs, n, mean, rot, codes);
-        const stats = try recallOf(gpa, codes, n, queries, truth, dup);
+        try encode(gpa, variant, vecs, n, opts.bits, mean, rot, codes);
+        const stats = try recallOf(gpa, codes, n, words, queries, truth, dup);
         printRow(variant, stats, opts.verbose);
     }
 
-    try thresholdSweep(gpa, vecs, n, queries, opts);
+    if (!opts.no_sweep) try thresholdSweep(gpa, vecs, n, queries, opts);
 
     std.debug.print(
         \\
@@ -197,10 +214,12 @@ fn encode(
     variant: Variant,
     vecs: []const f32,
     n: usize,
+    bits: usize,
     mean: []const f32,
     rot: []const f32,
     out: []u64,
 ) !void {
+    const words = bits / 64;
     const rotated = variant == .simhash or variant == .centered_simhash;
     const centered = variant == .centered or variant == .centered_simhash;
 
@@ -217,9 +236,12 @@ fn encode(
             @memcpy(work, v);
         }
 
-        const code = out[i * CODE_WORDS ..][0..CODE_WORDS];
+        const code = out[i * words ..][0..words];
         @memset(code, 0);
-        for (0..DIM) |b| {
+        for (0..bits) |b| {
+            // Unrotated below DIM bits is a plain truncation -- the first `bits` coordinates,
+            // the rest discarded. It is the naive way to shorten a code and is here as the
+            // baseline the projection has to beat.
             const proj = if (rotated) dot(rot[b * DIM ..][0..DIM], work) else work[b];
             if (proj > 0) code[b / 64] |= @as(u64, 1) << @intCast(b % 64);
         }
@@ -284,13 +306,15 @@ fn recallOf(
     gpa: std.mem.Allocator,
     codes: []const u64,
     n: usize,
+    words: usize,
     queries: []const u32,
     truth: []const [TOP]u32,
     dup: []const bool,
 ) !Stats {
+    const bits = words * 64;
     const dists = try gpa.alloc(u16, n);
     defer gpa.free(dists);
-    var hist = try gpa.alloc(u32, DIM + 1);
+    var hist = try gpa.alloc(u32, bits + 1);
     defer gpa.free(hist);
 
     var sum: [KS.len]f64 = @splat(0);
@@ -302,14 +326,14 @@ fn recallOf(
 
     for (queries, truth, dup) |q, t, is_dup| {
         if (!is_dup) clean_n += 1;
-        const qc = codes[@as(usize, q) * CODE_WORDS ..][0..CODE_WORDS];
+        const qc = codes[@as(usize, q) * words ..][0..words];
         @memset(hist, 0);
 
         timer.reset();
         for (0..n) |i| {
-            const c = codes[i * CODE_WORDS ..][0..CODE_WORDS];
+            const c = codes[i * words ..][0..words];
             var d: u32 = 0;
-            inline for (0..CODE_WORDS) |w| d += @popCount(qc[w] ^ c[w]);
+            for (0..words) |w| d += @popCount(qc[w] ^ c[w]);
             dists[i] = @intCast(d);
         }
         scan_ns += timer.read();
@@ -325,8 +349,8 @@ fn recallOf(
             // `frac` of the items *at* dstar are, which is how ties are shared out.
             var cum: usize = 0;
             var dstar: usize = 0;
-            while (dstar <= DIM and cum + hist[dstar] < k) : (dstar += 1) cum += hist[dstar];
-            const at = if (dstar <= DIM) hist[dstar] else 0;
+            while (dstar <= bits and cum + hist[dstar] < k) : (dstar += 1) cum += hist[dstar];
+            const at = if (dstar <= bits) hist[dstar] else 0;
             const frac: f64 = if (at == 0) 0 else
                 @as(f64, @floatFromInt(k - cum)) / @as(f64, @floatFromInt(at));
 
@@ -352,16 +376,16 @@ fn recallOf(
     for (&out.clean_recall, clean_sum) |*r, s| r.* = s / @as(f64, @floatFromInt(@max(clean_n, 1)));
 
     // Bit occupancy, which is what explains a bad recall rather than merely reporting it.
-    for (0..DIM) |b| {
+    for (0..bits) |b| {
         var set: usize = 0;
         for (0..n) |i| {
-            if (codes[i * CODE_WORDS + b / 64] >> @intCast(b % 64) & 1 == 1) set += 1;
+            if (codes[i * words + b / 64] >> @intCast(b % 64) & 1 == 1) set += 1;
         }
         const p = @as(f64, @floatFromInt(set)) / @as(f64, @floatFromInt(n));
         if (p > 0.95 or p < 0.05) out.dead_bits += 1;
         out.balance += @abs(p - 0.5);
     }
-    out.balance /= DIM;
+    out.balance /= @floatFromInt(bits);
     return out;
 }
 
@@ -384,14 +408,17 @@ fn thresholdSweep(
 ) !void {
     // Raw sign only: the variants were indistinguishable above, so repeating all four here
     // would be four copies of one answer.
-    const codes = try gpa.alignedAlloc(u64, .@"8", n * CODE_WORDS);
+    // Full-width sign codes: this section is about whether a *cosine* floor can be made to
+    // work at all, which does not depend on how short the code is.
+    const words = DIM / 64;
+    const codes = try gpa.alignedAlloc(u64, .@"8", n * words);
     defer gpa.free(codes);
     {
         const mean = try gpa.alloc(f32, DIM);
         defer gpa.free(mean);
         @memset(mean, 0);
         const rot: []f32 = &.{};
-        try encode(gpa, .sign, vecs, n, mean, rot, codes);
+        try encode(gpa, .sign, vecs, n, DIM, mean, rot, codes);
     }
 
     const dists = try gpa.alloc(u16, n);
@@ -411,7 +438,7 @@ fn thresholdSweep(
 
     for (queries) |q| {
         const qv = vecs[@as(usize, q) * DIM ..][0..DIM];
-        const qc = codes[@as(usize, q) * CODE_WORDS ..][0..CODE_WORDS];
+        const qc = codes[@as(usize, q) * words ..][0..words];
 
         var real: usize = 0;
         var hit: [CUTS.len]usize = @splat(0);
@@ -420,9 +447,9 @@ fn thresholdSweep(
 
         for (0..n) |i| {
             if (i == q) continue;
-            const c = codes[i * CODE_WORDS ..][0..CODE_WORDS];
+            const c = codes[i * words ..][0..words];
             var d: u32 = 0;
-            inline for (0..CODE_WORDS) |w| d += @popCount(qc[w] ^ c[w]);
+            for (0..words) |w| d += @popCount(qc[w] ^ c[w]);
             dists[i] = @intCast(d);
 
             const sim = dot(qv, vecs[i * DIM ..][0..DIM]);
@@ -524,6 +551,10 @@ fn parseArgs(args: [][:0]u8) Options {
             o.verbose = true;
             continue;
         }
+        if (eq(a, "--no-sweep")) {
+            o.no_sweep = true;
+            continue;
+        }
         i += 1;
         if (i >= args.len) fatal("{s} needs a value", .{a});
         const v = args[i];
@@ -532,9 +563,13 @@ fn parseArgs(args: [][:0]u8) Options {
         else if (eq(a, "--queries")) o.queries = parseUint(v)
         else if (eq(a, "--limit")) o.limit = parseUint(v)
         else if (eq(a, "--seed")) o.seed = parseUint(v)
+        else if (eq(a, "--bits")) o.bits = parseUint(v)
         else fatal("unknown argument '{s}' (try --help)", .{a});
     }
     if (o.queries == 0) fatal("--queries must be positive", .{});
+    if (o.bits == 0 or o.bits % 64 != 0 or o.bits > DIM) {
+        fatal("--bits must be a multiple of 64 and at most {d}", .{DIM});
+    }
     return o;
 }
 
@@ -556,6 +591,8 @@ fn usage(code: u8) noreturn {
         \\  --file <name>      database file (default mpnet_embedding.db)
         \\  --queries <count>  queries to average over (default 300)
         \\  --limit <count>    subsample the corpus to this many vectors (default: all)
+        \\  --bits <n>         code width, multiple of 64, max 768 (default 768)
+        \\  --no-sweep         skip the cosine-threshold section
         \\  --seed <n>         rng seed (default 1)
         \\  --verbose          also print Hamming distance to the true nearest neighbour
         \\

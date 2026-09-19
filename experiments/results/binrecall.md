@@ -116,6 +116,61 @@ independent reduction per slice, so it parallelizes trivially; eight P-cores sho
 the 15-25 ms range. Measuring it properly needs a synthetic array well past cache size, and
 that is the next experiment.
 
+## Code width: shorter codes plus a bigger K beat a wide code
+
+The scan is memory-bound (`hamscan.md`), so scan time is proportional to code size exactly.
+K is paid for separately, in disk reads. That makes the two knobs tradeable, and the trade is
+lopsided.
+
+Recall@K on the full corpus, duplicate-free, best variant at each width:
+
+| bits | bytes | RAM @35M | @100 | @200 | @500 | best variant |
+|---:|---:|---:|---:|---:|---:|---|
+| 768 | 96 | 3.36 GB | 0.987 | 0.995 | 0.998 | `sign` |
+| 512 | 64 | 2.24 GB | 0.966 | 0.989 | 0.997 | `centered` |
+| **384** | **48** | **1.68 GB** | 0.933 | 0.973 | **0.992** | `centered` |
+| 256 | 32 | 1.12 GB | 0.901 | 0.945 | 0.973 | `centered` |
+| 192 | 24 | 0.84 GB | 0.833 | 0.901 | 0.948 | `centered` |
+| 128 | 16 | 0.56 GB | 0.737 | 0.814 | 0.897 | `centered_simhash` |
+
+Scan time scaled off the measured 124 ms at 96 bytes, plus K x 64 us of stage-2 disk:
+
+| | recall | scan | + disk | total | RAM |
+|---|---:|---:|---:|---:|---:|
+| 768 bits, K=100 | 0.987 | 124 ms | 6 ms | **130 ms** | 3.36 GB |
+| **384 bits, K=500** | **0.992** | 62 ms | 32 ms | **94 ms** | **1.68 GB** |
+| 256 bits, K=500 | 0.973 | 41 ms | 32 ms | 73 ms | 1.12 GB |
+| 192 bits, K=200 | 0.901 | 31 ms | 13 ms | 44 ms | 0.84 GB |
+
+**768 bits at K=100 is not on the Pareto frontier.** 384 bits at K=500 is better on every
+axis at once -- higher recall, 28% less latency, half the memory. The rule is: **shrink the
+code and spend the saving on a larger K.** Recall lost to a narrower code is bought back more
+cheaply by reading more candidates than by scanning more bytes.
+
+### Which makes raw sign the right code again, for a second reason
+
+Centering wins at every width below 768 -- by 1.4 points at 384 bits, 2 at 256, 4.6 at 128 --
+which is the anisotropy argument finally showing up. It only bites once bits are scarce enough
+that spending one on a near-constant direction matters.
+
+But it only wins at *small* K. At 384 bits and K=500, the recommended point, `sign` scores
+0.992 and `centered` scores 0.991: identical. So the persisted corpus mean -- 3 KB of
+parameters that drift as documents arrive and need re-fitting -- buys nothing where it would
+actually be used.
+
+**Take the first 384 coordinate signs.** Truncation also matches random projection at this
+width (0.919 vs 0.912 at K=100), so there is no matvec at ingest either. Every variant that
+costs something has now been measured and none of them earns it.
+
+### The disk model is the weak part of this
+
+`K x 64 us` assumes cold random reads issued one at a time, which is what `full.md` measured
+(15,605 IOPS at queue depth 1). Real NVMe does far better with several reads outstanding, and
+`experiments/README` deliberately never measured concurrency. If stage 2 parallelizes, K gets
+cheaper and the frontier moves *further* toward short codes and large K -- so the
+recommendation is robust in direction even though the numbers would move. Worth measuring
+before fixing K.
+
 ## What this does not measure
 
 - **Real queries.** Queries here are corpus vectors, standard ANN-benchmark practice, but a
@@ -123,5 +178,6 @@ that is the next experiment.
   documents sit from each other. Recall could be worse. `binrecall` has no text mode yet.
 - **Scale.** 37,689 vectors against ~35M. Flat over the measured range is encouraging, not
   conclusive.
-- **Wider codes.** At 0.99 recall there is no reason to want them, which is itself a result:
-  2-bit codes would double the memory for at most one point of recall.
+- **Wider codes.** Measured downward rather than upward, above. 2-bit codes were never worth
+  trying: 768 one-bit codes already reach 0.998 at K=500, so there is no headroom to buy.
+- **Read concurrency in stage 2**, which is what the disk half of the frontier rests on.
