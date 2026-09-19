@@ -192,18 +192,23 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 vec_res,
                 self.embedder.threshold,
             );
+            // Compacted, and the count is of what was actually written. A vector whose id has
+            // no path is skipped, and counting it anyway would hand the caller a `buf[i]` this
+            // loop never touched -- undefined memory it has every reason to read.
+            var written: usize = 0;
             for (0..found_n) |i| {
                 const p = self.note_id_map.getPath(vec_res[i].row.doc_id) orelse continue;
-                buf[i] = SearchResult{
+                buf[written] = SearchResult{
                     .path = p,
                     .start_i = vec_res[i].row.start_i,
                     .end_i = vec_res[i].row.end_i,
                     .similarity = vec_res[i].similarity,
                 };
+                written += 1;
             }
 
-            std.log.info("Found {d} results searching with `{s}`", .{ found_n, query });
-            return found_n;
+            std.log.info("Found {d} results searching with `{s}`", .{ written, query });
+            return written;
         }
 
         /// Searches the vector database. Each path/key will be unique in the results.
@@ -533,18 +538,21 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 vec_res,
                 self.embedder.threshold,
             );
+            // Same compaction as `search`; see the note there.
+            var written: usize = 0;
             for (0..found_n) |i| {
                 const p = self.note_id_map.getPath(vec_res[i].row.doc_id) orelse continue;
-                buf[i] = SearchResult{
+                buf[written] = SearchResult{
                     .path = p,
                     .start_i = vec_res[i].row.start_i,
                     .end_i = vec_res[i].row.end_i,
                     .similarity = vec_res[i].similarity,
                 };
+                written += 1;
             }
 
-            std.log.info("Found {d} results searching with raw vector", .{found_n});
-            return found_n;
+            std.log.info("Found {d} results searching with raw vector", .{written});
+            return written;
         }
     };
 }
@@ -1735,4 +1743,23 @@ test "reroot drops the notes the new root no longer contains" {
         .{ .path = "kept.md", .start_i = 0, .end_i = 5 },
     }, buf[0..1]);
     try db.validate();
+}
+
+test "search counts only the results it wrote" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    defer db.deinit();
+
+    try db.embedText("gone.md", "hello");
+
+    // Drop the path but leave its vectors, which is what any stale index looks like: an id the
+    // store still has rows for and the manifest can no longer name. A count that included it
+    // would hand back a SearchResult nothing had written.
+    try db.note_id_map.removePath("gone.md");
+
+    var buf: [4]SearchResult = undefined;
+    try expectEqual(0, try db.search("hello", &buf));
 }
