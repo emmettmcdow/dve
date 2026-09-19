@@ -338,6 +338,28 @@ pub fn build(b: *std.Build) !void {
         storebench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
+    ///////////////////
+    // Binrecall     //
+    ///////////////////
+    // Does a 1-bit code surface what exact cosine says is the answer? Reads a corpus of real
+    // embeddings out of an existing database; builds nothing and writes nothing.
+    //   zig build binrecall -Doptimize=ReleaseFast
+    //   ./zig-out/bin/binrecall --queries 300
+    const binrecall_step = b.step("binrecall", "Build the 1-bit recall experiment");
+    {
+        const exe = b.addExecutable(.{
+            .name = "binrecall",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("experiments/binrecall/main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addImport("dve", dve_mod);
+        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
+        binrecall_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(test_vec_storage);
     test_step.dependOn(test_pfile);
