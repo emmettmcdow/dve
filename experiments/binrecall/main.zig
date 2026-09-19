@@ -43,12 +43,17 @@ const Options = struct {
     limit: usize = 0,
     seed: u64 = 1,
     verbose: bool = false,
+    /// Cosine floor that defines a "real" result, matching `MpnetEmbedder.THRESHOLD`. The
+    /// threshold sweep below asks what a Hamming cutoff costs to catch everything above it.
+    cos_threshold: f32 = 0.36,
 };
 
 const DIM = 768;
 const CODE_BYTES = DIM / 8; // 96
 const CODE_WORDS = CODE_BYTES / 8; // 12 u64s
 const TOP = 10;
+/// Above this, two chunks are the same text. The corpus has a lot of these.
+const DUP_COS: f32 = 0.99;
 const KS = [_]usize{ 10, 25, 50, 100, 200, 500, 1000, 2000 };
 
 pub fn main() !void {
@@ -129,12 +134,27 @@ pub fn main() !void {
     // Ground truth is the same for every variant, so it is computed once.
     const truth = try gpa.alloc([TOP]u32, opts.queries);
     defer gpa.free(truth);
+    // The corpus carries a lot of duplicated boilerplate -- see src/chunking.md -- and a query
+    // that has an exact copy of itself in the corpus is trivially easy for any code: the copy's
+    // code is identical, so it sits at Hamming distance 0 and recall is 1.0 by construction.
+    // Scoring those together with real queries flatters the result, so they are reported apart.
+    const dup = try gpa.alloc(bool, opts.queries);
+    defer gpa.free(dup);
+    var dup_n: usize = 0;
     var truth_timer = try std.time.Timer.start();
-    for (queries, truth) |q, *t| exactTop(vecs, n, q, t);
+    for (queries, truth, dup) |q, *t, *d| {
+        d.* = exactTop(vecs, n, q, t) > DUP_COS;
+        if (d.*) dup_n += 1;
+    }
     const truth_ns = truth_timer.read();
-    std.debug.print("exact top-{d}: {D} for {d} queries ({D} each)\n\n", .{
+    std.debug.print("exact top-{d}: {D} for {d} queries ({D} each)\n", .{
         TOP, truth_ns, opts.queries, truth_ns / opts.queries,
     });
+    std.debug.print(
+        "{d} of {d} queries have a near-duplicate (cosine > {d:.2}) in the corpus; " ++
+            "those are scored separately\n\n",
+        .{ dup_n, opts.queries, DUP_COS },
+    );
 
     // ------------------------------------------------------------------------- the variants
     printHeader();
@@ -142,9 +162,11 @@ pub fn main() !void {
         const codes = try gpa.alignedAlloc(u64, .@"8", n * CODE_WORDS);
         defer gpa.free(codes);
         try encode(gpa, variant, vecs, n, mean, rot, codes);
-        const stats = try recallOf(gpa, codes, n, queries, truth);
+        const stats = try recallOf(gpa, codes, n, queries, truth, dup);
         printRow(variant, stats, opts.verbose);
     }
+
+    try thresholdSweep(gpa, vecs, n, queries, opts);
 
     std.debug.print(
         \\
@@ -221,7 +243,7 @@ fn dot(a: []const f32, b: []const f32) f32 {
 // ******************************************************************************* Ground truth
 /// Exact cosine top-`TOP`, excluding the query itself. Every vector in the store is L2
 /// normalized -- `validate` enforces it -- so the dot product is the cosine.
-fn exactTop(vecs: []const f32, n: usize, q: u32, out: *[TOP]u32) void {
+fn exactTop(vecs: []const f32, n: usize, q: u32, out: *[TOP]u32) f32 {
     var best_sim = [_]f32{-2.0} ** TOP;
     var best_id = [_]u32{0} ** TOP;
     const qv = vecs[@as(usize, q) * DIM ..][0..DIM];
@@ -241,11 +263,15 @@ fn exactTop(vecs: []const f32, n: usize, q: u32, out: *[TOP]u32) void {
         best_id[j] = @intCast(i);
     }
     out.* = best_id;
+    return best_sim[0];
 }
 
 // ************************************************************************************* Recall
 const Stats = struct {
     recall: [KS.len]f64,
+    /// Recall over only those queries with no near-duplicate in the corpus -- the honest
+    /// number, and the lower one.
+    clean_recall: [KS.len]f64,
     /// Mean Hamming distance from a query to its exact nearest neighbour, in bits. A code that
     /// has collapsed puts everything at the same distance and this goes to ~DIM/2.
     mean_nn_dist: f64,
@@ -260,6 +286,7 @@ fn recallOf(
     n: usize,
     queries: []const u32,
     truth: []const [TOP]u32,
+    dup: []const bool,
 ) !Stats {
     const dists = try gpa.alloc(u16, n);
     defer gpa.free(dists);
@@ -267,11 +294,14 @@ fn recallOf(
     defer gpa.free(hist);
 
     var sum: [KS.len]f64 = @splat(0);
+    var clean_sum: [KS.len]f64 = @splat(0);
+    var clean_n: usize = 0;
     var nn_sum: f64 = 0;
     var scan_ns: u64 = 0;
     var timer = try std.time.Timer.start();
 
-    for (queries, truth) |q, t| {
+    for (queries, truth, dup) |q, t, is_dup| {
+        if (!is_dup) clean_n += 1;
         const qc = codes[@as(usize, q) * CODE_WORDS ..][0..CODE_WORDS];
         @memset(hist, 0);
 
@@ -306,17 +336,20 @@ fn recallOf(
                 if (d < dstar) hit += 1 else if (d == dstar) hit += frac;
             }
             sum[ki] += hit / @as(f64, TOP);
+            if (!is_dup) clean_sum[ki] += hit / @as(f64, TOP);
         }
     }
 
     var out = Stats{
         .recall = undefined,
+        .clean_recall = undefined,
         .mean_nn_dist = nn_sum / @as(f64, @floatFromInt(queries.len)),
         .dead_bits = 0,
         .balance = 0,
         .scan_ns = scan_ns / queries.len,
     };
     for (&out.recall, sum) |*r, s| r.* = s / @as(f64, @floatFromInt(queries.len));
+    for (&out.clean_recall, clean_sum) |*r, s| r.* = s / @as(f64, @floatFromInt(@max(clean_n, 1)));
 
     // Bit occupancy, which is what explains a bad recall rather than merely reporting it.
     for (0..DIM) |b| {
@@ -330,6 +363,127 @@ fn recallOf(
     }
     out.balance /= DIM;
     return out;
+}
+
+// ************************************************************* Threshold sweep (the dual of K)
+/// Top-K and a distance cutoff are two ways to size the same candidate list. `search` today
+/// is threshold-shaped -- it returns everything above `THRESHOLD` rather than a fixed count --
+/// so this asks the question in those terms: to catch a given share of everything above the
+/// cosine floor, how loose does the Hamming cutoff have to be, and how many candidates does
+/// that let through?
+///
+/// The answer is not free to guess. Hamming distance estimates angle with a spread of about
+/// sqrt(DIM * p * (1-p)) ~= 13 bits at these angles, so a cutoff loose enough to catch the
+/// tail of the real matches also admits everything whose noise happened to fall short.
+fn thresholdSweep(
+    gpa: std.mem.Allocator,
+    vecs: []const f32,
+    n: usize,
+    queries: []const u32,
+    opts: Options,
+) !void {
+    // Raw sign only: the variants were indistinguishable above, so repeating all four here
+    // would be four copies of one answer.
+    const codes = try gpa.alignedAlloc(u64, .@"8", n * CODE_WORDS);
+    defer gpa.free(codes);
+    {
+        const mean = try gpa.alloc(f32, DIM);
+        defer gpa.free(mean);
+        @memset(mean, 0);
+        const rot: []f32 = &.{};
+        try encode(gpa, .sign, vecs, n, mean, rot, codes);
+    }
+
+    const dists = try gpa.alloc(u16, n);
+    defer gpa.free(dists);
+
+    // Per Hamming cutoff: how many of the real matches we kept, and how many candidates we
+    // had to read to keep them.
+    const CUTS = [_]u16{ 100, 150, 200, 225, 250, 275, 300, 325, 350, 384 };
+    // How selective the *cosine* floor itself is, before any of this is quantized. If a
+    // threshold admits a tenth of the corpus, no code can turn it into a small candidate list.
+    const COS_CUTS = [_]f32{ 0.36, 0.46, 0.65, 0.85, 0.95, 0.99 };
+    var kept: [CUTS.len]f64 = @splat(0);
+    var cands: [CUTS.len]f64 = @splat(0);
+    var real_total: f64 = 0;
+    var queries_with_hits: usize = 0;
+    var cos_above: [COS_CUTS.len]f64 = @splat(0);
+
+    for (queries) |q| {
+        const qv = vecs[@as(usize, q) * DIM ..][0..DIM];
+        const qc = codes[@as(usize, q) * CODE_WORDS ..][0..CODE_WORDS];
+
+        var real: usize = 0;
+        var hit: [CUTS.len]usize = @splat(0);
+        var cand: [CUTS.len]usize = @splat(0);
+        var above: [COS_CUTS.len]usize = @splat(0);
+
+        for (0..n) |i| {
+            if (i == q) continue;
+            const c = codes[i * CODE_WORDS ..][0..CODE_WORDS];
+            var d: u32 = 0;
+            inline for (0..CODE_WORDS) |w| d += @popCount(qc[w] ^ c[w]);
+            dists[i] = @intCast(d);
+
+            const sim = dot(qv, vecs[i * DIM ..][0..DIM]);
+            const is_real = sim > opts.cos_threshold;
+            if (is_real) real += 1;
+            for (COS_CUTS, 0..) |cc, ci| {
+                if (sim > cc) above[ci] += 1;
+            }
+            for (CUTS, 0..) |cut, ci| {
+                if (d <= cut) {
+                    cand[ci] += 1;
+                    if (is_real) hit[ci] += 1;
+                }
+            }
+        }
+        for (0..COS_CUTS.len) |ci| cos_above[ci] += @floatFromInt(above[ci]);
+
+        real_total += @floatFromInt(real);
+        for (0..CUTS.len) |ci| cands[ci] += @floatFromInt(cand[ci]);
+        if (real == 0) continue;
+        queries_with_hits += 1;
+        for (0..CUTS.len) |ci| {
+            kept[ci] += @as(f64, @floatFromInt(hit[ci])) / @as(f64, @floatFromInt(real));
+        }
+    }
+
+    const nq: f64 = @floatFromInt(queries.len);
+    std.debug.print(
+        \\
+        \\threshold sweep -- the dual of top-K, on `sign` codes
+        \\
+        \\a "real match" is cosine > {d:.2} ({s}). mean real matches per query: {d:.1} of {d}
+        \\queries with at least one: {d} of {d}
+        \\
+        \\{s:>10}{s:>12}{s:>14}{s:>14}
+        \\{s:>10}{s:>12}{s:>14}{s:>14}
+        \\
+    , .{
+        opts.cos_threshold, "MpnetEmbedder.THRESHOLD", real_total / nq, n,
+        queries_with_hits,  queries.len,
+        "hamming",          "kept",
+        "candidates",       "disk @64us",
+        "<= bits",          "",
+        "read",             "",
+    });
+    std.debug.print("how selective is the cosine floor itself?\n", .{});
+    for (COS_CUTS, cos_above) |cc, tot| {
+        const mean_n = tot / nq;
+        std.debug.print("  cosine > {d:.2}: {d:>10.0} of {d} per query ({d:.2}% of corpus)\n", .{
+            cc, mean_n, n, 100.0 * mean_n / @as(f64, @floatFromInt(n)),
+        });
+    }
+    std.debug.print("\n{s:->10}{s:->12}{s:->14}{s:->14}\n", .{ "", "", "", "" });
+
+    const qh: f64 = @floatFromInt(@max(queries_with_hits, 1));
+    for (CUTS, kept, cands) |cut, k, c| {
+        const mean_c = c / nq;
+        std.debug.print("{d:>10}{d:>12.3}{d:>14.0}{d:>12.1} ms\n", .{
+            cut, k / qh, mean_c, mean_c * 64.0 / 1000.0,
+        });
+    }
 }
 
 // ************************************************************************************* Report
@@ -351,6 +505,9 @@ fn printRow(v: Variant, s: Stats, verbose: bool) void {
     std.debug.print("{d:>10}{d:>8.3}{d:>10.2}\n", .{
         s.dead_bits, s.balance, @as(f64, @floatFromInt(s.scan_ns)) / 1e6,
     });
+    std.debug.print("{s:<17}", .{"  no-dup only"});
+    for (s.clean_recall) |r| std.debug.print("{d:>8.3}", .{r});
+    std.debug.print("\n", .{});
     if (verbose) {
         std.debug.print("{s:<17}mean Hamming distance to the true nearest neighbour: {d:.1} bits\n", .{ "", s.mean_nn_dist });
     }
