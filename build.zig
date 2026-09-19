@@ -360,6 +360,26 @@ pub fn build(b: *std.Build) !void {
         binrecall_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
+    ///////////////////
+    // Hamscan       //
+    ///////////////////
+    // How fast a 1-bit codes array can be scanned in RAM, swept from cache-resident to well
+    // past it. Pure std, no dve import -- it measures a pattern, not a format.
+    //   zig build hamscan -Doptimize=ReleaseFast
+    //   ./zig-out/bin/hamscan
+    const hamscan_step = b.step("hamscan", "Build the Hamming scan throughput benchmark");
+    {
+        const exe = b.addExecutable(.{
+            .name = "hamscan",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("experiments/hamscan/main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        hamscan_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(test_vec_storage);
     test_step.dependOn(test_pfile);
