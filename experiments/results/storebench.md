@@ -13,19 +13,19 @@ see `full.md`. A cold run needs `--reuse` and `sudo purge` between phases and ha
 `--no-persist`: no `save` and no `flush`, which isolates the insert path from the durability
 path. v1's puts are memory writes; v2's are two `pwrite`s each, durable to the page cache.
 
-| | 20k | 100k | 500k |
-|---|---:|---:|---:|
-| **put** v1 | 80,431/s | 33,091/s | 8,224/s |
-| **put** v2 | 41,400/s | 41,500/s | 37,352/s |
-| | *v1 1.9x* | *v2 1.25x* | *v2 **4.5x*** |
-| **open** v1 | 28.6 ms | 139.3 ms | 922.4 ms |
-| **open** v2 | 6.3 ms | 35.2 ms | 319.0 ms |
-| | *v2 4.6x* | *v2 4.0x* | *v2 2.9x* |
-| **search** v1 | 12.04 ms | 59.89 ms | 302.91 ms |
-| **search** v2 | 8.00 ms | 41.50 ms | 254.15 ms |
-| | *v2 1.5x* | *v2 1.4x* | *v2 1.2x* |
-| **on disk** v1 | 96.8 MB | 387.1 MB | 1.5 GB |
-| **on disk** v2 | 78.1 MB | 390.6 MB | 1.9 GB |
+|                | 20k       | 100k       | 500k          |
+|----------------|-----------|------------|---------------|
+| **put** v1     | 80,431/s  | 33,091/s   | 8,224/s       |
+| **put** v2     | 41,400/s  | 41,500/s   | 37,352/s      |
+|                | *v1 1.9x* | *v2 1.25x* | *v2 **4.5x*** |
+| **open** v1    | 28.6 ms   | 139.3 ms   | 922.4 ms      |
+| **open** v2    | 6.3 ms    | 35.2 ms    | 319.0 ms      |
+|                | *v2 4.6x* | *v2 4.0x*  | *v2 2.9x*     |
+| **search** v1  | 12.04 ms  | 59.89 ms   | 302.91 ms     |
+| **search** v2  | 8.00 ms   | 41.50 ms   | 254.15 ms     |
+|                | *v2 1.5x* | *v2 1.4x*  | *v2 1.2x*     |
+| **on disk** v1 | 96.8 MB   | 387.1 MB   | 1.5 GB        |
+| **on disk** v2 | 78.1 MB   | 390.6 MB   | 1.9 GB        |
 
 **The expected result did not happen.** The prior was that a disk-resident store would lose
 badly to one that keeps every vector in RAM. It loses on put only at the smallest size, and by
