@@ -22,7 +22,19 @@
 const PHASES = "ingest, search, open, all";
 
 const Phase = enum { ingest, search, open, all };
-const Which = enum { v1, v2, both };
+const Which = enum {
+    /// vec_storage.zig: every vector resident as f32, search is a linear scan over RAM.
+    v1,
+    /// vstore.zig alone: every vector on disk, search is a linear scan over the file.
+    v2,
+    /// vstore.zig plus codes.zig: scan 384-bit codes in RAM for K candidates, then read those
+    /// K vectors from disk and rank them by exact cosine. The stack as it actually ships.
+    v2_indexed,
+    /// v1 and v2_indexed -- the old engine against the new one, which is the comparison that
+    /// matters now that vector.zig only has the one.
+    both,
+    all,
+};
 
 const Options = struct {
     n: usize = 100_000,
@@ -30,6 +42,9 @@ const Options = struct {
     /// which is exactly what `embedText` does, so this is the unit the real workload has.
     doc: usize = 20,
     queries: usize = 200,
+    /// Candidates stage one hands stage two, for the indexed run. Also the number of vectors
+    /// it reads from disk per query.
+    k: usize = 500,
     /// Persist once every this many documents. 1 is what `embedText` does. It is also what
     /// makes v1's ingest quadratic -- `save` rewrites the entire capacity every call, so the
     /// total written is documents x capacity -- which is measurable at 20k vectors and takes
@@ -106,6 +121,10 @@ const Result = struct {
     persist_ns: u64 = 0,
     open_ns: u64 = 0,
     persists: u64 = 0,
+    /// Time to build the code index by reading every vector, and its resident size. Zero for
+    /// an unindexed run.
+    index_ns: u64 = 0,
+    index_bytes: u64 = 0,
     search_ns: u64 = 0,
     hits: u64 = 0,
     bytes: u64 = 0,
@@ -156,18 +175,18 @@ pub fn main() !void {
     var results: std.ArrayList(Result) = .{};
     defer results.deinit(gpa);
 
-    if (opts.which != .v2) try results.append(gpa, try run(gpa, dir, opts, .v1));
-    if (opts.which != .v1) try results.append(gpa, try run(gpa, dir, opts, .v2));
+    const want = opts.which;
+    if (want == .v1 or want == .both or want == .all) {
+        try results.append(gpa, try runOne(gpa, dir, opts, V1, false, "v1 vec_storage"));
+    }
+    if (want == .v2 or want == .all) {
+        try results.append(gpa, try runOne(gpa, dir, opts, V2, false, "v2 vstore"));
+    }
+    if (want == .v2_indexed or want == .both or want == .all) {
+        try results.append(gpa, try runOne(gpa, dir, opts, V2, true, "v2 vstore+codes"));
+    }
 
     report(results.items, opts);
-}
-
-fn run(gpa: std.mem.Allocator, dir: std.fs.Dir, opts: Options, which: Which) !Result {
-    return switch (which) {
-        .v1 => runOne(gpa, dir, opts, V1, "v1 vec_storage"),
-        .v2 => runOne(gpa, dir, opts, V2, "v2 vstore"),
-        .both => unreachable,
-    };
 }
 
 /// One store, all phases. Generic over the two store types rather than duplicated, but the
@@ -178,6 +197,9 @@ fn runOne(
     dir: std.fs.Dir,
     opts: Options,
     comptime Store: type,
+    /// Search through the codes index rather than scanning the store. Only meaningful for V2;
+    /// v1 has no index and never will.
+    indexed: bool,
     label: []const u8,
 ) !Result {
     var res = Result{ .label = label };
@@ -259,9 +281,26 @@ fn runOne(
 
     if (opts.phase == .open) return res;
 
+    // ------------------------------------------------------------------------ build index
+    var idx: ?Codes = null;
+    defer if (idx) |*c| c.deinit();
+    if (Store == V2 and indexed) {
+        var c = try Codes.init(gpa, .{ .capacity = store.slot_n });
+        errdefer c.deinit();
+        var build_timer = try std.time.Timer.start();
+        var it = try store.iterate();
+        defer it.deinit();
+        while (try it.next()) |e| try c.put(e.slot, e.vec);
+        res.index_ns = build_timer.read();
+        res.index_bytes = c.bytes();
+        idx = c;
+    }
+
     // ---------------------------------------------------------------------------- search
     const buf = try gpa.alloc(Store.SearchEntry, 50);
     defer gpa.free(buf);
+    const cands = try gpa.alloc(Codes.Candidate, opts.k);
+    defer gpa.free(cands);
 
     // Queries are drawn from the same centroids as the corpus, so every one of them has real
     // neighbours to find. A query with no hits would measure the scan and nothing else.
@@ -273,15 +312,49 @@ fn runOne(
     for (0..opts.queries) |q| {
         corpus.draw(qrng, q, &query);
         search_timer.reset();
-        const found = if (Store == V1)
-            try store.search(query, buf, opts.threshold)
-        else
-            try store.search(&query, buf, opts.threshold);
+        const found = found: {
+            if (Store == V2) {
+                if (idx) |*c| {
+                    break :found try twoStage(&store, c, &query, cands, buf, opts.threshold);
+                }
+                break :found try store.search(&query, buf, opts.threshold);
+            }
+            break :found try store.search(query, buf, opts.threshold);
+        };
         search_ns += search_timer.read();
         res.hits += found;
     }
     res.search_ns = search_ns;
     return res;
+}
+
+/// The shipped search path, in miniature: codes for candidates, disk for the truth. Kept here
+/// rather than called through `vector.zig` so the comparison measures storage and indexing
+/// without an embedder in the way.
+fn twoStage(
+    store: *V2,
+    idx: *Codes,
+    query: *const [VEC_SZ]f32,
+    cands: []Codes.Candidate,
+    out: []V2.SearchEntry,
+    threshold: f32,
+) !usize {
+    const n_cand = try idx.search(query, cands);
+    var vec: [VEC_SZ]f32 = undefined;
+    var n: usize = 0;
+    for (cands[0..n_cand]) |cand| {
+        const row = (try store.getSlot(cand.slot, &vec)) orelse continue;
+        const sim = storedDotAt(VEC_SZ, f32, &vec, query);
+        if (sim <= threshold) continue;
+        // Same bounded insertion the engine does: `out` is small, and most candidates lose to
+        // the worst kept entry immediately.
+        if (n == out.len and sim <= out[n - 1].similarity) continue;
+        if (n < out.len) n += 1;
+        var j = n - 1;
+        while (j > 0 and out[j - 1].similarity < sim) : (j -= 1) out[j] = out[j - 1];
+        out[j] = .{ .row = row, .similarity = sim };
+    }
+    return n;
 }
 
 // ************************************************************************************ Report
@@ -304,12 +377,16 @@ fn report(results: []const Result, opts: Options) void {
         });
     }
 
-    w("\n{s:<18} {s:>12} {s:>12} {s:>12}\n", .{ "", "live vecs", "hits/query", "peak rss" });
-    w("{s:-<18} {s:->12} {s:->12} {s:->12}\n", .{ "", "", "", "" });
+    w("\n{s:<18} {s:>12} {s:>12} {s:>12} {s:>12} {s:>12}\n", .{
+        "", "live vecs", "hits/query", "peak rss", "index", "index size",
+    });
+    w("{s:-<18} {s:->12} {s:->12} {s:->12} {s:->12} {s:->12}\n", .{ "", "", "", "", "", "" });
     for (results) |r| {
         const hpq = if (opts.queries == 0) 0 else @as(f64, @floatFromInt(r.hits)) /
             @as(f64, @floatFromInt(opts.queries));
-        w("{s:<18} {d:>12} {d:>12.1} {f:>12}\n", .{ r.label, r.vec_n, hpq, fmtBytes(r.rss_peak) });
+        w("{s:<18} {d:>12} {d:>12.1} {f:>12} {D:>12} {f:>12}\n", .{
+            r.label, r.vec_n, hpq, fmtBytes(r.rss_peak), r.index_ns, fmtBytes(r.index_bytes),
+        });
     }
     if (results.len > 1) {
         w("\nrss is a process high-water mark, so it only separates the two stores when each\n" ++
@@ -318,7 +395,7 @@ fn report(results: []const Result, opts: Options) void {
 
     if (results.len == 2) {
         const a = results[0];
-        const b = results[1];
+        const b = results[results.len - 1];
         w("\nv2 relative to v1: put {d:.2}x, search {d:.2}x, open {d:.2}x, disk {d:.2}x\n", .{
             ratio(rate(b.vec_n, b.put_ns), rate(a.vec_n, a.put_ns)),
             ratio(@floatFromInt(a.search_ns), @floatFromInt(b.search_ns)),
@@ -396,6 +473,8 @@ fn parseArgs(args: [][:0]u8) Options {
             o.queries = parseUint(val(args, &i, a));
         } else if (eq(a, "--persist-every")) {
             o.persist_every = parseUint(val(args, &i, a));
+        } else if (eq(a, "--k")) {
+            o.k = parseUint(val(args, &i, a));
         } else if (eq(a, "--seed")) {
             o.seed = parseUint(val(args, &i, a));
         } else if (eq(a, "--threshold")) {
@@ -408,7 +487,7 @@ fn parseArgs(args: [][:0]u8) Options {
         } else if (eq(a, "--store")) {
             const s = val(args, &i, a);
             o.which = std.meta.stringToEnum(Which, s) orelse
-                fatal("unknown store '{s}' (expected v1, v2 or both)", .{s});
+                fatal("unknown store '{s}' (expected v1, v2, v2_indexed, both or all)", .{s});
         } else if (eq(a, "--dir")) {
             o.dir = val(args, &i, a);
         } else if (eq(a, "--no-persist")) {
@@ -446,10 +525,11 @@ fn usage(code: u8) noreturn {
         \\  --n <count>        vectors to ingest (default 100000)
         \\  --doc <count>      sentences per document, one persist call each (default 20)
         \\  --queries <count>  searches to time (default 200)
+        \\  --k <count>        candidates for the indexed run (default 500)
         \\  --persist-every <n>  save/flush once every n documents (default 1)
         \\  --threshold <f>    similarity floor for search (default 0.5)
         \\  --phase <p>        ingest, search, open, or all (default all)
-        \\  --store <s>        v1, v2, or both (default both)
+        \\  --store <s>        v1, v2, v2_indexed, both, all (default both)
         \\  --no-persist       skip save/flush, isolating the put path
         \\  --dir <path>       working directory (default bench-data)
         \\  --keep             leave the databases behind
@@ -471,3 +551,5 @@ const dve = @import("dve");
 const VEC_SZ = 768;
 const V1 = dve.vec_storage.Storage(VEC_SZ, f32);
 const V2 = dve.vstore.VStore(VEC_SZ, f32);
+const Codes = dve.codes.Codes(VEC_SZ, f32, dve.codes.DEFAULT_BITS);
+const storedDotAt = dve.vec_util.storedDotAt;

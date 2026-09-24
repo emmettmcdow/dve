@@ -29,7 +29,8 @@ path. v1's puts are memory writes; v2's are two `pwrite`s each, durable to the p
 
 **The expected result did not happen.** The prior was that a disk-resident store would lose
 badly to one that keeps every vector in RAM. It loses on put only at the smallest size, and by
-500k vectors it wins every column except disk.
+500k vectors it wins every column except disk. The row that matters most is search, and the
+section below adds the one the engine actually runs.
 
 **v1's put rate falls 10x across the sweep while v2's is flat.** v2's `put` is two `pwrite`s
 into a file it extends a chunk at a time -- the same work per vector at any size. v1 doubles a
@@ -45,6 +46,41 @@ shows the real ratio: 1.26x, which is the ~24% slack `vec_storage2.md` accounts 
 **Memory is not separated.** `maxrss` is a process high-water mark and both stores run in one
 process, so the rss column is the max of the two. Splitting it needs `--store v1` and
 `--store v2` in separate processes and has not been done.
+
+## The engine, old against new
+
+`--store all` adds the stack as it actually ships: `vstore.zig` for bytes plus `codes.zig` for
+stage one. Same corpus, same queries, warm, insert-only.
+
+Milliseconds per query:
+
+| | 20k | 100k | 500k |
+|---|---:|---:|---:|
+| v1 `vec_storage` (linear scan, RAM) | 12.37 | 61.25 | 307.25 |
+| v2 `vstore` (linear scan, disk) | 10.80 | 57.16 | 257.09 |
+| **v2 `vstore` + `codes`** (two-stage) | **1.03** | **1.45** | **2.78** |
+| | *12x* | *42x* | ***110x*** |
+
+**The speedup grows with the corpus, because the new path barely grows at all.** A 25x larger
+corpus costs 2.7x more latency: stage one scans an array 32x smaller than the vectors, and
+stage two reads a fixed K=500 vectors however large the store is. Linear scan pays for every
+vector, every query, forever.
+
+The index is cheap in both senses:
+
+| | index build | index size | of the data |
+|---|---:|---:|---:|
+| 100k vectors | 46.9 ms | 6.0 MB | 1.5% |
+| 500k vectors | 226.9 ms | 24.1 MB | 1.3% |
+
+Build is O(corpus) at every open, because nothing persists the codes yet -- 227 ms at 500k,
+and ~16 s projected to 35M, which is what a codes file would remove.
+
+Two things this table does not show. The `hits/query` column is 50.0 for all three, but that
+only says each filled its 50-entry buffer; recall is measured properly against exact cosine on
+real embeddings in `binrecall.md` and `codesbench`, not here on synthetic vectors. And every
+number is warm -- the cold column is where stage two's 500 random reads would actually cost
+something, and it is still unmeasured.
 
 ## Persisting every document, which is what `embedText` does
 
