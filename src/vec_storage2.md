@@ -388,10 +388,43 @@ intuition it confirms: **stage one cannot touch the disk at all.** The two-stage
 disk-resident alternative that competes. The codes scan itself is still unmeasured; that is the
 next experiment.
 
-## The index layer -- open, nothing committed
+## The index layer -- decided and built (`src/codes.zig`)
 
-The measurements settled the *storage* question and moved the open one up a layer. Nothing
-below is decided; this records the discussion so it does not have to be re-derived.
+This section was "open, nothing committed" until the measurements below it were made. They
+are now made, and the answer is the simplest option that was on the table:
+
+| | |
+|---|---|
+| **index** | linear scan over 1-bit codes in RAM, then exact rerank of K candidates on disk |
+| **code** | sign of the first 384 components. 48 bytes. No mean, no rotation, no codebook |
+| **K** | 100-500; a runtime knob, not a format decision |
+| **memory** | 1.68 GB at ~35M vectors, 4.4 MB of that liveness bits |
+| **query** | ~62 ms scan at 4 threads + ~6-32 ms of stage-2 disk |
+| **recall** | 0.992 of the exact cosine top-10 at K=500 |
+
+`src/codes.zig` is that, and it **knows nothing about storage**: no import of `vstore.zig` in
+either direction, per the dependency rule below. The two share only a slot number. Wiring them
+together is `vector.zig`'s job and has not been done yet.
+
+Three things the module records that were not obvious going in, each measured:
+
+- **A 384-bit code plus K=500 beats a 768-bit code plus K=100 on every axis at once.** The
+  scan is memory-bound, so its cost is exactly proportional to code width, while K is paid for
+  in disk reads. Recall lost to a narrower code is cheaper to buy back with more candidates.
+- **Every variant that costs something was measured and none earned it.** Centering wins 1.4
+  points at K=100 and nothing at K=500; random projection never beats plain truncation.
+- **Ties have to be broken by something intrinsic.** Hamming distances are small integers over
+  a large corpus, so ties are everywhere, and breaking them by whichever thread scanned first
+  made the same query return different results on consecutive runs. Candidates are ordered by
+  a packed `(distance, slot)` u64 key, which keeps the hot path at one comparison -- ordering
+  by distance alone and tie-breaking separately cost ~50% of a cache-resident scan.
+
+What remains open is **persistence**. Rebuilding codes at startup means re-reading every
+vector, which is the 82 GB the sidecar exists to avoid; at 1.68 GB a codes file loads in
+~0.3 s. Nothing below has been built. See "Deferred" for the rest.
+
+The discussion that got here is kept below, because the reasoning is worth more than the
+conclusion.
 
 ### What the disk experiment did and did not prove
 

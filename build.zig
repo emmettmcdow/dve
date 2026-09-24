@@ -176,6 +176,21 @@ pub fn build(b: *std.Build) !void {
         test_vstore.dependOn(&runTest(b, t, use_lldb).step);
     }
 
+    const test_codes = b.step("test-codes", "run tests for src/codes.zig");
+    {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/codes.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+            .filters = if (test_filter != null) filters else &.{},
+        });
+        // codes.zig is std only -- it holds an array of codes and scans it, and deliberately
+        // knows nothing about storage, embeddings, or config.
+        test_codes.dependOn(&runTest(b, t, use_lldb).step);
+    }
+
     const test_note_id_map = b.step("test-note_id_map", "run tests for src/note_id_map.zig");
     {
         const t = b.addTest(.{
@@ -380,10 +395,33 @@ pub fn build(b: *std.Build) !void {
         hamscan_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
+    ///////////////////
+    // Codesbench    //
+    ///////////////////
+    // Validates src/codes.zig against the corpus binrecall measured, so a wrong encoder
+    // cannot hide behind self-consistent unit tests.
+    //   zig build codesbench -Doptimize=ReleaseFast
+    //   ./zig-out/bin/codesbench
+    const codesbench_step = b.step("codesbench", "Build the codes.zig validation harness");
+    {
+        const exe = b.addExecutable(.{
+            .name = "codesbench",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("experiments/codesbench/main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addImport("dve", dve_mod);
+        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
+        codesbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(test_vec_storage);
     test_step.dependOn(test_pfile);
     test_step.dependOn(test_vstore);
+    test_step.dependOn(test_codes);
     test_step.dependOn(test_note_id_map);
     test_step.dependOn(test_util);
     test_step.dependOn(test_tokenizer);
