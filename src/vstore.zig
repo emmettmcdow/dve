@@ -323,7 +323,10 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             assert(@bitSizeOf(VectorID) >= 64);
         }
 
-        fn slotOf(id: VectorID) usize {
+        /// Public because an index outside this file keys its own array by slot. That is the
+        /// whole interface between the two: the store numbers slots and reuses them, an index
+        /// mirrors that numbering, and neither has to learn anything else about the other.
+        pub fn slotOf(id: VectorID) usize {
             return @intCast(id & SLOT_MASK);
         }
         fn genOf(id: VectorID) u64 {
@@ -661,6 +664,96 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             // wrapping an id back onto one a caller might still be holding.
             if (nextId(slot, m.vec_id)) |next| self.free.appendAssumeCapacity(next);
             self.assertCounts();
+        }
+
+        /// Reads one slot's row and vector in a single chunk read.
+        ///
+        /// This is the second stage of an indexed search: a caller that has already narrowed
+        /// the corpus to a few hundred slots, and wants the bytes behind each one. `get`
+        /// followed by `getVec` reads the same chunk three times -- two trailer reads and a
+        /// vector read -- and at 500 candidates a query that is the difference between 32 ms
+        /// and 96 ms of disk, which is most of the latency the index exists to save.
+        ///
+        /// Null for a slot that is out of range or not occupied. A stale candidate is not an
+        /// error: an index can legitimately name a slot the store has since freed.
+        ///
+        /// **The checksum is not verified**, matching `search`, which skips it on its inner
+        /// loop for the same reason -- this *is* that inner loop now. `validate` checks
+        /// everything.
+        pub fn getSlot(self: *Self, slot: usize, out: *Array) !?Row {
+            self.mutex.lock();
+            defer self.mutex.unlock();
+            if (slot >= self.slot_n) return null;
+
+            var chunk: [L.chunk_bytes]u8 align(VEC_ALIGN) = undefined;
+            const got = try self.file.readAt(&chunk, chunkOff(slot / L.vecs_per_chunk));
+            if (got != chunk.len) return null;
+
+            const i = slot % L.vecs_per_chunk;
+            const m = metaAt(@alignCast(chunk[L.meta_off..]), i);
+            if (!m.isOccupied()) return null;
+
+            out.* = vecAt(&chunk, i).*;
+            return rowOf(m.*);
+        }
+
+        /// Walks every live vector in slot order, reading in `SCAN_BATCH_BYTES` bites. This is
+        /// how an index outside this file builds itself: it needs every vector once, in an
+        /// order it can key on, and doing that through `getSlot` would be one `pread` per
+        /// vector -- 30 us each measured cold, against 4 MiB reads at 6.6 GiB/s.
+        ///
+        /// Holds the store's lock from `iterate` to `deinit`, so `defer it.deinit()` is not
+        /// optional.
+        pub const Iterator = struct {
+            store: *Self,
+            walker: ChunkWalker,
+            chunk: ?ChunkWalker.Chunk = null,
+            /// Next index within the current chunk.
+            i: usize = 0,
+
+            pub const Entry = struct {
+                slot: usize,
+                row: Row,
+                /// Borrowed from the iterator's batch buffer, valid until the next `next`.
+                vec: *const Array,
+            };
+
+            pub fn deinit(self: *Iterator) void {
+                self.walker.deinit();
+                self.store.mutex.unlock();
+            }
+
+            pub fn next(self: *Iterator) !?Entry {
+                while (true) {
+                    if (self.chunk == null or self.i >= L.vecs_per_chunk) {
+                        self.chunk = try self.walker.next();
+                        self.i = 0;
+                        if (self.chunk == null) return null;
+                    }
+                    const chunk = self.chunk.?;
+                    const i = self.i;
+                    self.i += 1;
+
+                    const slot = chunk.index * L.vecs_per_chunk + i;
+                    if (slot >= self.store.slot_n) return null;
+                    const m = metaAt(@alignCast(chunk.bytes[L.meta_off..]), i);
+                    if (!m.isOccupied()) continue;
+                    return .{
+                        .slot = slot,
+                        .row = rowOf(m.*),
+                        .vec = vecAt(chunk.bytes, i),
+                    };
+                }
+            }
+        };
+
+        pub fn iterate(self: *Self) !Iterator {
+            self.mutex.lock();
+            errdefer self.mutex.unlock();
+            return .{
+                .store = self,
+                .walker = try ChunkWalker.init(self, chunkCount(self.slot_n)),
+            };
         }
 
         /// Generates a new ID for an existing VectorRow.
@@ -2064,3 +2157,90 @@ const VectorID = types.VectorID;
 /// Renamed from NoteID: the store deals in documents, whatever the layer above calls them.
 /// `note_id_map.zig` keeps the old name for now.
 pub const DocID = @import("note_id_map.zig").NoteID;
+
+test "getSlot: reads row and vector in one read, and refuses a freed slot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var inst = try TestStorage.init(testing_allocator, tmp.dir, .{});
+    defer inst.deinit();
+
+    const a = TestStorage.Array{ 1.0, 0.0, 0.0 };
+    const b = TestStorage.Array{ 0.0, 1.0, 0.0 };
+    const id_a = try inst.put(.{ .doc_id = 7, .start_i = 2, .end_i = 9 }, &a);
+    const id_b = try inst.put(.{ .doc_id = 8, .start_i = 0, .end_i = 1 }, &b);
+
+    var out: TestStorage.Array = undefined;
+    const row = (try inst.getSlot(TestStorage.slotOf(id_a), &out)).?;
+    try expectEqual(@as(DocID, 7), row.doc_id);
+    try expectEqual(@as(usize, 2), row.start_i);
+    try expectEqual(@as(usize, 9), row.end_i);
+    try expectEqual(id_a, row.vec_id);
+    try std.testing.expectEqualSlices(f32, &a, &out);
+
+    // Out of range is null, not an error: an index may name a slot that no longer exists.
+    try expectEqual(@as(?TestStorage.Row, null), try inst.getSlot(inst.slot_n + 5, &out));
+
+    // A freed slot is null too, which is what keeps a stale candidate from being scored.
+    try inst.rm(id_b);
+    try expectEqual(@as(?TestStorage.Row, null), try inst.getSlot(TestStorage.slotOf(id_b), &out));
+}
+
+test "iterate: every live vector once, in slot order, across batch boundaries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var inst = try TestStorage.init(testing_allocator, tmp.dir, .{});
+    defer inst.deinit();
+
+    // More chunks than fit one scan batch, so the iterator has to cross the seam that the
+    // walker's short-read handling lives on.
+    const per_batch = SCAN_BATCH_BYTES / TestStorage.CHUNK_BYTES;
+    const n = per_batch * TestStorage.VECS_PER_CHUNK + 37;
+
+    var ids = try testing_allocator.alloc(VectorID, n);
+    defer testing_allocator.free(ids);
+    for (0..n) |i| {
+        const v = TestStorage.Array{ @floatFromInt(i % 7), 0.0, 0.0 };
+        var unit = v;
+        normalize(&unit);
+        ids[i] = try inst.put(.{ .doc_id = @intCast(i + 1), .start_i = i, .end_i = i + 1 }, &unit);
+    }
+    // Free a scattering, including either side of the batch seam.
+    const freed = [_]usize{ 0, 1, per_batch - 1, per_batch, per_batch + 1, n - 1 };
+    for (freed) |i| try inst.rm(ids[i]);
+
+    var seen = std.AutoHashMap(usize, void).init(testing_allocator);
+    defer seen.deinit();
+    var last: ?usize = null;
+    var count: usize = 0;
+
+    var it = try inst.iterate();
+    defer it.deinit();
+    while (try it.next()) |e| {
+        // Slot order, strictly increasing, no repeats.
+        if (last) |l| try std.testing.expect(e.slot > l);
+        last = e.slot;
+        try std.testing.expect(!(try seen.getOrPut(e.slot)).found_existing);
+
+        // The row and the vector come from the same chunk and must agree with each other.
+        try expectEqual(@as(DocID, @intCast(e.slot + 1)), e.row.doc_id);
+        try expectEqual(e.slot, e.row.start_i);
+        var want = TestStorage.Array{ @floatFromInt(e.slot % 7), 0.0, 0.0 };
+        normalize(&want);
+        try std.testing.expectEqualSlices(f32, &want, e.vec);
+        count += 1;
+    }
+    try expectEqual(inst.vec_n, count);
+    try expectEqual(n - freed.len, count);
+    for (freed) |i| try std.testing.expect(!seen.contains(TestStorage.slotOf(ids[i])));
+}
+
+fn normalize(v: *TestStorage.Array) void {
+    var sum: f32 = 0;
+    for (v) |x| sum += x * x;
+    if (sum == 0) {
+        v[0] = 1.0;
+        return;
+    }
+    const inv = 1.0 / @sqrt(sum);
+    for (v) |*x| x.* *= inv;
+}

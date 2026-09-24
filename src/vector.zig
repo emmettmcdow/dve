@@ -1,6 +1,13 @@
 const MAX_NOTE_LEN: usize = std.math.maxInt(u32);
 
-pub const Error = error{ NotQueuedShuttingDown, InvalidPath };
+pub const Error = error{
+    NotQueuedShuttingDown,
+    InvalidPath,
+    /// The resident code index and the store disagree about how many vectors are live. Every
+    /// mutation has to touch both, so this means one path updated only one of them -- which
+    /// otherwise shows up as results that silently stop appearing.
+    IndexOutOfSync,
+};
 
 pub const SearchResult = struct {
     /// The path or the key associated with this vector.
@@ -22,6 +29,14 @@ pub const InitOptions = struct {
     tokenizer_path: ?[]const u8 = null,
     /// Absolute path to the model file or package directory.
     model_path: ?[]const u8 = null,
+    /// Candidates stage one hands to stage two, which is also the number of vectors read from
+    /// disk per query. The cost knob: measured on real embeddings, K=100 recovers 0.957 of the
+    /// exact top-10 and K=500 recovers 0.996, at ~64 us of cold disk each. See
+    /// `experiments/results/binrecall.md`.
+    candidates: usize = 500,
+    /// Threads for the code scan. Null lets the pool size itself. Four saturate memory
+    /// bandwidth on the machine this was measured on; see `experiments/results/hamscan.md`.
+    scan_threads: ?usize = null,
 };
 
 const BaseEmbedder = union(EmbeddingModel) {
@@ -64,6 +79,10 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
     return struct {
         const Self = @This();
         pub const VecStorage = vstore.VStore(VEC_SZ, STORED_VEC_TYPE);
+        /// Stage one: a 1-bit code per vector, resident and scanned linearly. Keyed by the
+        /// store's own slot number, which is the entire interface between the two -- neither
+        /// module imports the other.
+        pub const VecCodes = codes.Codes(VEC_SZ, STORED_VEC_TYPE, codes.DEFAULT_BITS);
         pub const quant = config.quant;
 
         /// Converts a vector as the embedder produced it into the form VecStorage holds.
@@ -82,6 +101,9 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         base_embedder: BaseEmbedder,
         embedder: embed.Embedder,
         vec_storage: VecStorage,
+        codes: VecCodes,
+        /// How many candidates stage one produces per query.
+        candidates: usize,
         note_id_map: *NoteIdMap,
         basedir: std.fs.Dir,
         allocator: std.mem.Allocator,
@@ -120,6 +142,17 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
 
             var vecs = try VecStorage.init(allocator, basedir, .{ .path = embedder.path });
             errdefer vecs.deinit();
+
+            // Built by reading every vector once. That is O(corpus) at every open and is what
+            // a persisted codes file would remove; nothing about the format depends on it, so
+            // it is a later want rather than a blocker.
+            var vcodes = try VecCodes.init(allocator, .{
+                .capacity = vecs.slot_n,
+                .threads = opts.scan_threads,
+            });
+            errdefer vcodes.deinit();
+            try buildCodes(&vecs, &vcodes);
+
             const wq = try WorkQueue.init(allocator, 1024);
 
             const note_id_map = try allocator.create(NoteIdMap);
@@ -131,19 +164,28 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 .base_embedder = base_embedder,
                 .embedder = embedder,
                 .vec_storage = vecs,
+                .codes = vcodes,
+                .candidates = @max(opts.candidates, 1),
                 .note_id_map = note_id_map,
                 .basedir = basedir,
                 .allocator = allocator,
                 .work_queue = wq,
-                .work_queue_thread = try spawn(.{}, Self.workQueueRun, .{self}),
+                .work_queue_thread = undefined,
                 .work_queue_running = true,
             };
+            // Spawned *after* the struct is written, not inside the initializer. The worker's
+            // first act is to read `self.work_queue` and take `self.work_queue_mutex`, so
+            // starting it while the fields it needs are still uninitialized is a race it
+            // usually wins and occasionally does not -- it surfaced as a queued document
+            // embedding itself out of garbage offsets.
+            self.work_queue_thread = try spawn(.{}, Self.workQueueRun, .{self});
             return self;
         }
         pub fn deinit(self: *Self) void {
             if (self.work_queue_running) {
                 self.shutdown();
             }
+            self.codes.deinit();
             self.vec_storage.deinit();
             self.embedder.deinit();
             switch (embedding_model) {
@@ -166,6 +208,80 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             self.work_queue_thread.join();
         }
 
+        /// Reads every live vector once and encodes it. The store hands back the slot along
+        /// with the bytes, so the codes array ends up mirroring the store's slot numbering
+        /// without either side having to agree on anything else.
+        fn buildCodes(store: *VecStorage, out: *VecCodes) !void {
+            const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:buildCodes" });
+            defer zone.end();
+            var it = try store.iterate();
+            defer it.deinit();
+            while (try it.next()) |e| try out.put(e.slot, e.vec);
+        }
+
+        /// One scored result from stage two: a row and its exact cosine.
+        const Scored = struct {
+            row: VecStorage.Row,
+            similarity: f32,
+        };
+
+        /// The whole search, both stages.
+        ///
+        /// Stage one scans the resident codes and returns `self.candidates` slots by Hamming
+        /// distance -- no disk at all. Stage two reads those slots' full vectors and scores
+        /// them by exact cosine, which is what fixes the ordering: Hamming over a 384-bit code
+        /// estimates the angle with a spread of about 13 bits, so it is a good filter and a
+        /// poor ranking. Reranking cannot recover a vector stage one never surfaced, which is
+        /// why `candidates` is the quality knob and not just a cost one.
+        fn twoStage(
+            self: *Self,
+            allocator: std.mem.Allocator,
+            query: *const StoredArray,
+            want: usize,
+        ) ![]Scored {
+            const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:twoStage" });
+            defer zone.end();
+            if (want == 0) return &.{};
+
+            const cands = try allocator.alloc(VecCodes.Candidate, self.candidates);
+            defer allocator.free(cands);
+            const n_cand = try self.codes.search(query, cands);
+
+            var out: std.ArrayList(Scored) = .{};
+            errdefer out.deinit(allocator);
+            try out.ensureTotalCapacity(allocator, @min(want, n_cand));
+
+            var vec: StoredArray = undefined;
+            for (cands[0..n_cand]) |cand| {
+                // Null means the index named a slot the store has since freed. That is not an
+                // error: the two can drift by one removal and the store is the authority.
+                const row = (try self.vec_storage.getSlot(cand.slot, &vec)) orelse continue;
+                const sim = storedDotAt(VEC_SZ, STORED_VEC_TYPE, &vec, query);
+                if (sim <= self.embedder.threshold) continue;
+                insertScored(&out, allocator, want, .{ .row = row, .similarity = sim }) catch |e| return e;
+            }
+            return out.toOwnedSlice(allocator);
+        }
+
+        /// Keeps `out` sorted by descending similarity and no longer than `want`. Insertion
+        /// rather than sort-at-the-end because `want` is small -- ten or so for a real query --
+        /// and most candidates lose to the tenth-best immediately.
+        fn insertScored(
+            out: *std.ArrayList(Scored),
+            allocator: std.mem.Allocator,
+            want: usize,
+            s: Scored,
+        ) !void {
+            if (out.items.len == want and s.similarity <= out.items[want - 1].similarity) return;
+            if (out.items.len < want) try out.append(allocator, s) else out.items[want - 1] = s;
+
+            var j = out.items.len - 1;
+            while (j > 0 and out.items[j - 1].similarity < s.similarity) : (j -= 1) {
+                out.items[j] = out.items[j - 1];
+            }
+            out.items[j] = s;
+        }
+
         /// Searches the vector database. Can return multiple results per path/key.
         pub fn search(self: *Self, raw_query: []const u8, buf: []SearchResult) !usize {
             const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:search" });
@@ -184,22 +300,19 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 return 0;
             };
             const query_vec: StoredArray = toStored(@field(query_vec_union, @tagName(embedding_model)).*);
-            const vec_res = try arena.allocator().alloc(VecStorage.SearchEntry, max_results);
 
             debugSearchHeader(query);
-            const found_n = try self.vec_storage.search(
-                &query_vec,
-                vec_res,
-                self.embedder.threshold,
-            );
-            for (0..found_n) |i| {
-                const p = self.note_id_map.getPath(vec_res[i].row.doc_id) orelse continue;
-                buf[i] = SearchResult{
+            const scored = try self.twoStage(arena.allocator(), &query_vec, max_results);
+            var found_n: usize = 0;
+            for (scored) |sc| {
+                const p = self.note_id_map.getPath(sc.row.doc_id) orelse continue;
+                buf[found_n] = SearchResult{
                     .path = p,
-                    .start_i = vec_res[i].row.start_i,
-                    .end_i = vec_res[i].row.end_i,
-                    .similarity = vec_res[i].similarity,
+                    .start_i = sc.row.start_i,
+                    .end_i = sc.row.end_i,
+                    .similarity = sc.similarity,
                 };
+                found_n += 1;
             }
 
             std.log.info("Found {d} results searching with `{s}`", .{ found_n, query });
@@ -222,24 +335,22 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             const query_vec: StoredArray = toStored(@field(query_vec_union, @tagName(embedding_model)).*);
 
             debugSearchHeader(query);
-            var search_results: [1000]VecStorage.SearchEntry = undefined;
-            const found_n = try self.vec_storage.search(
-                &query_vec,
-                &search_results,
-                self.embedder.threshold,
-            );
+            // Over-fetches, because collapsing to one hit per path can discard most of a
+            // result set: a long document matching well occupies many of the top rows.
+            const scored = try self.twoStage(arena.allocator(), &query_vec, self.candidates);
+            const found_n = scored.len;
             var unique_found_n: usize = 0;
-            outer: for (0..@min(found_n, buf.len)) |i| {
-                const row = search_results[i].row;
-                const path = self.note_id_map.getPath(row.doc_id) orelse continue;
+            outer: for (scored) |sc| {
+                if (unique_found_n >= buf.len) break;
+                const path = self.note_id_map.getPath(sc.row.doc_id) orelse continue;
                 for (0..unique_found_n) |j| {
                     if (std.mem.eql(u8, buf[j].path, path)) continue :outer;
                 }
                 buf[unique_found_n] = SearchResult{
                     .path = path,
-                    .start_i = row.start_i,
-                    .end_i = row.end_i,
-                    .similarity = search_results[i].similarity,
+                    .start_i = sc.row.start_i,
+                    .end_i = sc.row.end_i,
+                    .similarity = sc.similarity,
                 };
                 unique_found_n += 1;
             }
@@ -446,27 +557,42 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                     error.MultipleRemove => continue,
                     else => return e,
                 };
+                self.codes.rm(VecStorage.slotOf(old_v.vec_id));
             }
 
             for (embedded_sentences) |sentence| {
-                _ = try self.vec_storage.put(.{
+                const id = try self.vec_storage.put(.{
                     .doc_id = note_id,
                     .start_i = sentence.start_i,
                     .end_i = sentence.end_i,
                 }, sentence.vec);
+                // Indexing can only fail on allocation, but if it does the vector would be on
+                // disk and invisible to every search until the next rebuild. Undoing the store
+                // write keeps the two in step; the document is then under-indexed, which a
+                // re-embed fixes, and that is the same failure mode as a `put` that fails.
+                errdefer self.vec_storage.rm(id) catch {};
+                try self.codes.put(VecStorage.slotOf(id), sentence.vec);
             }
         }
 
         /// Validate the vector database is in a good state.
         pub fn validate(self: *Self) !void {
             try self.vec_storage.validate();
+            // Cheap, and it is the invariant that binds the two halves together: stage one
+            // can only return what it was told about, so an index that has drifted from the
+            // store loses results with no error anywhere.
+            if (self.codes.len() != self.vec_storage.len()) return Error.IndexOutOfSync;
         }
 
         /// Delete the entries associated with a given path.
         pub fn removePath(self: *Self, path: []const u8) !void {
             if (path.len == 0) return Error.InvalidPath;
             if (self.note_id_map.getId(path)) |note_id| {
+                // Collected before the removal, because afterwards there is nothing to look up.
+                const rows = try self.vec_storage.vecsForDoc(self.allocator, note_id);
+                defer self.allocator.free(rows);
                 try self.vec_storage.rmByDocId(note_id);
+                for (rows) |row| self.codes.rm(VecStorage.slotOf(row.vec_id));
             }
             try self.note_id_map.removePath(path);
         }
@@ -501,21 +627,17 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
 
             const vec: StoredArray = toStored(raw_vec);
 
-            const max_results = buf.len;
-            const vec_res = try arena.allocator().alloc(VecStorage.SearchEntry, max_results);
-            const found_n = try self.vec_storage.search(
-                &vec,
-                vec_res,
-                self.embedder.threshold,
-            );
-            for (0..found_n) |i| {
-                const p = self.note_id_map.getPath(vec_res[i].row.doc_id) orelse continue;
-                buf[i] = SearchResult{
+            const scored = try self.twoStage(arena.allocator(), &vec, buf.len);
+            var found_n: usize = 0;
+            for (scored) |sc| {
+                const p = self.note_id_map.getPath(sc.row.doc_id) orelse continue;
+                buf[found_n] = SearchResult{
                     .path = p,
-                    .start_i = vec_res[i].row.start_i,
-                    .end_i = vec_res[i].row.end_i,
-                    .similarity = vec_res[i].similarity,
+                    .start_i = sc.row.start_i,
+                    .end_i = sc.row.end_i,
+                    .similarity = sc.similarity,
                 };
+                found_n += 1;
             }
 
             std.log.info("Found {d} results searching with raw vector", .{found_n});
@@ -1650,6 +1772,10 @@ const NoteIdMap = note_id_map_mod.NoteIdMap;
 
 const NLEmbedder = embed.NLEmbedder;
 const MpnetEmbedder = embed.MpnetEmbedder;
+/// Takes its operands by pointer. A @Vector(768, f32) is padded to 4096 bytes, so the
+/// by-value form copies 8 KB per candidate -- see experiments/results/storebench.md, where
+/// that was the whole cost of a whole-store scan.
+const storedDotAt = @import("vec_util.zig").storedDotAt;
 const quant32to16 = @import("vec_util.zig").quant32to16;
 const quant32toi8 = @import("vec_util.zig").quant32toi8;
 const spawn = Thread.spawn;
@@ -1659,3 +1785,77 @@ const UniqueCircularBuffer = util.UniqueCircularBuffer;
 const util = @import("util.zig");
 const VectorID = types.VectorID;
 const vstore = @import("vstore.zig");
+const codes = @import("codes.zig");
+
+test "the code index stays in step with the store across re-embeds and removals" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    defer db.deinit();
+
+    // Two documents, re-embedded with different content, then one removed. Every one of those
+    // paths has to touch both halves; `validate` is what catches it if one does not.
+    try db.embedText("a.md", "pizza. pasta. bread.");
+    try db.embedText("b.md", "cars. trains. planes. boats.");
+    try db.validate();
+    try expectEqual(db.vec_storage.len(), db.codes.len());
+
+    // Re-embedding shorter must free the surplus in both.
+    try db.embedText("a.md", "pizza.");
+    try db.validate();
+    try expectEqual(@as(usize, 5), db.vec_storage.len());
+    try expectEqual(@as(usize, 5), db.codes.len());
+
+    // ...and longer must claim reused slots in both.
+    try db.embedText("a.md", "pizza. pasta. bread. cheese. olives.");
+    try db.validate();
+    try expectEqual(@as(usize, 9), db.vec_storage.len());
+    try expectEqual(@as(usize, 9), db.codes.len());
+
+    try db.removePath("b.md");
+    try db.validate();
+    try expectEqual(@as(usize, 5), db.vec_storage.len());
+    try expectEqual(@as(usize, 5), db.codes.len());
+
+    // The removed document must be gone from results, not merely from the store.
+    var buf: [10]SearchResult = undefined;
+    const n = try db.search("trains", &buf);
+    for (buf[0..n]) |r| try std.testing.expect(!std.mem.eql(u8, r.path, "b.md"));
+}
+
+test "the index is rebuilt on reopen and finds what it found before" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+
+    const text = "pizza is delicious. trains are fast. the sky is blue.";
+    var before: [4]SearchResult = undefined;
+    var n_before: usize = 0;
+    {
+        var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+        defer db.deinit();
+        try db.embedText("a.md", text);
+        n_before = try db.search("trains are fast", &before);
+        try std.testing.expect(n_before > 0);
+        // `path` borrows from this db's note_id_map, which the defer above is about to free.
+        for (before[0..n_before]) |*r| r.path = try arena.allocator().dupe(u8, r.path);
+    }
+
+    // Nothing persists the codes yet, so this exercises the rebuild path in `init`.
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    defer db.deinit();
+    try db.validate();
+    try expectEqual(db.vec_storage.len(), db.codes.len());
+
+    var after: [4]SearchResult = undefined;
+    const n_after = try db.search("trains are fast", &after);
+    try expectEqual(n_before, n_after);
+    for (before[0..n_before], after[0..n_after]) |a, b| {
+        try std.testing.expectEqualStrings(a.path, b.path);
+        try expectEqual(a.start_i, b.start_i);
+        try expectEqual(a.end_i, b.end_i);
+    }
+}
