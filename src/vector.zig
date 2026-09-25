@@ -634,6 +634,34 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             return @field(out, @tagName(embedding_model)).*;
         }
 
+        /// Exhaustive search: scores every vector in the store against the query, with no
+        /// index involved. Slow by construction and O(corpus) on every call.
+        ///
+        /// This is not a path the app should use. It exists as the ground truth a benchmark
+        /// measures the two-stage path against -- recall is only meaningful against the answer
+        /// an exhaustive scan would have given, and computing that needs the scan.
+        pub fn exactVectorSearch(self: *Self, raw_vec: RawVector, buf: []SearchResult) !usize {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+
+            const vec: StoredArray = toStored(raw_vec);
+            const entries = try arena.allocator().alloc(VecStorage.SearchEntry, buf.len);
+            const n = try self.vec_storage.search(&vec, entries, self.embedder.threshold);
+
+            var found: usize = 0;
+            for (entries[0..n]) |e| {
+                const p = self.note_id_map.getPath(e.row.doc_id) orelse continue;
+                buf[found] = .{
+                    .path = p,
+                    .start_i = e.row.start_i,
+                    .end_i = e.row.end_i,
+                    .similarity = e.similarity,
+                };
+                found += 1;
+            }
+            return found;
+        }
+
         /// Searches the vector database with an already-embedded query vector. Behaves like
         /// `search`, but runs no embedding operations.
         pub fn rawVectorSearch(self: *Self, raw_vec: RawVector, buf: []SearchResult) !usize {

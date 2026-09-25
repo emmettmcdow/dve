@@ -55,6 +55,10 @@ const Options = struct {
     k: usize = 10,
     repeat: usize = 3,
     unique: bool = false,
+    /// Also run an exhaustive scan per query and report how much of its answer the index
+    /// found. The only way to know whether a 384-bit code is costing results on real data at
+    /// real scale, rather than on synthetic vectors or a 37k corpus.
+    verify: bool = false,
     csv: ?[]const u8 = null,
     queries: []const []const u8 = &default_queries,
 };
@@ -223,8 +227,14 @@ fn runSearch(allocator: std.mem.Allocator, opts: Options) !void {
 
     const buf = try allocator.alloc(dve.SearchResult, opts.k);
     defer allocator.free(buf);
+    const exact = try allocator.alloc(dve.SearchResult, opts.k);
+    defer allocator.free(exact);
     const samples = try allocator.alloc(u64, opts.repeat);
     defer allocator.free(samples);
+
+    var recall_sum: f64 = 0;
+    var recall_n: usize = 0;
+    var exact_ns_sum: u64 = 0;
 
     for (opts.queries) |query| {
         // Embedded once and timed on its own. Folding it into the repeats would report ~20 ms
@@ -253,6 +263,33 @@ fn runSearch(allocator: std.mem.Allocator, opts: Options) !void {
                 samples[samples.len - 1],
             },
         );
+
+        if (opts.verify) if (query_vec) |v| {
+            var exact_timer = try std.time.Timer.start();
+            const n_exact = try db.exactVectorSearch(v, exact);
+            const exact_ns = exact_timer.read();
+            exact_ns_sum += exact_ns;
+
+            // Matched on (path, start_i): two results naming the same span of the same
+            // document are the same result, whatever their ranks.
+            var hit: usize = 0;
+            for (exact[0..n_exact]) |e| {
+                for (buf[0..found]) |g| {
+                    if (e.start_i == g.start_i and std.mem.eql(u8, e.path, g.path)) {
+                        hit += 1;
+                        break;
+                    }
+                }
+            }
+            const r: f64 = if (n_exact == 0) 1.0 else
+                @as(f64, @floatFromInt(hit)) / @as(f64, @floatFromInt(n_exact));
+            recall_sum += r;
+            recall_n += 1;
+            std.debug.print("  exact {D} ({d} results) | recall {d:.3} | speedup {d:.1}x\n", .{
+                exact_ns, n_exact, r,
+                @as(f64, @floatFromInt(exact_ns)) / @as(f64, @floatFromInt(@max(samples[0], 1))),
+            });
+        };
         for (buf[0..found]) |r| {
             std.debug.print("    {d:.4}  {s} [{d}..{d}]\n", .{
                 r.similarity,
@@ -262,6 +299,13 @@ fn runSearch(allocator: std.mem.Allocator, opts: Options) !void {
             });
         }
         std.debug.print("\n", .{});
+    }
+
+    if (recall_n > 0) {
+        std.debug.print(
+            "recall {d:.3} over {d} queries, against an exhaustive scan averaging {D}\n",
+            .{ recall_sum / @as(f64, @floatFromInt(recall_n)), recall_n, exact_ns_sum / recall_n },
+        );
     }
 }
 
@@ -480,6 +524,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: [][:0]u8) !Options {
             opts.db = nextArg(args, &i);
         } else if (std.mem.eql(u8, arg, "--limit")) {
             opts.limit = try parseUsize(nextArg(args, &i));
+        } else if (std.mem.eql(u8, arg, "--verify")) {
+            opts.verify = true;
         } else if (std.mem.eql(u8, arg, "--sample")) {
             opts.sample = try parseUsize(nextArg(args, &i));
         } else if (std.mem.eql(u8, arg, "--progress")) {
@@ -547,6 +593,7 @@ fn usage(code: u8) noreturn {
         \\  --query <text>   query to run, repeatable (default: a built-in set)
         \\  -k <n>           results per query        (default: 10)
         \\  --repeat <n>     timing repeats per query (default: 3)
+        \\  --verify         also scan exhaustively and report the index's recall
         \\  --unique         use uniqueSearch instead of search
         \\
         \\examples:
