@@ -509,18 +509,22 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             const allocator = arena.allocator();
             assert(contents.len < MAX_NOTE_LEN);
 
-            var embedded_sentence_list: std.ArrayList(EmbeddedSentence) = .{};
-            errdefer embedded_sentence_list.deinit(allocator);
+            // Filter first, then embed every surviving sentence in one batch.
+            var sentences: std.ArrayList(embed.Chunk) = .{};
+            var sentence_strs: std.ArrayList([]const u8) = .{};
             var spliterator = embed.SentenceSpliterator.init(contents);
             while (spliterator.next()) |sentence| {
-                const vec: ?*const RawVector =
-                    if (whitespaceOnly(sentence.contents) or !wordlike(sentence.contents))
-                        null
-                    else if (try self.embedder.embed(allocator, sentence.contents)) |v|
-                        @field(v, @tagName(embedding_model))
-                    else
-                        null;
-                if (vec) |raw_vec| {
+                if (whitespaceOnly(sentence.contents) or !wordlike(sentence.contents)) continue;
+                try sentences.append(allocator, sentence);
+                try sentence_strs.append(allocator, sentence.contents);
+            }
+            const outputs = try self.embedder.embedBatch(allocator, sentence_strs.items);
+
+            var embedded_sentence_list: std.ArrayList(EmbeddedSentence) = .{};
+            errdefer embedded_sentence_list.deinit(allocator);
+            for (sentences.items, outputs) |sentence, output| {
+                if (output) |v| {
+                    const raw_vec: *const RawVector = @field(v, @tagName(embedding_model));
                     // Unquantized, the embedder's own arena buffer is already the storage
                     // form, so it is borrowed as-is. Quantizing needs somewhere to put the
                     // narrowed copy; the arena outlives replaceVectors below.
