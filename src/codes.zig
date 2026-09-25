@@ -442,20 +442,34 @@ pub fn Codes(comptime vec_sz: usize, comptime vec_type: type, comptime code_bits
             }
             self.pool.?.waitAndWork(&wg);
 
-            // Merge: each shard is already sorted, and there are `threads * K` of them, so a
-            // pass of pushes into one more TopK is cheaper than it looks and far simpler than
-            // a k-way merge.
-            var merged = TopK.init(out);
-            for (tops) |top| {
-                for (top.buf[0..top.n]) |c| {
-                    // Shards are sorted by the same key, so the first rejection means the
-                    // rest of this shard is worse too.
-                    const key = keyOf(c.dist, c.slot);
-                    if (key >= merged.worst_key) break;
-                    merged.push(key);
+            // A real k-way merge, because the shards are already sorted and the obvious
+            // alternative is quadratic. Pushing every shard entry into one more `TopK` costs
+            // O(threads * K^2): the first shard appends cheaply, but every shard after it
+            // interleaves, and each insertion shifts about half the array. Measured at K=4000
+            // that was 62 ms a query against 0.5 ms at K=100 -- superlinear in K, and none of
+            // it disk. Taking the best head `threads` times per output slot is O(K * threads),
+            // and `threads` is single digits.
+            const head = try self.allocator.alloc(usize, threads);
+            defer self.allocator.free(head);
+            @memset(head, 0);
+
+            var n: usize = 0;
+            while (n < out.len) : (n += 1) {
+                var best: usize = 0;
+                var best_key: u64 = std.math.maxInt(u64);
+                for (tops, head, 0..) |top, h, t| {
+                    if (h >= top.n) continue;
+                    const key = keyOfCand(top.buf[h]);
+                    if (key < best_key) {
+                        best_key = key;
+                        best = t;
+                    }
                 }
+                if (best_key == std.math.maxInt(u64)) break; // every shard drained
+                out[n] = tops[best].buf[head[best]];
+                head[best] += 1;
             }
-            return merged.n;
+            return n;
         }
 
         fn workerRun(self: *Self, q: *const Word, next: *std.atomic.Value(usize), top: *TopK) void {
@@ -482,9 +496,20 @@ pub fn Codes(comptime vec_sz: usize, comptime vec_type: type, comptime code_bits
             }
         }
 
-        /// Bounded top-K over a caller-owned buffer, kept sorted nearest-first. Insertion
-        /// rather than a heap: pushes are rare enough after `worst` converges that the O(K)
-        /// shift never shows up, and a sorted result is what the caller wants anyway.
+        /// Bounded top-K over a caller-owned buffer, kept sorted nearest-first.
+        ///
+        /// **Insertion, not a heap, and that caps the useful K at around 1,000.** A push costs
+        /// O(K) to shift, and the number of pushes in a scan of N is about K*ln(N/K), so the
+        /// selection is O(K^2 log) overall. Below ~500 it is invisible -- `worst_key`
+        /// converges in the first few hundred candidates and almost everything after that is
+        /// rejected by one comparison. Above it, it takes over: measured on a pure in-memory
+        /// scan of 5M codes with no disk involved, K=500 is 10 ms and K=4,000 is 150 ms.
+        ///
+        /// That is fine for the K this is used at -- 500 by default, which reaches 0.99 recall
+        /// (`experiments/results/binrecall.md`) -- and it is a trap for anyone who raises
+        /// `candidates` expecting a linear cost. A binary heap would make a push O(log K) and
+        /// remove the ceiling; it is not written because nothing needs K that large yet, and
+        /// because a heap gives up the sorted result the caller currently gets for free.
         ///
         /// **Ordered by (distance, slot), not distance alone**, and that second key is not
         /// tidiness. Hamming distances are small integers over a large corpus, so ties are

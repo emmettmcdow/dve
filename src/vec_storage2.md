@@ -598,15 +598,31 @@ still never fatal to lose.
 The lesson worth keeping: all three reversals came from measuring one scale and reasoning about
 another. Numbers in this file now cite `experiments/` or say they are estimates.
 
+## Cold is out of scope  [decided 2026-09-24]
+
+Much of this file reasons about the cold regime as though it were the one that decides the
+design. **It is not, for this product.** dve backs an interactive app that opens a database and
+then serves queries against it for as long as the session lasts, so the store is warm after the
+first touch and the cold path is one query at launch. That was a product decision, not a
+measurement, and it is recorded here because several conclusions above were derived from cold
+numbers and should be read with it in mind.
+
+What stays true regardless: the 4 MiB batched read, which wins warm as well as cold, and the
+whole argument for scanning codes in RAM rather than probing an index on disk.
+
+What changes is **the price of a candidate**. The crossover below was derived from 64 us cold
+random reads; warm, a candidate costs a fraction of that, which makes K cheap and shifts the
+code-width tradeoff toward narrower codes with a larger candidate list. See
+`experiments/results/binrecall.md`.
+
+What is no longer worth measuring: cold `storebench`, cold stage two, `--reuse` plus `purge`.
+
 ## Open questions
 
-- **Every storebench number is warm.** The cold regime is what decides the design and it is
-  unmeasured for these two stores. `--reuse` plus `sudo purge` between phases is the way in.
-- **No benchmark on a real corpus yet.** The wikitest run is the check that matters and has
-  not happened. It no longer waits on the cutover.
-- **The in-memory Hamming scan is unmeasured.** ~20 ms/query at 20M vectors is 1.9 GB divided
-  by an assumed ~100 GB/s of memory bandwidth. It is the load-bearing number for the whole
-  search design and deserves the same treatment the disk numbers just got -- next experiment.
+- **How many vectors Simple Wikipedia really is.** ~35M measured off a 400-article sample, and
+  `src/chunking.md` argues most of them should not exist. That decision is unmade and it is
+  worth 5.5x on both memory and latency.
+- **Whether the code can be narrower**, now that cold is out of scope and K is cheap.
 - **How many sentences a real filesystem produces**, which sets whether 20M is the right target
   at all. Everything above is sized off an estimate of ~100-500 sentences per document.
 

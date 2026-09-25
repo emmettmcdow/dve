@@ -248,8 +248,8 @@ const Job = struct {
 
     fn run(self: *Job) void {
         const sh = self.shared;
-        var buf_d: [1024]u16 = undefined;
-        var buf_i: [1024]u32 = undefined;
+        var buf_d: [8192]u16 = undefined;
+        var buf_i: [8192]u32 = undefined;
         var top = TopK.init(buf_d[0..sh.k], buf_i[0..sh.k]);
 
         while (true) {
@@ -342,7 +342,7 @@ fn parseArgs(args: [][:0]u8) Options {
         else if (eq(a, "--seed")) o.seed = parseUint(v)
         else fatal("unknown argument '{s}' (try --help)", .{a});
     }
-    if (o.k == 0 or o.k > 1024) fatal("--k must be 1..1024", .{});
+    if (o.k == 0 or o.k > 8192) fatal("--k must be 1..8192", .{});
     if (o.queries == 0) fatal("--queries must be positive", .{});
     return o;
 }
