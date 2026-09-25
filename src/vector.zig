@@ -145,15 +145,28 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             var vecs = try VecStorage.init(allocator, basedir, .{ .path = embedder.path });
             errdefer vecs.deinit();
 
-            // Built by reading every vector once. That is O(corpus) at every open and is what
-            // a persisted codes file would remove; nothing about the format depends on it, so
-            // it is a later want rather than a blocker.
-            var vcodes = try VecCodes.init(allocator, .{
-                .capacity = vecs.slot_n,
-                .threads = opts.scan_threads,
-            });
+            // Loaded if a usable file is sitting there, rebuilt from the store if not.
+            // Rebuilding reads every vector: 279 ms at 247k measured, but the store is ~143 GB
+            // at the full corpus and no page cache holds that, so it becomes ~22 s of cold
+            // sequential read at every launch against ~0.3 s to read the codes back.
+            var codes_name_buf: [256]u8 = undefined;
+            const codes_name = try codesPath(&codes_name_buf, embedder.path);
+            var vcodes = (try VecCodes.load(
+                allocator,
+                basedir,
+                codes_name,
+                stampOf(&vecs),
+                .{ .threads = opts.scan_threads },
+            )) orelse blk: {
+                var c = try VecCodes.init(allocator, .{
+                    .capacity = vecs.slot_n,
+                    .threads = opts.scan_threads,
+                });
+                errdefer c.deinit();
+                try buildCodes(&vecs, &c);
+                break :blk c;
+            };
             errdefer vcodes.deinit();
-            try buildCodes(&vecs, &vcodes);
 
             const wq = try WorkQueue.init(allocator, 1024);
 
@@ -187,6 +200,12 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             if (self.work_queue_running) {
                 self.shutdown();
             }
+            // Best effort: the index is a cache, and failing to write it costs a rebuild at
+            // the next open rather than any correctness. A caller that wants to know calls
+            // `saveIndex` itself.
+            self.saveIndex() catch |e| {
+                std.log.warn("could not save the code index: {t}", .{e});
+            };
             self.codes.deinit();
             self.vec_storage.deinit();
             self.embedder.deinit();
@@ -577,6 +596,38 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             }
         }
 
+        /// The database filename this engine uses, so a test can name the index beside it.
+        pub fn embedderPathForTest() []const u8 {
+            return switch (embedding_model) {
+                .apple_nlembedding => NLEmbedder.PATH,
+                .mpnet_embedding => MpnetEmbedder.PATH,
+            };
+        }
+
+        /// Writes the code index next to the database so the next open does not have to
+        /// rebuild it from every vector.
+        ///
+        /// `deinit` calls this, which means an unclean exit leaves nothing to load and the
+        /// next open rebuilds -- deliberately. A saved index cannot be proved fresh from
+        /// counters alone (`codes.Stamp` explains why), so it is only trusted when the process
+        /// that wrote it also shut down cleanly. Call this explicitly to checkpoint sooner;
+        /// it costs one sequential write of the index, ~48 bytes a vector.
+        pub fn saveIndex(self: *Self) !void {
+            var buf: [256]u8 = undefined;
+            const name = try codesPath(&buf, self.embedder.path);
+            try self.codes.save(self.basedir, name, stampOf(&self.vec_storage));
+        }
+
+        /// What a saved index has to match to be loaded. Read from the store rather than
+        /// tracked, so it cannot drift from the thing it describes.
+        fn stampOf(store: *VecStorage) codes.Stamp {
+            return .{
+                .store_bytes = store.file.size() catch 0,
+                .slot_n = store.slot_n,
+                .vec_n = store.vec_n,
+            };
+        }
+
         /// Validate the vector database is in a good state.
         pub fn validate(self: *Self) !void {
             try self.vec_storage.validate();
@@ -689,6 +740,13 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             return found_n;
         }
     };
+}
+
+/// The index file sits beside the database and is named after it, so a build with a different
+/// quantization -- which already gets its own `.db` -- gets its own index too rather than
+/// silently reading one built for a different vector type.
+fn codesPath(buf: []u8, db_path: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}.codes", .{db_path});
 }
 
 fn stripQuery(query: []const u8) []const u8 {
@@ -1902,5 +1960,114 @@ test "the index is rebuilt on reopen and finds what it found before" {
         try std.testing.expectEqualStrings(a.path, b.path);
         try expectEqual(a.start_i, b.start_i);
         try expectEqual(a.end_i, b.end_i);
+    }
+}
+
+test "the code index is saved on close and loaded on reopen" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+
+    const text = "pizza is delicious. trains are fast. the sky is blue. cats sleep often.";
+    {
+        var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+        defer db.deinit();
+        try db.embedText("a.md", text);
+    }
+
+    // The file exists only because deinit wrote it, and it is named after the database.
+    var name_buf: [256]u8 = undefined;
+    const name = try codesPath(&name_buf, TestVecDB.embedderPathForTest());
+    try tmpD.dir.access(name, .{});
+
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    defer db.deinit();
+    try db.validate();
+    try expectEqual(db.vec_storage.len(), db.codes.len());
+
+    // Loading consumed the file: an index on disk is only valid while no process holds it.
+    try std.testing.expectError(error.FileNotFound, tmpD.dir.access(name, .{}));
+
+    var buf: [4]SearchResult = undefined;
+    try std.testing.expect(try db.search("trains are fast", &buf) > 0);
+}
+
+test "a stale index is rejected rather than trusted" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+
+    var name_buf: [256]u8 = undefined;
+    const name = try codesPath(&name_buf, TestVecDB.embedderPathForTest());
+
+    {
+        var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+        defer db.deinit();
+        try db.embedText("a.md", "pizza is delicious.");
+    }
+    // An index written for a one-document store.
+    try tmpD.dir.access(name, .{});
+    const stale = try tmpD.dir.readFileAlloc(arena.allocator(), name, 1 << 24);
+
+    {
+        var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+        defer db.deinit();
+        try db.embedText("b.md", "trains are fast. the sky is blue.");
+    }
+    // Put the one-document index back over the two-document one.
+    try tmpD.dir.writeFile(.{ .sub_path = name, .data = stale });
+
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    defer db.deinit();
+    // Rejected on the stamp, so the index was rebuilt and covers both documents.
+    try db.validate();
+    try expectEqual(db.vec_storage.len(), db.codes.len());
+
+    var buf: [4]SearchResult = undefined;
+    try std.testing.expect(try db.search("trains are fast", &buf) > 0);
+    try std.testing.expect(try db.search("pizza is delicious", &buf) > 0);
+}
+
+test "a missing index is rebuilt, and answers the same as a loaded one" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+
+    var name_buf: [256]u8 = undefined;
+    const name = try codesPath(&name_buf, TestVecDB.embedderPathForTest());
+    const text = "pizza is delicious. trains are fast. the sky is blue. cats sleep often.";
+
+    {
+        var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+        defer db.deinit();
+        try db.embedText("a.md", text);
+    }
+
+    var loaded_buf: [4]SearchResult = undefined;
+    var n_loaded: usize = 0;
+    {
+        var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+        defer db.deinit();
+        n_loaded = try db.search("trains are fast", &loaded_buf);
+        for (loaded_buf[0..n_loaded]) |*r| r.path = try arena.allocator().dupe(u8, r.path);
+    }
+
+    // That reopen consumed the index, and this deinit wrote a fresh one -- delete it so the
+    // next open takes the rebuild path instead.
+    tmpD.dir.deleteFile(name) catch {};
+
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    defer db.deinit();
+    var rebuilt: [4]SearchResult = undefined;
+    const n_rebuilt = try db.search("trains are fast", &rebuilt);
+
+    try expectEqual(n_loaded, n_rebuilt);
+    for (loaded_buf[0..n_loaded], rebuilt[0..n_rebuilt]) |a, b| {
+        try std.testing.expectEqualStrings(a.path, b.path);
+        try expectEqual(a.start_i, b.start_i);
+        try expectEqual(a.similarity, b.similarity);
     }
 }

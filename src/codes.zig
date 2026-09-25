@@ -55,6 +55,54 @@ pub const Error = error{
     EmptyBuffer,
 };
 
+/// What a saved codes file has to match to be worth loading: the store it was built from, and
+/// the configuration it was built under.
+///
+/// **Counters alone cannot prove freshness**, and it is worth being explicit about why rather
+/// than discovering it later. `replaceVectors` removes a document's rows and then puts the
+/// replacements into the slots it just freed, so a re-embed of the same length leaves
+/// `vec_n`, `slot_n` and the file size all exactly as they were while every code is wrong.
+/// Detecting that would need either a mutation counter persisted inside the store -- whose
+/// header is deliberately immutable -- or a rescan of every trailer, which is the cost the
+/// file exists to avoid.
+///
+/// So the stamp is not the freshness mechanism. `load` deletes the file it read, which makes a
+/// saved file valid only while nobody holds it open, and `save` writes a new one at shutdown.
+/// The stamp's job is narrower and still worth doing: catch a file belonging to a *different*
+/// store, or written by a build with a different code width or vector type.
+pub const Stamp = struct {
+    /// The store's byte length when the codes were written.
+    store_bytes: u64,
+    /// The store's slot high-water mark.
+    slot_n: u64,
+    /// The store's live vector count.
+    vec_n: u64,
+
+    fn eql(a: Stamp, b: Stamp) bool {
+        return a.store_bytes == b.store_bytes and a.slot_n == b.slot_n and a.vec_n == b.vec_n;
+    }
+};
+
+const MAGIC: [8]u8 = "DVECODES".*;
+const FMT_V: u8 = 1;
+
+/// Fixed-size and written first. Everything after it is two flat arrays: the liveness bits,
+/// then the codes.
+const FileHeader = extern struct {
+    magic: [8]u8,
+    fmt_v: u8,
+    big_endian: u8,
+    _pad: [6]u8 = @splat(0),
+    code_bits: u64,
+    vec_sz: u64,
+    vec_elem_bits: u64,
+    slot_n: u64,
+    live_n: u64,
+    store_bytes: u64,
+    store_slot_n: u64,
+    store_vec_n: u64,
+};
+
 pub fn Codes(comptime vec_sz: usize, comptime vec_type: type, comptime code_bits: usize) type {
     comptime {
         // A code is addressed as u64 words, and the scan reads it as 16-byte lanes with a
@@ -237,6 +285,129 @@ pub fn Codes(comptime vec_sz: usize, comptime vec_type: type, comptime code_bits
             return self.words.len * 8 + self.live.len * 8;
         }
 
+        // ************************************************************************ Persistence
+        /// Byte offsets of the two arrays. Both are `u64`-aligned by construction, so a load
+        /// reads straight into them with no copying or byte-shuffling.
+        fn liveOff() u64 {
+            return @sizeOf(FileHeader);
+        }
+        fn codesOff(live_words: usize) u64 {
+            return liveOff() + live_words * 8;
+        }
+
+        /// Writes the index to `path` in `dir`, replacing whatever was there.
+        ///
+        /// No checksum over the payload, deliberately. At 1.68 GB a crc32 costs about a
+        /// second, which is several times the read it is protecting, and the failure it would
+        /// catch is uniquely benign here: every bit pattern is a valid code, so a corrupted
+        /// one cannot crash anything or return wrong data -- stage two re-reads the real
+        /// vector and scores it exactly. A flipped bit costs a little recall and nothing else.
+        /// A *truncated* file is caught, by length.
+        pub fn save(self: *const Self, dir: std.fs.Dir, path: []const u8, stamp: Stamp) !void {
+            const live_words = (self.slot_n + 63) / 64;
+            const code_words = self.slot_n * CODE_WORDS;
+
+            const file = try pfile.File.openAt(@intCast(dir.fd), path, .{ .truncate = true });
+            defer file.close();
+
+            const h = FileHeader{
+                .magic = MAGIC,
+                .fmt_v = FMT_V,
+                .big_endian = @intFromBool(native_endian == .big),
+                .code_bits = code_bits,
+                .vec_sz = vec_sz,
+                .vec_elem_bits = @bitSizeOf(vec_type),
+                .slot_n = self.slot_n,
+                .live_n = self.live_n,
+                .store_bytes = stamp.store_bytes,
+                .store_slot_n = stamp.slot_n,
+                .store_vec_n = stamp.vec_n,
+            };
+            try file.writeAt(std.mem.asBytes(&h), 0);
+            try file.writeAt(std.mem.sliceAsBytes(self.live[0..live_words]), liveOff());
+            try file.writeAt(
+                std.mem.sliceAsBytes(self.words[0..code_words]),
+                codesOff(live_words),
+            );
+            try file.sync();
+        }
+
+        /// Loads an index written by `save`, or returns null if there is nothing usable --
+        /// absent, a different format, a different configuration, or built from a different
+        /// store. Null is the normal path, not an error: the caller rebuilds.
+        ///
+        /// **A successful load deletes the file**, and that is the freshness mechanism rather
+        /// than an optimisation. See `Stamp` for why counters cannot do the job. Removing the
+        /// file means a saved index is only ever valid while no process holds it, so a crash
+        /// -- or any exit that does not reach `save` -- leaves nothing to load and the next
+        /// open rebuilds. The cost of being wrong here is silently missing search results, and
+        /// the cost of being conservative is one rebuild, so it is not a close call.
+        pub fn load(
+            allocator: std.mem.Allocator,
+            dir: std.fs.Dir,
+            path: []const u8,
+            stamp: Stamp,
+            opts: Opts,
+        ) !?Self {
+            const file = pfile.File.openAt(@intCast(dir.fd), path, .{ .create = false }) catch
+                return null;
+            var keep_file = true;
+            defer {
+                file.close();
+                if (!keep_file) dir.deleteFile(path) catch {};
+            }
+
+            var h: FileHeader = undefined;
+            const got = file.readAt(std.mem.asBytes(&h), 0) catch return null;
+            if (got != @sizeOf(FileHeader)) return null;
+
+            const ok = std.mem.eql(u8, &h.magic, &MAGIC) and
+                h.fmt_v == FMT_V and
+                h.big_endian == @intFromBool(native_endian == .big) and
+                h.code_bits == code_bits and
+                h.vec_sz == vec_sz and
+                h.vec_elem_bits == @bitSizeOf(vec_type) and
+                Stamp.eql(.{
+                    .store_bytes = h.store_bytes,
+                    .slot_n = h.store_slot_n,
+                    .vec_n = h.store_vec_n,
+                }, stamp);
+            if (!ok) {
+                // Stale or foreign. Drop it rather than leave it to be re-rejected forever.
+                keep_file = false;
+                return null;
+            }
+
+            const slot_n: usize = @intCast(h.slot_n);
+            const live_words = (slot_n + 63) / 64;
+            const code_words = slot_n * CODE_WORDS;
+            const want = codesOff(live_words) + code_words * 8;
+            if ((file.size() catch return null) != want) {
+                keep_file = false; // truncated: caught by length, which is what length is for
+                return null;
+            }
+
+            var self = try Self.init(allocator, .{ .capacity = slot_n, .threads = opts.threads });
+            errdefer self.deinit();
+
+            if (slot_n > 0) {
+                const lv = self.live[0..live_words];
+                if (try file.readAt(std.mem.sliceAsBytes(lv), liveOff()) != live_words * 8) {
+                    return null;
+                }
+                const cw = self.words[0..code_words];
+                if (try file.readAt(
+                    std.mem.sliceAsBytes(cw),
+                    codesOff(live_words),
+                ) != code_words * 8) return null;
+            }
+            self.slot_n = slot_n;
+            self.live_n = @intCast(h.live_n);
+
+            keep_file = false;
+            return self;
+        }
+
         // ***************************************************************************** Search
         /// Stage one. Fills `out` with the closest live slots by Hamming distance, nearest
         /// first, and returns how many. `out.len` is K -- the candidate count, which is also
@@ -362,6 +533,8 @@ pub fn Codes(comptime vec_sz: usize, comptime vec_type: type, comptime code_bits
 
 const std = @import("std");
 const assert = std.debug.assert;
+const native_endian = @import("builtin").cpu.arch.endian();
+const pfile = @import("pfile.zig");
 
 // ****************************************************************************************** Tests
 const testing = std.testing;
@@ -651,7 +824,6 @@ test "bytes: the resident cost is the code array plus one bit per slot" {
 }
 
 test "the production configuration is 48 bytes a vector" {
-    const Prod = Codes(768, f32, DEFAULT_BITS);
     try expectEqual(@as(usize, 384), Prod.CODE_BITS);
     try expectEqual(@as(usize, 48), Prod.CODE_BYTES);
     try expectEqual(@as(usize, 6), Prod.CODE_WORDS);
@@ -807,4 +979,156 @@ test "search: threading does not change the answer, ties included" {
         // Slot for slot, not just distance for distance.
         try testing.expectEqualSlices(Tiny.Candidate, b[0..nb], a[0..na]);
     }
+}
+
+// ****************************************************************************** Persistence
+const Prod = Codes(768, f32, DEFAULT_BITS);
+
+fn randVec(comptime N: usize, rng: std.Random, out: *[N]f32) void {
+    for (out) |*x| x.* = rng.floatNorm(f32);
+}
+
+test "save then load reproduces the index exactly" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var prng = std.Random.DefaultPrng.init(11);
+    const rng = prng.random();
+    const stamp = Stamp{ .store_bytes = 4096 * 300, .slot_n = 300, .vec_n = 280 };
+
+    var v: [768]f32 = undefined;
+    var saved = try Prod.init(talloc, .{ .capacity = 300 });
+    defer saved.deinit();
+    for (0..300) |slot| {
+        randVec(768, rng, &v);
+        try saved.put(slot, &v);
+        if (slot % 15 == 0) saved.rm(slot); // holes, so liveness has to survive the round trip
+    }
+    try saved.save(tmp.dir, "c.bin", stamp);
+
+    var loaded = (try Prod.load(talloc, tmp.dir, "c.bin", stamp, .{})).?;
+    defer loaded.deinit();
+
+    try expectEqual(saved.slotCount(), loaded.slotCount());
+    try expectEqual(saved.len(), loaded.len());
+    for (0..300) |slot| try expectEqual(saved.isLive(slot), loaded.isLive(slot));
+    try testing.expectEqualSlices(u64, saved.words[0 .. 300 * Prod.CODE_WORDS], loaded.words[0 .. 300 * Prod.CODE_WORDS]);
+
+    // And it answers the same, which is the property that actually matters.
+    var qv: [768]f32 = undefined;
+    var a: [20]Prod.Candidate = undefined;
+    var b: [20]Prod.Candidate = undefined;
+    for (0..5) |_| {
+        randVec(768, rng, &qv);
+        const na = try saved.search(&qv, &a);
+        const nb = try loaded.search(&qv, &b);
+        try expectEqual(na, nb);
+        try testing.expectEqualSlices(Prod.Candidate, a[0..na], b[0..nb]);
+    }
+}
+
+test "load consumes the file, so a second open has nothing to read" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const stamp = Stamp{ .store_bytes = 4096, .slot_n = 1, .vec_n = 1 };
+
+    var v: [768]f32 = @splat(0.5);
+    var c = try Prod.init(talloc, .{ .capacity = 1 });
+    defer c.deinit();
+    try c.put(0, &v);
+    try c.save(tmp.dir, "c.bin", stamp);
+
+    var first = (try Prod.load(talloc, tmp.dir, "c.bin", stamp, .{})).?;
+    first.deinit();
+
+    // Gone. A saved index is only valid while nobody holds it, which is what stops a crashed
+    // process leaving a stale one behind -- see the comment on `load`.
+    try expectEqual(@as(?Prod, null), try Prod.load(talloc, tmp.dir, "c.bin", stamp, .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.access("c.bin", .{}));
+}
+
+test "load refuses a file from a different store, and does not leave it behind" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const written = Stamp{ .store_bytes = 4096 * 10, .slot_n = 10, .vec_n = 10 };
+
+    var v: [768]f32 = @splat(0.25);
+    var c = try Prod.init(talloc, .{ .capacity = 10 });
+    defer c.deinit();
+    for (0..10) |slot| try c.put(slot, &v);
+
+    // Each field on its own is enough to reject.
+    for ([_]Stamp{
+        .{ .store_bytes = 4096 * 11, .slot_n = 10, .vec_n = 10 },
+        .{ .store_bytes = 4096 * 10, .slot_n = 11, .vec_n = 10 },
+        .{ .store_bytes = 4096 * 10, .slot_n = 10, .vec_n = 9 },
+    }) |wrong| {
+        try c.save(tmp.dir, "c.bin", written);
+        try expectEqual(@as(?Prod, null), try Prod.load(talloc, tmp.dir, "c.bin", wrong, .{}));
+        try testing.expectError(error.FileNotFound, tmp.dir.access("c.bin", .{}));
+    }
+}
+
+test "load refuses a file written for a different code width" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const stamp = Stamp{ .store_bytes = 4096 * 4, .slot_n = 4, .vec_n = 4 };
+
+    const Narrow = Codes(768, f32, 128);
+    var v: [768]f32 = @splat(1.0);
+    var c = try Narrow.init(talloc, .{ .capacity = 4 });
+    defer c.deinit();
+    for (0..4) |slot| try c.put(slot, &v);
+    try c.save(tmp.dir, "c.bin", stamp);
+
+    // Same store, same vectors, a build that quantizes differently. Loading it would be
+    // reading 48-byte codes out of 16-byte ones.
+    try expectEqual(@as(?Prod, null), try Prod.load(talloc, tmp.dir, "c.bin", stamp, .{}));
+}
+
+test "load refuses a truncated file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const stamp = Stamp{ .store_bytes = 4096 * 50, .slot_n = 50, .vec_n = 50 };
+
+    var prng = std.Random.DefaultPrng.init(3);
+    var v: [768]f32 = undefined;
+    var c = try Prod.init(talloc, .{ .capacity = 50 });
+    defer c.deinit();
+    for (0..50) |slot| {
+        randVec(768, prng.random(), &v);
+        try c.put(slot, &v);
+    }
+    try c.save(tmp.dir, "c.bin", stamp);
+
+    // Lop off the last few codes, which is what a crash mid-write looks like. There is no
+    // checksum over the payload -- see `save` for why -- so length is the whole defence.
+    const f = try tmp.dir.openFile("c.bin", .{ .mode = .read_write });
+    const full = (try f.stat()).size;
+    try f.setEndPos(full - 200);
+    f.close();
+
+    try expectEqual(@as(?Prod, null), try Prod.load(talloc, tmp.dir, "c.bin", stamp, .{}));
+}
+
+test "load of a missing file is null, not an error" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const stamp = Stamp{ .store_bytes = 0, .slot_n = 0, .vec_n = 0 };
+    try expectEqual(@as(?Prod, null), try Prod.load(talloc, tmp.dir, "nope.bin", stamp, .{}));
+}
+
+test "an empty index round-trips" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const stamp = Stamp{ .store_bytes = 4096, .slot_n = 0, .vec_n = 0 };
+
+    var c = try Prod.init(talloc, .{});
+    defer c.deinit();
+    try c.save(tmp.dir, "c.bin", stamp);
+
+    var loaded = (try Prod.load(talloc, tmp.dir, "c.bin", stamp, .{})).?;
+    defer loaded.deinit();
+    try expectEqual(@as(usize, 0), loaded.slotCount());
+    try expectEqual(@as(usize, 0), loaded.len());
 }

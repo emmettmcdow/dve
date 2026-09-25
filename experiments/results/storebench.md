@@ -73,8 +73,25 @@ The index is cheap in both senses:
 | 100k vectors | 46.9 ms | 6.0 MB | 1.5% |
 | 500k vectors | 226.9 ms | 24.1 MB | 1.3% |
 
-Build is O(corpus) at every open, because nothing persists the codes yet -- 227 ms at 500k,
-and ~16 s projected to 35M, which is what a codes file would remove.
+### Building the index versus loading it
+
+The index is now written to a file beside the store, so the O(corpus) build only happens when
+there is nothing to load. Measured with no embedder in the way:
+
+| | build (reads every vector) | save | load | ratio |
+|---|---:|---:|---:|---:|
+| 100k vectors | 103.5 ms | 8.1 ms | 3.3 ms | **31x** |
+| 500k vectors | 203.9 ms | 16.3 ms | 5.5 ms | **37x** |
+
+**The ratio grows with the corpus, because the two read different things.** A build reads the
+whole store -- 1.9 GB at 500k -- while a load reads the index, 24.1 MB. That is 80:1 in bytes
+at this size and it only widens: at 35M the store is ~143 GB, which no page cache holds, so a
+rebuild is ~22 s of cold sequential read against ~0.26 s to read a 1.68 GB index.
+
+Worth saying plainly that **this does not matter yet**. At the scale wikitest reaches, the
+rebuild is ~280 ms against a CoreML model load of 1-2.7 s, so it is invisible. It is built now
+because the thing it fixes is a cliff rather than a slope, and the cliff is on the far side of
+a corpus we cannot embed in a day.
 
 Two things this table does not show. The `hits/query` column is 50.0 for all three, but that
 only says each filled its 50-entry buffer; recall is measured properly against exact cosine on

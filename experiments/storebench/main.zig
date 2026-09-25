@@ -125,6 +125,10 @@ const Result = struct {
     /// an unindexed run.
     index_ns: u64 = 0,
     index_bytes: u64 = 0,
+    /// Writing that index to a file and reading it back. The point of the file is that the
+    /// second number replaces the first at every open.
+    index_save_ns: u64 = 0,
+    index_load_ns: u64 = 0,
     search_ns: u64 = 0,
     hits: u64 = 0,
     bytes: u64 = 0,
@@ -293,7 +297,28 @@ fn runOne(
         while (try it.next()) |e| try c.put(e.slot, e.vec);
         res.index_ns = build_timer.read();
         res.index_bytes = c.bytes();
-        idx = c;
+
+        // Round-trip it, so the build cost and the load cost are measured side by side on the
+        // same index. `load` consumes the file, which is how a saved index is kept from
+        // outliving the process that wrote it, so this saves again afterwards.
+        const stamp = codesStamp(&store);
+        var save_timer = try std.time.Timer.start();
+        try c.save(dir, CODES_FILE, stamp);
+        res.index_save_ns = save_timer.read();
+
+        var load_timer = try std.time.Timer.start();
+        var reloaded = (try Codes.load(gpa, dir, CODES_FILE, stamp, .{})) orelse
+            fatal("the index just written would not load back", .{});
+        res.index_load_ns = load_timer.read();
+
+        c.deinit();
+        idx = reloaded;
+        // Re-sampled: the peak above was taken before the index existed, so an indexed run
+        // would otherwise report the store's footprint and not its own.
+        res.rss_peak = rssBytes();
+        // Searches below run against the *loaded* index, so a save/load bug shows up as bad
+        // results rather than only as a bad number.
+        _ = &reloaded;
     }
 
     // ---------------------------------------------------------------------------- search
@@ -331,6 +356,16 @@ fn runOne(
 /// The shipped search path, in miniature: codes for candidates, disk for the truth. Kept here
 /// rather than called through `vector.zig` so the comparison measures storage and indexing
 /// without an embedder in the way.
+const CODES_FILE = "bench.codes";
+
+fn codesStamp(store: *V2) dve.codes.Stamp {
+    return .{
+        .store_bytes = store.file.size() catch 0,
+        .slot_n = store.slot_n,
+        .vec_n = store.vec_n,
+    };
+}
+
 fn twoStage(
     store: *V2,
     idx: *Codes,
@@ -377,15 +412,28 @@ fn report(results: []const Result, opts: Options) void {
         });
     }
 
-    w("\n{s:<18} {s:>12} {s:>12} {s:>12} {s:>12} {s:>12}\n", .{
-        "", "live vecs", "hits/query", "peak rss", "index", "index size",
+    w("\n{s:<18} {s:>12} {s:>12} {s:>12} {s:>12}\n", .{
+        "", "live vecs", "hits/query", "peak rss", "index size",
     });
-    w("{s:-<18} {s:->12} {s:->12} {s:->12} {s:->12} {s:->12}\n", .{ "", "", "", "", "", "" });
+    w("{s:-<18} {s:->12} {s:->12} {s:->12} {s:->12}\n", .{ "", "", "", "", "" });
     for (results) |r| {
         const hpq = if (opts.queries == 0) 0 else @as(f64, @floatFromInt(r.hits)) /
             @as(f64, @floatFromInt(opts.queries));
-        w("{s:<18} {d:>12} {d:>12.1} {f:>12} {D:>12} {f:>12}\n", .{
-            r.label, r.vec_n, hpq, fmtBytes(r.rss_peak), r.index_ns, fmtBytes(r.index_bytes),
+        w("{s:<18} {d:>12} {d:>12.1} {f:>12} {f:>12}\n", .{
+            r.label, r.vec_n, hpq, fmtBytes(r.rss_peak), fmtBytes(r.index_bytes),
+        });
+    }
+
+    for (results) |r| {
+        if (r.index_ns == 0) continue;
+        w("\n{s}: index build {D} (reads every vector), save {D}, load {D}\n", .{
+            r.label, r.index_ns, r.index_save_ns, r.index_load_ns,
+        });
+        w("  loading instead of rebuilding is {d:.0}x, and that ratio is what grows:\n" ++
+            "  the build reads the whole store, the load reads {f}.\n", .{
+            @as(f64, @floatFromInt(r.index_ns)) /
+                @as(f64, @floatFromInt(@max(r.index_load_ns, 1))),
+            fmtBytes(r.index_bytes),
         });
     }
     if (results.len > 1) {

@@ -186,8 +186,9 @@ pub fn build(b: *std.Build) !void {
             }),
             .filters = if (test_filter != null) filters else &.{},
         });
-        // codes.zig is std only -- it holds an array of codes and scans it, and deliberately
-        // knows nothing about storage, embeddings, or config.
+        // codes.zig knows nothing about storage, embeddings, or config -- but it saves and
+        // loads itself through pfile.zig, which is a thin shim onto libc.
+        t.root_module.link_libc = true;
         test_codes.dependOn(&runTest(b, t, use_lldb).step);
     }
 

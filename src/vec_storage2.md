@@ -419,9 +419,20 @@ Three things the module records that were not obvious going in, each measured:
   a packed `(distance, slot)` u64 key, which keeps the hot path at one comparison -- ordering
   by distance alone and tie-breaking separately cost ~50% of a cache-resident scan.
 
-What remains open is **persistence**. Rebuilding codes at startup means re-reading every
-vector, which is the 82 GB the sidecar exists to avoid; at 1.68 GB a codes file loads in
-~0.3 s. Nothing below has been built. See "Deferred" for the rest.
+**Persistence is built too.** The index is written to `<db>.codes` beside the store on close
+and loaded at open; if it is missing, stale, or from a different build, it is rebuilt. Measured
+with no embedder in the way: a build is 203.9 ms at 500k against 5.5 ms to load, and the ratio
+grows because a build reads the whole store while a load reads the index -- 80:1 in bytes at
+500k, and at 35M it is ~22 s of cold read against ~0.26 s.
+
+The part worth remembering is **why the file is deleted when it is read**. Counters cannot
+prove an index fresh: `replaceVectors` frees a document's slots and refills them, so a re-embed
+of the same length leaves `vec_n`, `slot_n` and the file size all unchanged while every code is
+wrong. Proving freshness would need a mutation counter inside the store -- whose header is
+deliberately immutable -- or a rescan of every trailer, which is the cost the file exists to
+avoid. So a saved index is valid only while no process holds it: `load` consumes the file,
+`save` writes a new one at shutdown, and an unclean exit leaves nothing to load. The stamp it
+does carry catches a different store or a different build, not staleness.
 
 The discussion that got here is kept below, because the reasoning is worth more than the
 conclusion.
@@ -562,12 +573,13 @@ reasoned about once.
 
 ## Deferred, roughly in order
 
-1. **Sidecar index**, back on the list: even batched, a cold open at 20M vectors is ~12 seconds,
-   so the scan cannot be the startup path. Must also persist the quantized codes -- recomputing
-   them means re-reading 82 GB. Still never inside the data file, still never fatal to lose.
-2. **1-bit quantized cache** of the whole DB in memory: scan the codes, then confirm ~100
-   candidates on disk. The ~880 bytes of slack per chunk at 768xf32 has room for a 96-byte code,
-   so this needs no format change. The measurements make this mandatory, not optional.
+1. **Sidecar index** -- **DONE**, as `<db>.codes`. It turned out to be one artifact rather than
+   two: the codes file carries the liveness the open scan would have rebuilt, so there was never
+   a separate free-list sidecar worth building. Never inside the data file, never fatal to lose.
+2. **1-bit quantized cache** -- **DONE**, `src/codes.zig`. 384 bits rather than the 96 bytes
+   guessed here, and in its own file rather than the chunk slack: slack would have made the
+   codes durable but reading them would still walk the whole store, which is the cost being
+   avoided.
 3. **Atomic metadata commit** -- split the 32-byte `VMeta` write into a 24-byte payload and an
    8-byte commit word. Land it with the `put` IO work above so the syscall budget is costed once.
 4. **RwLock**, once contention is real.
