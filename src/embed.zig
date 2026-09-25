@@ -56,11 +56,8 @@ pub const EmbeddingModelOutput = union(EmbeddingModel) {
 pub const Embedder = struct {
     ptr: *anyopaque,
     splitFn: *const fn (ptr: *anyopaque, contents: []const u8) SentenceSpliterator,
-    embedFn: *const fn (
-        ptr: *anyopaque,
-        allocator: Allocator,
-        str: []const u8,
-    ) anyerror!?EmbeddingModelOutput,
+    embedFn: EmbedFn,
+    embedBatchFn: EmbedBatchFn,
     deinitFn: *const fn (self: *anyopaque) void,
 
     id: EmbeddingModel,
@@ -80,10 +77,51 @@ pub const Embedder = struct {
         return self.embedFn(self.ptr, allocator, contents);
     }
 
+    /// Embeds every string in `strs` at once. The returned slice lines up with
+    /// `strs`: entry i is what `embed(allocator, strs[i])` would give, null for
+    /// the strings `embed` would skip. The slice and every vector in it come
+    /// from `allocator`; as with `embed`, an arena is the expected choice.
+    pub fn embedBatch(
+        self: *Embedder,
+        allocator: Allocator,
+        strs: []const []const u8,
+    ) ![]?EmbeddingModelOutput {
+        return self.embedBatchFn(self.ptr, allocator, strs);
+    }
+
     pub fn deinit(self: *Embedder) void {
         self.deinitFn(self.ptr);
     }
 };
+
+pub const EmbedFn = *const fn (
+    ptr: *anyopaque,
+    allocator: Allocator,
+    str: []const u8,
+) anyerror!?EmbeddingModelOutput;
+
+pub const EmbedBatchFn = *const fn (
+    ptr: *anyopaque,
+    allocator: Allocator,
+    strs: []const []const u8,
+) anyerror![]?EmbeddingModelOutput;
+
+/// A batch in name only: calls `embedOne` once per string. For backends with no
+/// native batching, so that every Embedder can answer `embedBatch`.
+fn sequentialEmbedBatch(comptime embedOne: EmbedFn) EmbedBatchFn {
+    return struct {
+        fn embedBatch(
+            ptr: *anyopaque,
+            allocator: Allocator,
+            strs: []const []const u8,
+        ) ![]?EmbeddingModelOutput {
+            const outs = try allocator.alloc(?EmbeddingModelOutput, strs.len);
+            errdefer allocator.free(outs);
+            for (strs, outs) |str, *out| out.* = try embedOne(ptr, allocator, str);
+            return outs;
+        }
+    }.embedBatch;
+}
 
 //**************************************************************************************** Embedder
 pub const MpnetEmbedder = struct {
@@ -261,6 +299,7 @@ pub const MpnetEmbedder = struct {
             .ptr = self,
             .splitFn = split,
             .embedFn = embed,
+            .embedBatchFn = sequentialEmbedBatch(embed),
             .deinitFn = deinitFn,
             .id = ID,
             .threshold = THRESHOLD,
@@ -601,6 +640,7 @@ pub const NLEmbedder = struct {
             .ptr = self,
             .splitFn = split,
             .embedFn = embed,
+            .embedBatchFn = sequentialEmbedBatch(embed),
             .deinitFn = deinitFn,
             .id = ID,
             .threshold = THRESHOLD,
@@ -714,6 +754,7 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
             .ptr = self,
             .splitFn = split,
             .embedFn = embed,
+            .embedBatchFn = sequentialEmbedBatch(embed),
             .deinitFn = deinitFn,
             .id = ID,
             .threshold = THRESHOLD,
@@ -1320,6 +1361,84 @@ test "embed - LlamaNomicEmbedTextV15F32 solo" {
     vec = output.?.llama_nomic_embed_text_v1_5_f32.*;
     sum = @reduce(.Add, vec);
     try std.testing.expectApproxEqAbs(0.17591982, sum, 1e-4);
+}
+
+/// Checks `e.embedBatch(strs)` against `e.embed` run on each string alone.
+fn expectBatchMatchesSingles(e: *Embedder, strs: []const []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const batch = try e.embedBatch(allocator, strs);
+    try expectEqual(strs.len, batch.len);
+    for (strs, batch) |str, batch_out| {
+        const single_out = try e.embed(allocator, str);
+        if (single_out == null) {
+            try expectEqual(null, batch_out);
+            continue;
+        }
+        try expectEqual(std.meta.activeTag(single_out.?), std.meta.activeTag(batch_out.?));
+        try expectEqualSlices(f32, single_out.?.slice(), batch_out.?.slice());
+    }
+}
+
+const batch_phrases = [_][]const u8{
+    "Hello world",
+    "",
+    "The quick brown fox jumps over the lazy dog",
+    "Machine learning models convert text into vector representations",
+    "",
+    "Zig is a systems programming language designed for correctness",
+    "a",
+};
+
+test "embedBatch - nlembed matches embed" {
+    var nl = try NLEmbedder.init();
+    defer nl.deinit();
+    var e = nl.embedder();
+    try expectBatchMatchesSingles(&e, &batch_phrases);
+}
+
+test "embedBatch - mpnetembed matches embed" {
+    var mpnet = try MpnetEmbedder.init(.{});
+    defer mpnet.deinit();
+    var e = mpnet.embedder();
+    try expectBatchMatchesSingles(&e, &batch_phrases);
+}
+
+test "embedBatch - empty batch" {
+    var nl = try NLEmbedder.init();
+    defer nl.deinit();
+    var e = nl.embedder();
+    const out = try e.embedBatch(std.testing.allocator, &.{});
+    defer std.testing.allocator.free(out);
+    try expectEqual(0, out.len);
+
+    if (!llama.enabled) return;
+    var ll = try LlamaNomicEmbedTextV15F32.init();
+    defer ll.deinit();
+    var le = ll.embedder();
+    const llama_out = try le.embedBatch(std.testing.allocator, &.{});
+    defer std.testing.allocator.free(llama_out);
+    try expectEqual(0, llama_out.len);
+}
+
+test "embedBatch - LlamaNomicEmbedTextV15F32 matches embed" {
+    if (!llama.enabled) return error.SkipZigTest;
+
+    var ll = try LlamaNomicEmbedTextV15F32.init();
+    defer ll.deinit();
+    var e = ll.embedder();
+    try expectBatchMatchesSingles(&e, &batch_phrases);
+}
+
+test "embedBatch - LlamaNomicEmbedTextV15F32 all empty" {
+    if (!llama.enabled) return error.SkipZigTest;
+
+    var ll = try LlamaNomicEmbedTextV15F32.init();
+    defer ll.deinit();
+    var e = ll.embedder();
+    try expectBatchMatchesSingles(&e, &.{ "", "" });
 }
 
 const std = @import("std");
