@@ -45,6 +45,12 @@ const Options = struct {
     db: []const u8 = "wikitest-db",
     /// 0 means no limit.
     limit: usize = 0,
+    /// Shuffle the article list with this seed before applying `--limit`. Sorted order makes
+    /// a smaller limit a prefix of a larger one, which is good for reproducibility and bad for
+    /// realism: the alphabetically first few thousand Simple Wikipedia files are asteroid
+    /// stubs and disambiguation pages, so a prefix is not a corpus anyone would search. A seed
+    /// keeps the run reproducible while making the sample representative.
+    sample: ?u64 = null,
     progress: usize = 100,
     k: usize = 10,
     repeat: usize = 3,
@@ -80,7 +86,7 @@ fn runEmbed(allocator: std.mem.Allocator, opts: Options) !void {
     };
     defer corpus.close();
 
-    const names = try collectArticles(allocator, corpus, opts.limit);
+    const names = try collectArticles(allocator, corpus, opts.limit, opts.sample);
     defer {
         for (names) |n| allocator.free(n);
         allocator.free(names);
@@ -208,6 +214,12 @@ fn runSearch(allocator: std.mem.Allocator, opts: Options) !void {
             opts.repeat,
         },
     );
+    std.debug.print(
+        "note       'embed' is the one-off cost of turning the query text into a vector, on\n" ++
+            "           CoreML. 'search' is everything after that -- the code scan and the\n" ++
+            "           candidate reads -- which is the part the storage layer controls.\n\n",
+        .{},
+    );
 
     const buf = try allocator.alloc(dve.SearchResult, opts.k);
     defer allocator.free(buf);
@@ -215,24 +227,32 @@ fn runSearch(allocator: std.mem.Allocator, opts: Options) !void {
     defer allocator.free(samples);
 
     for (opts.queries) |query| {
+        // Embedded once and timed on its own. Folding it into the repeats would report ~20 ms
+        // of CoreML as though it were search, which is most of the number and none of the
+        // thing being measured.
+        var embed_timer = try std.time.Timer.start();
+        const query_vec = try db.embedQuery(query);
+        const embed_ns = embed_timer.read();
+
         var found: usize = 0;
         for (samples) |*sample| {
             var timer = try std.time.Timer.start();
-            found = if (opts.unique)
-                try db.uniqueSearch(query, buf)
-            else
-                try db.search(query, buf);
+            found = if (query_vec) |v| try db.rawVectorSearch(v, buf) else 0;
             sample.* = timer.read();
         }
         std.mem.sort(u64, samples, {}, std.sort.asc(u64));
 
-        std.debug.print("\"{s}\"\n  {d} results | min {D} | median {D} | max {D}\n", .{
-            query,
-            found,
-            samples[0],
-            samples[samples.len / 2],
-            samples[samples.len - 1],
-        });
+        std.debug.print(
+            "\"{s}\"\n  {d} results | embed {D} | search min {D} | median {D} | max {D}\n",
+            .{
+                query,
+                found,
+                embed_ns,
+                samples[0],
+                samples[samples.len / 2],
+                samples[samples.len - 1],
+            },
+        );
         for (buf[0..found]) |r| {
             std.debug.print("    {d:.4}  {s} [{d}..{d}]\n", .{
                 r.similarity,
@@ -285,7 +305,12 @@ fn runStat(allocator: std.mem.Allocator, opts: Options) !void {
 
 /// Collects up to `limit` filenames from `dir`, sorted, so that a smaller limit
 /// always yields a prefix of a larger one.
-fn collectArticles(allocator: std.mem.Allocator, dir: std.fs.Dir, limit: usize) ![][]u8 {
+fn collectArticles(
+    allocator: std.mem.Allocator,
+    dir: std.fs.Dir,
+    limit: usize,
+    sample: ?u64,
+) ![][]u8 {
     var names: std.ArrayList([]u8) = .{};
     errdefer {
         for (names.items) |n| allocator.free(n);
@@ -305,6 +330,12 @@ fn collectArticles(allocator: std.mem.Allocator, dir: std.fs.Dir, limit: usize) 
         }
     }.lessThan);
 
+    // Sorted first either way, so the shuffle starts from a filesystem-order-independent
+    // list and the same seed gives the same sample on any machine.
+    if (sample) |seed| {
+        var prng = std.Random.DefaultPrng.init(seed);
+        prng.random().shuffle([]u8, items);
+    }
     if (limit == 0 or limit >= items.len) return items;
 
     for (items[limit..]) |n| allocator.free(n);
@@ -449,6 +480,8 @@ fn parseArgs(allocator: std.mem.Allocator, args: [][:0]u8) !Options {
             opts.db = nextArg(args, &i);
         } else if (std.mem.eql(u8, arg, "--limit")) {
             opts.limit = try parseUsize(nextArg(args, &i));
+        } else if (std.mem.eql(u8, arg, "--sample")) {
+            opts.sample = try parseUsize(nextArg(args, &i));
         } else if (std.mem.eql(u8, arg, "--progress")) {
             opts.progress = try parseUsize(nextArg(args, &i));
             if (opts.progress == 0) fatal("--progress must be greater than 0", .{});
@@ -507,6 +540,8 @@ fn usage(code: u8) noreturn {
         \\  --corpus <dir>   article directory        (default: wikidata/md)
         \\  --db <dir>       database directory       (default: wikitest-db)
         \\  --limit <n>      max articles to ingest, 0 for all   (default: 0)
+        \\  --sample <seed>  shuffle articles with this seed before --limit, so the
+        \\                   sample is representative rather than the alphabetic prefix
         \\  --progress <n>   report every n articles  (default: 100)
         \\  --csv <path>     also write interval samples as CSV
         \\  --query <text>   query to run, repeatable (default: a built-in set)

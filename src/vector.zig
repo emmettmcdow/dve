@@ -78,6 +78,8 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
 
     return struct {
         const Self = @This();
+        /// The embedder's output form, which is what `rawVectorSearch` takes.
+        pub const Raw = RawVector;
         pub const VecStorage = vstore.VStore(VEC_SZ, STORED_VEC_TYPE);
         /// Stage one: a 1-bit code per vector, resident and scanned linearly. Keyed by the
         /// store's own slot number, which is the entire interface between the two -- neither
@@ -615,6 +617,21 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         fn debugSearchHeader(query: []const u8) void {
             if (!config.debug) return;
             std.debug.print("Checking similarity against '{s}':\n", .{query});
+        }
+
+        /// Turns query text into the vector `rawVectorSearch` takes, and nothing else.
+        ///
+        /// Split out so a caller can charge the embedder separately from the search it feeds.
+        /// On CoreML an embedding is ~20 ms against ~1 ms of search, so a benchmark that times
+        /// `search` end to end is reporting the model, not the index. Null for a query that
+        /// strips to nothing or that the embedder declines.
+        pub fn embedQuery(self: *Self, raw_query: []const u8) !?RawVector {
+            var arena = std.heap.ArenaAllocator.init(self.allocator);
+            defer arena.deinit();
+            const query = stripQuery(raw_query);
+            if (query.len == 0) return null;
+            const out = (try self.embedder.embed(arena.allocator(), query)) orelse return null;
+            return @field(out, @tagName(embedding_model)).*;
         }
 
         /// Searches the vector database with an already-embedded query vector. Behaves like
