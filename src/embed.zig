@@ -754,7 +754,7 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
             .ptr = self,
             .splitFn = split,
             .embedFn = embed,
-            .embedBatchFn = sequentialEmbedBatch(embed),
+            .embedBatchFn = embedBatch,
             .deinitFn = deinitFn,
             .id = ID,
             .threshold = THRESHOLD,
@@ -807,6 +807,77 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
         return EmbeddingModelOutput{
             .llama_nomic_embed_text_v1_5_f32 = @ptrCast(vec_buf.ptr),
         };
+    }
+
+    /// Hands every string to the bridge at once, which packs several sequences
+    /// into each llama_decode. For the short chunks dve embeds that is worth
+    /// several times the one-at-a-time path, whose cost is dominated by per-
+    /// decode dispatch overhead rather than by the model.
+    ///
+    /// The strings `embed` declines are filtered out here rather than sent and
+    /// rejected, because the bridge has no way to say "skipped" for one entry
+    /// of a batch. Their slots stay null, so the result still lines up with
+    /// `strs` and still matches what `embed` returns for each string alone.
+    fn embedBatch(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        strs: []const []const u8,
+    ) ![]?EmbeddingModelOutput {
+        _ = ptr;
+        const zone = tracy.beginZone(@src(), .{
+            .name = "embed.zig:LlamaNomicEmbedTextV15F32.embedBatch",
+        });
+        defer zone.end();
+
+        const outs = try allocator.alloc(?EmbeddingModelOutput, strs.len);
+        errdefer allocator.free(outs);
+        @memset(outs, null);
+        if (strs.len == 0) return outs;
+
+        // Three parallel arrays over the strings that survive filtering: the
+        // NUL-terminated copy the bridge reads, the buffer it writes, and the
+        // slot in `outs` each one came from.
+        const c_strs = try allocator.alloc([*:0]const u8, strs.len);
+        const bufs = try allocator.alloc([*]f32, strs.len);
+        const slots = try allocator.alloc(usize, strs.len);
+
+        const VecType = @Vector(VEC_SZ, VEC_TYPE);
+        var n: usize = 0;
+        for (strs, 0..) |str, i| {
+            if (str.len == 0) {
+                std.log.info("Skipping embed of zero-length string\n", .{});
+                continue;
+            }
+            if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
+                std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'\n", .{str});
+            }
+            // The bridge takes a C string; anything past MAX_CTX is truncated there.
+            c_strs[n] = (try allocator.dupeZ(u8, str)).ptr;
+            // Each vector is allocated on its own so it carries the alignment
+            // @Vector(VEC_SZ, VEC_TYPE) needs. One slab with a VEC_SZ stride
+            // would only be aligned at its start.
+            bufs[n] = (try allocator.alignedAlloc(
+                VEC_TYPE,
+                std.mem.Alignment.of(VecType),
+                VEC_SZ,
+            )).ptr;
+            slots[n] = i;
+            n += 1;
+        }
+        if (n == 0) return outs;
+
+        const written = try llama.embedBatch(bufs[0..n], VEC_SZ, c_strs[0..n]);
+        assert(written == VEC_SZ);
+
+        for (slots[0..n], bufs[0..n]) |slot, buf| {
+            // Storing the buffers as [*]f32 to hand them to the bridge drops the
+            // alignment from the type; the alignedAlloc above is what makes the
+            // @alignCast true.
+            outs[slot] = EmbeddingModelOutput{
+                .llama_nomic_embed_text_v1_5_f32 = @ptrCast(@alignCast(buf)),
+            };
+        }
+        return outs;
     }
 };
 
@@ -1364,7 +1435,16 @@ test "embed - LlamaNomicEmbedTextV15F32 solo" {
 }
 
 /// Checks `e.embedBatch(strs)` against `e.embed` run on each string alone.
-fn expectBatchMatchesSingles(e: *Embedder, strs: []const []const u8) !void {
+///
+/// `tolerance` is the largest per-component difference allowed. Backends whose
+/// batch is `sequentialEmbedBatch` make the identical calls either way and must
+/// match exactly, so they pass 0. A backend with a real batch does not: packing
+/// several sequences into one decode changes the shape of the matmuls, and the
+/// GPU's reductions come out in a different order. What must survive is the
+/// vector's direction, so the cosine is checked too -- sequences bleeding into
+/// each other through a shared decode would still be near-unit-length and would
+/// still pass a loose per-component bound, but would not stay parallel.
+fn expectBatchMatchesSingles(e: *Embedder, strs: []const []const u8, tolerance: f32) !void {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -1378,7 +1458,23 @@ fn expectBatchMatchesSingles(e: *Embedder, strs: []const []const u8) !void {
             continue;
         }
         try expectEqual(std.meta.activeTag(single_out.?), std.meta.activeTag(batch_out.?));
-        try expectEqualSlices(f32, single_out.?.slice(), batch_out.?.slice());
+
+        const single = single_out.?.slice();
+        const batched = batch_out.?.slice();
+        if (tolerance == 0) {
+            try expectEqualSlices(f32, single, batched);
+            continue;
+        }
+        try expectEqual(single.len, batched.len);
+        var dot: f64 = 0;
+        for (single, batched) |a, b| {
+            try std.testing.expectApproxEqAbs(a, b, tolerance);
+            dot += @as(f64, a) * @as(f64, b);
+        }
+        if (dot < 0.9999) {
+            std.debug.print("batch and single diverged for '{s}': cosine {d}\n", .{ str, dot });
+            return error.TestExpectedApproxEqAbs;
+        }
     }
 }
 
@@ -1396,14 +1492,14 @@ test "embedBatch - nlembed matches embed" {
     var nl = try NLEmbedder.init();
     defer nl.deinit();
     var e = nl.embedder();
-    try expectBatchMatchesSingles(&e, &batch_phrases);
+    try expectBatchMatchesSingles(&e, &batch_phrases, 0);
 }
 
 test "embedBatch - mpnetembed matches embed" {
     var mpnet = try MpnetEmbedder.init(.{});
     defer mpnet.deinit();
     var e = mpnet.embedder();
-    try expectBatchMatchesSingles(&e, &batch_phrases);
+    try expectBatchMatchesSingles(&e, &batch_phrases, 0);
 }
 
 test "embedBatch - empty batch" {
@@ -1423,13 +1519,18 @@ test "embedBatch - empty batch" {
     try expectEqual(0, llama_out.len);
 }
 
+/// Measured worst case over 3,037 real corpus sentences is 5.4e-4 per component
+/// at a cosine of 0.99999 (experiments/embedbench --verify). This bound is loose
+/// enough for that and far too tight for a batch that mixed sequences up.
+const LLAMA_BATCH_TOLERANCE: f32 = 2e-3;
+
 test "embedBatch - LlamaNomicEmbedTextV15F32 matches embed" {
     if (!llama.enabled) return error.SkipZigTest;
 
     var ll = try LlamaNomicEmbedTextV15F32.init();
     defer ll.deinit();
     var e = ll.embedder();
-    try expectBatchMatchesSingles(&e, &batch_phrases);
+    try expectBatchMatchesSingles(&e, &batch_phrases, LLAMA_BATCH_TOLERANCE);
 }
 
 test "embedBatch - LlamaNomicEmbedTextV15F32 all empty" {
@@ -1438,7 +1539,54 @@ test "embedBatch - LlamaNomicEmbedTextV15F32 all empty" {
     var ll = try LlamaNomicEmbedTextV15F32.init();
     defer ll.deinit();
     var e = ll.embedder();
-    try expectBatchMatchesSingles(&e, &.{ "", "" });
+    try expectBatchMatchesSingles(&e, &.{ "", "" }, LLAMA_BATCH_TOLERANCE);
+}
+
+// The bridge packs at most DVE_MAX_SEQ (128) sequences into one llama_decode and
+// then starts another, so a batch larger than that exercises the loop that cuts
+// one decode from the next. Every string here is distinct, which makes this an
+// ordering check as much as a value check: a packing bug that misfiled a vector
+// by one shows up as a mismatch rather than as a plausible-looking wrong answer.
+test "embedBatch - LlamaNomicEmbedTextV15F32 spans several decodes" {
+    if (!llama.enabled) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const n = 300;
+    const strs = try arena.allocator().alloc([]const u8, n);
+    for (strs, 0..) |*str, i| {
+        str.* = try std.fmt.allocPrint(arena.allocator(), "sentence number {d} about badgers", .{i});
+    }
+
+    var ll = try LlamaNomicEmbedTextV15F32.init();
+    defer ll.deinit();
+    var e = ll.embedder();
+    try expectBatchMatchesSingles(&e, strs, LLAMA_BATCH_TOLERANCE);
+}
+
+// A batch is cut when either limit is hit, and the token budget is the one a
+// document of long paragraphs reaches first. Each of these tokenizes to well
+// over a hundred tokens, so the batch is split by tokens rather than by count.
+test "embedBatch - LlamaNomicEmbedTextV15F32 splits on the token budget" {
+    if (!llama.enabled) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const long = "the quick brown fox jumps over the lazy dog " ** 40;
+    const strs = try allocator.alloc([]const u8, 40);
+    for (strs, 0..) |*str, i| {
+        // Trailing space trimmed: embed warns on non-alphanumeric ends, and 40
+        // copies of that warning bury the rest of the test output.
+        str.* = try std.fmt.allocPrint(allocator, "{d} {s}", .{ i, long[0 .. long.len - 1] });
+    }
+
+    var ll = try LlamaNomicEmbedTextV15F32.init();
+    defer ll.deinit();
+    var e = ll.embedder();
+    try expectBatchMatchesSingles(&e, strs, LLAMA_BATCH_TOLERANCE);
 }
 
 const std = @import("std");

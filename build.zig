@@ -453,6 +453,30 @@ pub fn build(b: *std.Build) !void {
         codesbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
+    ///////////////////
+    // Embedbench    //
+    ///////////////////
+    // How fast each embedding backend turns real Wikipedia text into vectors, and whether
+    // batching per document beats one call per sentence. Storage is not involved.
+    //   zig build embedbench -Dllama -Doptimize=ReleaseFast
+    //   ./zig-out/bin/embedbench --model llama --docs 200
+    const embedbench_step = b.step("embedbench", "Build the embedding throughput benchmark");
+    {
+        const exe = b.addExecutable(.{
+            .name = "embedbench",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("experiments/embedbench/main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addImport("dve", dve_mod);
+        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
+        // The CoreML backend resolves its model bundle relative to the executable.
+        for (addModelInstalls(b, coreml_models)) |s| embedbench_step.dependOn(s);
+        embedbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+    }
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(test_vec_storage);
     test_step.dependOn(test_pfile);

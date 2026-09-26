@@ -33,6 +33,21 @@ extern "C" {
 // suppressed unless DVE_LLAMA_VERBOSE is set in the environment.
 int dve_embed(float *out, size_t out_len, const char *text);
 
+// Embeds `n_texts` texts in one go, packing several sequences into each
+// llama_decode. `outs[i]` receives text i's embedding and must have room for
+// at least the model's embedding dimension, which `out_len` states once for
+// all of them; results are L2-normalized exactly as dve_embed's are.
+//
+// Returns the number of floats written per text, or one of the DVE_EMBED_ERR_*
+// codes above. An error abandons the whole call: some of `outs` may have been
+// written, and none of it should be used. Embedding N texts this way gives the
+// same vectors as N dve_embed calls -- dve_embed is itself a batch of one --
+// but is several times faster for short texts, where a one-sequence decode
+// spends most of its time on dispatch overhead rather than on the model.
+//
+// Thread-safe on the same terms as dve_embed: calls are serialized internally.
+int dve_embed_batch(float *const *outs, size_t out_len, const char *const *texts, size_t n_texts);
+
 #ifdef __cplusplus
 }
 #endif
