@@ -85,3 +85,92 @@ chunks with metadata trailers and a crc did what `vec_storage2.md` says they do.
 - **Scale.** 247k vectors against a ~35M target, and the embedder is why.
 - **Result quality.** Recall is agreement with an exhaustive scan, not relevance. A random
   2,000-article sample often has no good answer to a given question, and the top hits show it.
+
+---
+
+# 1.18M vectors, llama backend [2026-09-28]
+
+Apple M5, `-Dllama -Doptimize=ReleaseFast`. 4.8x the corpus above, and a different embedder:
+`wikitest --model llama` selects the llama.cpp / nomic-embed-text-v1.5 backend, which since
+the native batch runs at 772 chunks/sec standalone.
+
+Raw output in `raw/wikitest-llama-20260928-2013.txt`.
+
+## Search holds up
+
+| | |
+|---|---|
+| vectors | **1,178,132** over 9,476 articles |
+| store | 4.5 GB on disk |
+| codes | 56.7 MB |
+| open | 416 ms with the index on disk |
+| query embed | 12-16 ms |
+| **search** | **2.2-6.9 ms** median, k=10 |
+| exhaustive scan | 710 ms |
+| **speedup** | **~250-300x** |
+| peak RSS | **653 MB**, of which 547 MB is the llama model |
+| recall@10 | 0.950 over 6 queries |
+
+Search is still single-digit milliseconds at 4.8x the vectors, and the resident cost of the
+index is 57 MB against a 4.5 GB store. Query embedding is again several times the search.
+
+Recall is 0.950 here against 0.987 above, but over only 6 queries on a different model, and
+one query carries it (`photosynthesis in plants` at 0.900 while three others are 1.000). Not
+enough queries to call it a regression.
+
+## Ingest is quadratic in corpus size
+
+This is the finding. Per-document ingest cost grows linearly with the store, so total ingest
+is O(n^2):
+
+| articles | vectors | store | vec/s | s/doc |
+|---:|---:|---:|---:|---:|
+| 2,000 | 126,732 | 0.50 GB | 1,277 | 0.102 |
+| 3,000 | 245,027 | 0.96 GB | 897 | 0.132 |
+| 4,000 | 363,369 | 1.4 GB | 375 | 0.298 |
+| 5,000 | 476,446 | 1.8 GB | 280 | 0.428 |
+| 7,000 | 742,374 | 2.8 GB | 216 | 0.730 |
+| 9,000 | 994,364 | 3.8 GB | 164 | 0.650 |
+
+**7.8x slower per document** between 2,000 and 9,000 articles. The embedder is not the cause;
+it is constant at 772 chunks/sec.
+
+`replaceVectors` (vector.zig) calls `vec_storage.vecsForDoc` for every document, and
+`vecsForDocLocked` (vstore.zig) walks every chunk in the store reading metadata trailers. Each
+document therefore scans the whole database looking for rows to replace -- including documents
+that have never been seen and cannot have any.
+
+Subtracting embed time (vectors-per-doc / 772) from each interval leaves 0.15 s at 1.4 GB,
+0.42 s at 2.3 GB and 0.49 s at 3.8 GB: **store_bytes / ~6 GB/s**, a page-cached full scan per
+document. The arithmetic matches the mechanism.
+
+At the full 36.9M-chunk corpus (~151 GB) that is ~25 s per document. Wikipedia would not
+finish.
+
+This predates the llama work; it has been in `replaceVectors` since the v2 cutover. Native
+batching is what exposed it. At the old 11.5 ms/chunk, embedding cost ~1.4 s/doc and buried a
+0.5 s scan; at 1.3 ms/chunk the scan is 75% of ingest.
+
+The likely fix is cheap: `note_id_map.getId(path) == null` means the document is new, so there
+are no old rows and the scan can be skipped entirely -- which covers all of bulk ingest. One
+thing to check first: that scan currently also reaps rows whose `doc_id` was reused after a
+lost `.dve_ids`, so skipping it changes behaviour in that already-broken state, where
+`validate()` and `pruneOrphanedPaths` are the right answers.
+
+## Two harness bugs this run found
+
+**`--csv` corrupted the stack.** `Csv.open` built the struct in a local, pointed `writer` at
+that local's `buf`, and returned it by value. The writer then addressed a dead stack frame, so
+every row went into reclaimed memory; after 10,500 articles the run took a SIGSEGV inside
+float formatting (`fmt.float.binaryToDecimal`). The empty CSV and the crash were the same bug.
+`Csv.init` now initializes in place.
+
+The store came through it clean: **1,178,132 live / 1,178,132 slots**, no holes. The producer
+was exactly 1,024 documents ahead of the embedder when it died, which is the work queue's
+capacity, so those were lost -- 10,500 submitted, 9,476 durable. The codes index was not
+written, and the next open rebuilt it and saved it without being asked.
+
+**One hour was sized on a lie.** The run was sized at 15,000 articles from the 500-article
+rate of 4.5 docs/s. Because ingest is quadratic, that rate does not survive contact with a
+larger store, and the run was at 2.4 docs/s cumulative when it died. Size ingest runs off the
+interval rate at the target scale, not a small-corpus extrapolation.

@@ -4,7 +4,9 @@ models/*/
 .DS_Store
 TODO.md
 *.db
-.dve_ids
+*.db.codes
+.dve_ids*
+wikitest-db*/
 .build/
 *.tar*
 *.zip

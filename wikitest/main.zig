@@ -23,8 +23,22 @@ const dve = @import("dve");
 pub const std_options: std.Options = .{ .log_level = .warn };
 
 /// Every model is compiled into the library; the consumer names the one it wants.
-const model: dve.embed.EmbeddingModel = .mpnet_embedding;
-const VectorEngine = dve.VectorEngine(model);
+/// Named on the command line here, because which backend embeds the corpus changes
+/// ingest throughput by more than an order of magnitude and the harness exists to
+/// measure that. Each model writes its own database file, so runs do not collide.
+const Model = enum {
+    mpnet,
+    nl,
+    llama,
+
+    fn id(self: Model) dve.embed.EmbeddingModel {
+        return switch (self) {
+            .mpnet => .mpnet_embedding,
+            .nl => .apple_nlembedding,
+            .llama => .llama_nomic_embed_text_v1_5_f32,
+        };
+    }
+};
 
 const MAX_ARTICLE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -41,6 +55,7 @@ const Mode = enum { embed, search, stat };
 
 const Options = struct {
     mode: Mode,
+    model: Model = .mpnet,
     corpus: []const u8 = "wikidata/md",
     db: []const u8 = "wikitest-db",
     /// 0 means no limit.
@@ -74,14 +89,28 @@ pub fn main() !void {
     const opts = try parseArgs(allocator, args);
     defer if (opts.queries.ptr != &default_queries) allocator.free(opts.queries);
 
-    switch (opts.mode) {
-        .embed => try runEmbed(allocator, opts),
-        .search => try runSearch(allocator, opts),
-        .stat => try runStat(allocator, opts),
+    // `inline else` makes `m` comptime, which is what VectorEngine needs. It also
+    // compiles one copy of the harness per model; there are three.
+    switch (opts.model) {
+        inline else => |m| {
+            const R = Runner(m.id());
+            switch (opts.mode) {
+                .embed => try R.runEmbed(allocator, opts),
+                .search => try R.runSearch(allocator, opts),
+                .stat => try R.runStat(allocator, opts),
+            }
+        },
     }
 }
 
 // ******************************************************************************************* Modes
+
+/// The three modes, bound to one embedding model. Everything below the Setup banner is
+/// model-independent and stays at file scope.
+fn Runner(comptime embedding_model: dve.embed.EmbeddingModel) type {
+    return struct {
+        const model = embedding_model;
+        const VectorEngine = dve.VectorEngine(embedding_model);
 
 fn runEmbed(allocator: std.mem.Allocator, opts: Options) !void {
     var corpus = std.fs.cwd().openDir(opts.corpus, .{ .iterate = true }) catch |err| {
@@ -100,7 +129,8 @@ fn runEmbed(allocator: std.mem.Allocator, opts: Options) !void {
     var db_dir = try std.fs.cwd().makeOpenPath(opts.db, .{ .iterate = true });
     defer db_dir.close();
 
-    var csv = try Csv.open(opts.csv);
+    var csv: Csv = undefined;
+    try csv.init(opts.csv);
     defer csv.close();
 
     std.debug.print(
@@ -345,6 +375,9 @@ fn runStat(allocator: std.mem.Allocator, opts: Options) !void {
     std.debug.print("  {s:<28} {f}\n", .{ "total", fmtBytes(total) });
 }
 
+    };
+}
+
 // ******************************************************************************************* Setup
 
 /// Collects up to `limit` filenames from `dir`, sorted, so that a smaller limit
@@ -428,15 +461,20 @@ const Csv = struct {
     writer: std.fs.File.Writer = undefined,
     buf: [4096]u8 = undefined,
 
-    fn open(path: ?[]const u8) !Csv {
-        const p = path orelse return .{};
-        var self = Csv{ .file = try std.fs.cwd().createFile(p, .{}) };
+    /// Initializes in place, and must: `writer` holds a pointer into `self.buf`, so a
+    /// Csv cannot be moved after this returns. Building one in a local and handing it
+    /// back by value -- which this did -- leaves the writer addressing the dead local's
+    /// buffer. Every row then lands in reclaimed stack, which is why the file came out
+    /// empty and why a long run eventually took a SIGSEGV inside float formatting.
+    fn init(self: *Csv, path: ?[]const u8) !void {
+        self.* = .{};
+        const p = path orelse return;
+        self.file = try std.fs.cwd().createFile(p, .{});
         self.writer = self.file.?.writer(&self.buf);
         try self.writer.interface.writeAll(
             "articles,vectors,total_ns,interval_ns,interval_articles," ++
                 "interval_vectors,docs_per_s_interval,docs_per_s_avg,rss_bytes,db_bytes\n",
         );
-        return self;
     }
 
     fn write(self: *Csv, s: Sample) !void {
@@ -524,6 +562,9 @@ fn parseArgs(allocator: std.mem.Allocator, args: [][:0]u8) !Options {
             opts.db = nextArg(args, &i);
         } else if (std.mem.eql(u8, arg, "--limit")) {
             opts.limit = try parseUsize(nextArg(args, &i));
+        } else if (std.mem.eql(u8, arg, "--model")) {
+            opts.model = std.meta.stringToEnum(Model, nextArg(args, &i)) orelse
+                fatal("--model must be mpnet, nl or llama", .{});
         } else if (std.mem.eql(u8, arg, "--verify")) {
             opts.verify = true;
         } else if (std.mem.eql(u8, arg, "--sample")) {
@@ -583,6 +624,7 @@ fn usage(code: u8) noreturn {
         \\  stat      report counts and on-disk size for an existing database
         \\
         \\options:
+        \\  --model <m>      mpnet | nl | llama       (default: mpnet)
         \\  --corpus <dir>   article directory        (default: wikidata/md)
         \\  --db <dir>       database directory       (default: wikitest-db)
         \\  --limit <n>      max articles to ingest, 0 for all   (default: 0)
