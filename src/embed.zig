@@ -124,6 +124,35 @@ fn sequentialEmbedBatch(comptime embedOne: EmbedFn) EmbedBatchFn {
 }
 
 //**************************************************************************************** Embedder
+/// Compiled models already loaded in this process, keyed by the path they were resolved
+/// from.
+///
+/// `MLModel.compileModelAtURL` writes the compiled model to a *temporary* directory, and
+/// Apple's contract is that the caller moves it if it needs to persist -- the system is free
+/// to reclaim it. This code never moved it, and compiled afresh on every `init`.
+///
+/// That is what made the mpnet tests flaky. Repeatedly loading the model in one process
+/// aborted inside MetalPerformanceShadersGraph with `shape.count = 0 != strides.count = 3`,
+/// a model whose output descriptions came back with no shape at all. Measured: 0 failures in
+/// 28 runs loading a precompiled `.mlmodelc` against 6 in 40 runs compiling each time, with
+/// the compile step as the only difference. Concurrency was not involved -- a purely
+/// sequential reload reproduces it, and 200 concurrent predictions through one model do not.
+///
+/// Compiling once per process removes the repeated compile entirely, and makes every `init`
+/// after the first nearly free, which the test suite feels more than anything else.
+///
+/// Entries are retained for the life of the process and never released. Tearing CoreML
+/// objects down at exit is its own hazard -- see the note in `llama_bridge.c` about ggml's
+/// Metal teardown asserting against static destructors -- and one retained model is a far
+/// cheaper problem than that.
+const ModelCache = struct {
+    /// Guards the table below.
+    var mutex: Mutex = .{};
+    var by_path: ?std.StringHashMap(Object) = null;
+    /// Held across `MLModel` prediction. Process-wide because the models are.
+    var predict_mutex: Mutex = .{};
+};
+
 pub const MpnetEmbedder = struct {
     model: Object,
     tokenizer: tokenizer_mod.WordPieceTokenizer,
@@ -157,6 +186,26 @@ pub const MpnetEmbedder = struct {
         absolute_model_path: ?[]const u8 = null,
         /// If set, bypasses bundle/exe-relative resolution and uses this path directly.
         absolute_tokenizer_path: ?[]const u8 = null,
+        /// Which engines CoreML may schedule the model on.
+        ///
+        /// Defaults to `cpu_and_neural_engine` rather than `all` because `all` offers the GPU,
+        /// and the GPU backend aborts the process: roughly one run in eight,
+        /// MetalPerformanceShadersGraph failed `shape.count = 0 != strides.count = 3` while
+        /// loading output descriptions. Measured 0 failures in 40 runs on this setting against
+        /// 5 in 62 on `all`.
+        ///
+        /// It costs throughput -- 26.3 chunks/sec against 50.2 -- and changes nothing
+        /// measurable about quality, which scores identically on every group in
+        /// src/benchmark.zig. Pass `all` to take the speed and the crash.
+        compute_units: ComputeUnits = .cpu_and_neural_engine,
+    };
+
+    /// MLComputeUnits, whose values land in a CoreML API and so are fixed.
+    pub const ComputeUnits = enum(i64) {
+        cpu_only = 0,
+        cpu_and_gpu = 1,
+        all = 2,
+        cpu_and_neural_engine = 3,
     };
 
     // The calling Swift thread wraps this in an AutoreleasePool, so we do not need to release
@@ -207,15 +256,8 @@ pub const MpnetEmbedder = struct {
             std.log.err("Failed to get NSURL class\n", .{});
             return error.ObjCClassNotFound;
         };
-        const MLModel = objc.getClass("MLModel") orelse {
-            std.log.err("Failed to get MLModel class\n", .{});
-            return error.ObjCClassNotFound;
-        };
-
         const fromUTF8 = objc.Sel.registerName("stringWithUTF8String:");
         const fileURLWithPath = objc.Sel.registerName("fileURLWithPath:");
-        const compileModelAtURL = objc.Sel.registerName("compileModelAtURL:error:");
-        const modelWithContentsOfURL = objc.Sel.registerName("modelWithContentsOfURL:error:");
 
         const full_path: [:0]const u8 = if (opts.absolute_model_path) |p|
             tokenizer_alloc.allocator().dupeZ(u8, p) catch return error.PathAllocFailed
@@ -236,7 +278,44 @@ pub const MpnetEmbedder = struct {
             return error.NSURLCreateFailed;
         }
 
-        const is_precompiled = std.mem.endsWith(u8, std.mem.sliceTo(full_path, 0), ".mlmodelc");
+        const resolved = std.mem.sliceTo(full_path, 0);
+        const is_precompiled = std.mem.endsWith(u8, resolved, ".mlmodelc");
+
+        const model = try acquireModel(resolved, model_url, is_precompiled, opts.compute_units);
+        errdefer model.release();
+
+        return .{
+            .model = model,
+            .tokenizer = tok,
+            .tokenizer_alloc = tokenizer_alloc,
+            .loaded_model_path = full_path,
+            .loaded_tokenizer_path = tokenizer_path,
+        };
+    }
+
+    /// Returns the model for `path`, with one retain transferred to the caller. Compiles and
+    /// loads it on the first call for that path and never again -- see `ModelCache`.
+    fn acquireModel(
+        path: []const u8,
+        model_url: Object,
+        is_precompiled: bool,
+        compute_units: ComputeUnits,
+    ) !Object {
+        ModelCache.mutex.lock();
+        defer ModelCache.mutex.unlock();
+
+        if (ModelCache.by_path == null) {
+            ModelCache.by_path = std.StringHashMap(Object).init(std.heap.page_allocator);
+        }
+        // Keyed by path alone: the first `compute_units` asked for wins for the life of the
+        // process. Nothing here loads one model two ways, and making the key a pair would
+        // invite doing it.
+        if (ModelCache.by_path.?.get(path)) |cached| return cached.retain();
+
+        const MLModel = objc.getClass("MLModel") orelse return error.ObjCClassNotFound;
+        const compileModelAtURL = objc.Sel.registerName("compileModelAtURL:error:");
+        const modelWithContentsOfURL =
+            objc.Sel.registerName("modelWithContentsOfURL:configuration:error:");
 
         const load_url = if (is_precompiled) model_url else compiled: {
             var compile_error: ?*anyopaque = null;
@@ -258,12 +337,21 @@ pub const MpnetEmbedder = struct {
             break :compiled compiled_url;
         };
 
+        const MLModelConfiguration =
+            objc.getClass("MLModelConfiguration") orelse return error.ObjCClassNotFound;
+        const config = MLModelConfiguration.msgSend(Object, objc.Sel.registerName("alloc"), .{})
+            .msgSend(Object, objc.Sel.registerName("init"), .{});
+        defer config.release();
+        config.msgSend(void, objc.Sel.registerName("setComputeUnits:"), .{
+            @intFromEnum(compute_units),
+        });
+
         var load_error: ?*anyopaque = null;
         const model = MLModel.msgSend(Object, modelWithContentsOfURL, .{
             load_url,
+            config,
             &load_error,
         });
-        errdefer model.release();
         if (load_error) |err_ptr| {
             const err = Object{ .value = @intFromPtr(err_ptr) };
             const desc_sel = objc.Sel.registerName("localizedDescription");
@@ -276,13 +364,12 @@ pub const MpnetEmbedder = struct {
             return error.ModelLoadFailed;
         }
 
-        return .{
-            .model = model.retain(),
-            .tokenizer = tok,
-            .tokenizer_alloc = tokenizer_alloc,
-            .loaded_model_path = full_path,
-            .loaded_tokenizer_path = tokenizer_path,
-        };
+        // One retain for the cache and one for the caller; the autoreleased original belongs
+        // to whatever pool is current.
+        const key = try std.heap.page_allocator.dupe(u8, path);
+        errdefer std.heap.page_allocator.free(key);
+        try ModelCache.by_path.?.put(key, model.retain());
+        return model.retain();
     }
 
     pub fn init_self(self: *MpnetEmbedder, opts: InitOptions) !void {
@@ -344,6 +431,15 @@ pub const MpnetEmbedder = struct {
 
         const token_ids = try self.tokenizer.tokenize(allocator, str);
         defer allocator.free(token_ids);
+
+        // Serializes prediction, as NLEmbedder has always done. The engine embeds documents
+        // on its worker thread while a search embeds the query on the caller's, through one
+        // shared Embedder, so concurrent prediction is the normal case rather than an edge
+        // one. The lock lives with the model and not the instance because `ModelCache` hands
+        // every MpnetEmbedder in a process the same MLModel -- a per-instance lock would
+        // guard nothing.
+        ModelCache.predict_mutex.lock();
+        defer ModelCache.predict_mutex.unlock();
 
         const MODEL_SEQ_LEN: usize = 128;
         const seq_len: usize = @min(token_ids.len, MODEL_SEQ_LEN);
@@ -1349,6 +1445,32 @@ fn threadSafetyTest(e: *Embedder) !void {
     }
     barrier.set();
     for (&threads) |*t| t.join();
+}
+
+// Reloading the model used to abort inside MetalPerformanceShadersGraph about one run in
+// eight, somewhere in whichever mpnet test happened to be running:
+//
+//     MPSGraphTensorData.mm:223: failed assertion `shape.count = 0 != strides.count = 3'
+//
+// `MLModel.compileModelAtURL` writes its output to a temporary directory the system may
+// reclaim, and `init` compiled afresh every time and never moved it. Loading a precompiled
+// `.mlmodelc` instead never failed in 28 runs, against 6 failures in 40 runs that compiled,
+// which is what pinned it to the compile step; concurrency turned out to be irrelevant.
+//
+// `ModelCache` compiles once per process, so this is now the cheap test it looks like. If
+// per-init compilation ever comes back, this is where it will show up -- and it will show up
+// as an abort rather than a failure, so a flake here means that, not a bad assertion.
+test "embed - mpnetembed survives repeated reload" {
+    for (0..40) |_| {
+        var mpnet = try MpnetEmbedder.init(.{});
+        defer mpnet.deinit();
+        var e = mpnet.embedder();
+
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        const out = try e.embed(arena.allocator(), "Hello world");
+        try std.testing.expect(out != null);
+    }
 }
 
 test "embed - output is L2-normalized (mpnet)" {
