@@ -3,7 +3,7 @@ pub const NoteID = u64;
 // here index that database specifically, so sharing one manifest between an unquantized
 // and a quantized build would let `pruneOrphanedPaths` drop paths that only the other
 // build still has vectors for.
-const MANIFEST_FILENAME = ".dve_ids" ++ db_suffix;
+pub const MANIFEST_FILENAME = ".dve_ids" ++ db_suffix;
 const MANIFEST_VERSION: u32 = 1;
 
 pub const Error = error{
@@ -15,6 +15,10 @@ pub const NoteIdMap = struct {
     path_to_id: std.StringHashMap(NoteID),
     id_to_path: std.AutoHashMap(NoteID, []u8),
     next_id: NoteID,
+    /// False when there was no manifest to load. A populated store with no manifest is not a
+    /// fresh database -- it is one whose record of what exists has gone missing -- and the
+    /// caller has to reconcile rather than start handing out ids from 1 again.
+    manifest_present: bool,
     allocator: std.mem.Allocator,
     basedir: std.fs.Dir,
     mutex: std.Thread.Mutex,
@@ -26,13 +30,14 @@ pub const NoteIdMap = struct {
             .path_to_id = std.StringHashMap(NoteID).init(allocator),
             .id_to_path = std.AutoHashMap(NoteID, []u8).init(allocator),
             .next_id = 1,
+            .manifest_present = true,
             .allocator = allocator,
             .basedir = basedir,
             .mutex = .{},
         };
 
         self.load() catch |err| switch (err) {
-            error.FileNotFound => {},
+            error.FileNotFound => self.manifest_present = false,
             else => return err,
         };
 
@@ -49,12 +54,23 @@ pub const NoteIdMap = struct {
     }
 
     pub fn getOrCreateId(self: *Self, path: []const u8) !NoteID {
+        if (self.getId(path)) |id| return id;
+        return self.createId(path);
+    }
+
+    /// Assigns `path` a fresh id, never an existing one, and persists the mapping before
+    /// returning. Callers that need to know whether a path is new -- which is most of them,
+    /// because a new path cannot have vectors already -- should ask `getId` first and call
+    /// this only when it says null, rather than using `getOrCreateId` and losing the answer.
+    ///
+    /// The id is durable before this returns, and therefore before any vector can be tagged
+    /// with it. That ordering is what makes `next_id` greater than every doc_id in the store,
+    /// which is in turn what lets a caller treat "no path" as "no vectors".
+    pub fn createId(self: *Self, path: []const u8) !NoteID {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        if (self.path_to_id.get(path)) |id| {
-            return id;
-        }
+        if (self.path_to_id.get(path)) |id| return id;
 
         const id = self.next_id;
         self.next_id += 1;
@@ -125,6 +141,36 @@ pub const NoteIdMap = struct {
         try self.save();
     }
 
+    /// Raises `next_id` past `id` if it is not already, so a later `createId` cannot hand out
+    /// an id some vector is already tagged with.
+    ///
+    /// The caller learns `id` by walking the store, which is the only way to know it when the
+    /// manifest has been lost or rolled back. Returns true if anything moved.
+    pub fn ensureNextIdAbove(self: *Self, id: NoteID) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.next_id > id) return false;
+        self.next_id = id + 1;
+        try self.save();
+        return true;
+    }
+
+    /// Every id the manifest currently names.
+    ///
+    /// Deliberately does not take the lock: it exists for reconciliation at open, before any
+    /// other thread can see the map, and the caller must not mutate while iterating.
+    pub fn idIteratorUnlocked(self: *Self) std.AutoHashMap(NoteID, []u8).KeyIterator {
+        return self.id_to_path.keyIterator();
+    }
+
+    /// The id the next `createId` will hand out. Greater than every doc_id in the store, as
+    /// long as nothing has torn.
+    pub fn nextId(self: *Self) NoteID {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.next_id;
+    }
+
     pub fn count(self: *Self) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -187,10 +233,18 @@ pub const NoteIdMap = struct {
         }
 
         try writer.interface.flush();
-        try file.sync();
+        // F_FULLFSYNC, not std.fs.File.sync's plain fsync: this file decides what exists, so
+        // it should not be less durable than the store it governs, which has always used
+        // pfile.
+        try pfile.syncFd(file.handle);
         file.close();
 
         try self.basedir.rename(tmp_name, MANIFEST_FILENAME);
+        // The rename itself has to be committed, or a crash can revert the manifest to its
+        // previous contents while the store keeps the rows the newer version described --
+        // which is the one direction of tearing that produces wrong answers rather than
+        // missing ones, because `next_id` goes backwards with it.
+        try pfile.syncFd(self.basedir.fd);
     }
 
     pub fn pruneOrphanedPaths(self: *Self, basedir: std.fs.Dir) !void {
@@ -439,6 +493,68 @@ test "thread safety: concurrent access across full interface" {
     }
 }
 
+test "manifest_present distinguishes a fresh map from a lost one" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    {
+        var fresh = try NoteIdMap.init(testing_allocator, tmpD.dir);
+        defer fresh.deinit();
+        // Nothing on disk yet, which is a new database rather than a damaged one.
+        try expect(!fresh.manifest_present);
+        _ = try fresh.getOrCreateId("note.md");
+    }
+
+    var reopened = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    defer reopened.deinit();
+    try expect(reopened.manifest_present);
+
+    try tmpD.dir.deleteFile(MANIFEST_FILENAME);
+    var lost = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    defer lost.deinit();
+    // Identical in-memory state to the fresh map above, and the caller cannot tell them
+    // apart without this flag -- but one of them is sitting next to a store full of
+    // vectors whose ids it no longer knows about.
+    try expect(!lost.manifest_present);
+    try expectEqual(1, lost.next_id);
+}
+
+test "ensureNextIdAbove stops ids being handed out twice" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    defer map.deinit();
+
+    // The shape of a lost manifest: the counter starts over while the store still holds
+    // rows tagged 1 through 9.
+    try expect(try map.ensureNextIdAbove(9));
+    try expectEqual(10, map.next_id);
+    try expectEqual(10, try map.createId("next.md"));
+
+    // Idempotent, and never walks backwards -- a stale high-water mark from an earlier
+    // reconcile must not undo ids handed out since.
+    try expect(!try map.ensureNextIdAbove(9));
+    try expect(!try map.ensureNextIdAbove(3));
+    try expectEqual(11, map.next_id);
+}
+
+test "ensureNextIdAbove survives a reopen" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    {
+        var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+        defer map.deinit();
+        _ = try map.ensureNextIdAbove(500);
+    }
+
+    // The raised counter has to be durable, or the next open reuses the ids all over again.
+    var reopened = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    defer reopened.deinit();
+    try expectEqual(501, reopened.next_id);
+}
+
 test "pruneOrphanedPaths removes missing files" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
@@ -462,6 +578,7 @@ test "pruneOrphanedPaths removes missing files" {
 
 const db_suffix = @import("vec_util.zig").db_suffix;
 const std = @import("std");
+const pfile = @import("pfile.zig");
 const tracy = @import("tracy");
 
 fn readIntLE(reader: *std.fs.File.Reader, comptime T: type) !T {

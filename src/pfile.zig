@@ -299,20 +299,31 @@ pub const File = struct {
     /// is the request that actually waits. It is not supported on every filesystem -- network
     /// mounts in particular -- so a failure falls back to plain fsync rather than giving up.
     pub fn sync(self: File) SyncError!void {
-        if (is_darwin) {
-            if (c.fcntl(self.fd, F_FULLFSYNC, @as(c_int, 0)) != -1) return;
-        }
-        while (true) {
-            if (c.fsync(self.fd) == 0) return;
-            switch (errno()) {
-                E.INTR => continue,
-                E.IO => return error.InputOutput,
-                E.BADF => return error.BadFileDescriptor,
-                else => |e| return unexpected("fsync", e),
-            }
-        }
+        return syncFd(self.fd);
     }
 };
+
+/// `File.sync` for a descriptor this module does not own, so a caller holding a `std.fs.File`
+/// or a `std.fs.Dir` can get the same durability without handing over the fd's lifetime.
+///
+/// Directories are the reason this is public. A rename is only as durable as the directory
+/// that records it: the renamed file's own `sync` says nothing about whether the new name
+/// survived, so a crash can leave the old name pointing at the old contents. Syncing the
+/// containing directory afterwards is what commits the swap.
+pub fn syncFd(fd: c_int) SyncError!void {
+    if (is_darwin) {
+        if (c.fcntl(fd, F_FULLFSYNC, @as(c_int, 0)) != -1) return;
+    }
+    while (true) {
+        if (c.fsync(fd) == 0) return;
+        switch (errno()) {
+            E.INTR => continue,
+            E.IO => return error.InputOutput,
+            E.BADF => return error.BadFileDescriptor,
+            else => |e| return unexpected("fsync", e),
+        }
+    }
+}
 
 // ****************************************************************************************** Tests
 const tmpDir = std.testing.tmpDir;

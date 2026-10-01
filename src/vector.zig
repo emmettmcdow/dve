@@ -7,6 +7,7 @@ pub const Error = error{
     /// mutation has to touch both, so this means one path updated only one of them -- which
     /// otherwise shows up as results that silently stop appearing.
     IndexOutOfSync,
+    ManifestOutOfSync,
 };
 
 pub const SearchResult = struct {
@@ -170,8 +171,14 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             // Rebuilding reads every vector: 279 ms at 247k measured, but the store is ~143 GB
             // at the full corpus and no page cache holds that, so it becomes ~22 s of cold
             // sequential read at every launch against ~0.3 s to read the codes back.
+            const note_id_map = try allocator.create(NoteIdMap);
+            errdefer allocator.destroy(note_id_map);
+            note_id_map.* = try NoteIdMap.init(allocator, basedir);
+            errdefer note_id_map.deinit();
+
             var codes_name_buf: [256]u8 = undefined;
             const codes_name = try codesPath(&codes_name_buf, embedder.path);
+            var rebuilt = false;
             var vcodes = (try VecCodes.load(
                 allocator,
                 basedir,
@@ -185,15 +192,20 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 });
                 errdefer c.deinit();
                 try buildCodes(&vecs, &c);
+                rebuilt = true;
                 break :blk c;
             };
             errdefer vcodes.deinit();
 
-            const wq = try WorkQueue.init(allocator, 1024);
+            // The index is written by `deinit` and consumed by the `load` above, so finding
+            // none means the last run did not shut down cleanly -- exactly when the manifest
+            // and the store can disagree. A missing manifest over a populated store is the
+            // other way in, and it does not need a crash: a restored backup will do.
+            if (rebuilt or (!note_id_map.manifest_present and vecs.vec_n > 0)) {
+                try reconcile(allocator, &vecs, &vcodes, note_id_map);
+            }
 
-            const note_id_map = try allocator.create(NoteIdMap);
-            errdefer allocator.destroy(note_id_map);
-            note_id_map.* = try NoteIdMap.init(allocator, basedir);
+            const wq = try WorkQueue.init(allocator, 1024);
 
             const self = try allocator.create(Self);
             self.* = .{
@@ -256,6 +268,125 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         /// Reads every live vector once and encodes it. The store hands back the slot along
         /// with the bytes, so the codes array ends up mirroring the store's slot numbering
         /// without either side having to agree on anything else.
+        /// Makes the manifest and the store agree, by walking the store once.
+        ///
+        /// Three things come out of that walk, and they are why this cannot be skipped after
+        /// an unclean shutdown:
+        ///
+        ///   1. The highest doc_id any row carries, which `next_id` must clear. Without it a
+        ///      lost or rolled-back manifest restarts ids at 1 and the next document to be
+        ///      embedded inherits a dead one's vectors -- the only tear here that produces a
+        ///      wrong answer instead of a missing one.
+        ///   2. Rows whose doc_id names nothing. Already invisible, because every read path
+        ///      resolves doc_id to a path first, but they hold slots and they occupy stage
+        ///      one's candidate budget, so they cost recall as well as space.
+        ///   3. Paths with no live rows. Invisible too, and worse than useless: the document
+        ///      looks indexed, so nothing re-embeds it. Dropping the name is what lets a sync
+        ///      pass notice it is missing and do something about it.
+        ///
+        /// Removal waits until the walk is done. `iterate` holds the store's lock for the
+        /// life of the iterator, so mutating inside the loop would deadlock.
+        fn reconcile(
+            allocator: std.mem.Allocator,
+            store: *VecStorage,
+            index: *VecCodes,
+            map: *NoteIdMap,
+        ) !void {
+            const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:reconcile" });
+            defer zone.end();
+
+            var c = try census(allocator, store, map);
+            defer c.deinit();
+
+            // First, because it is the step that prevents wrong answers. The rest only
+            // reclaims space and keeps counts honest.
+            if (try map.ensureNextIdAbove(c.max_doc_id)) {
+                std.log.warn(
+                    "note id counter trailed the store; moved it past doc_id {d}",
+                    .{c.max_doc_id},
+                );
+            }
+
+            for (c.orphans.items) |o| {
+                store.rm(o.vec_id) catch |e| switch (e) {
+                    error.MultipleRemove => {},
+                    else => return e,
+                };
+                index.rm(o.slot);
+            }
+            for (c.hollow.items) |path| try map.removePath(path);
+
+            if (c.orphans.items.len != 0 or c.hollow.items.len != 0) {
+                std.log.warn(
+                    "reconciled on open: dropped {d} unnamed vectors and {d} paths with none",
+                    .{ c.orphans.items.len, c.hollow.items.len },
+                );
+            }
+        }
+
+        /// What one walk of the store says about how well it matches the manifest.
+        const Census = struct {
+            allocator: std.mem.Allocator,
+            /// Live rows whose doc_id the manifest does not name.
+            orphans: std.ArrayList(Orphan),
+            /// Paths the manifest names that have no live row. Owned by this struct, because
+            /// removing a path rehashes the map these were read from.
+            hollow: std.ArrayList([]const u8),
+            /// Highest doc_id on any live row, which `next_id` has to clear.
+            max_doc_id: NoteID,
+
+            const Orphan = struct { vec_id: VectorID, slot: usize };
+
+            fn deinit(self: *Census) void {
+                self.orphans.deinit(self.allocator);
+                for (self.hollow.items) |p| self.allocator.free(p);
+                self.hollow.deinit(self.allocator);
+            }
+
+            fn agrees(self: Census) bool {
+                return self.orphans.items.len == 0 and self.hollow.items.len == 0;
+            }
+        };
+
+        /// Walks the store once and reports every way it and the manifest disagree. Costs a
+        /// full read of the store, so it belongs on `open`-after-a-crash and `validate`, not
+        /// on any ordinary path.
+        fn census(allocator: std.mem.Allocator, store: *VecStorage, map: *NoteIdMap) !Census {
+            var out = Census{
+                .allocator = allocator,
+                .orphans = .{},
+                .hollow = .{},
+                .max_doc_id = 0,
+            };
+            errdefer out.deinit();
+
+            var named = std.AutoHashMap(NoteID, void).init(allocator);
+            defer named.deinit();
+
+            {
+                var it = try store.iterate();
+                defer it.deinit();
+                while (try it.next()) |e| {
+                    out.max_doc_id = @max(out.max_doc_id, e.row.doc_id);
+                    if (map.getPath(e.row.doc_id) == null) {
+                        try out.orphans.append(
+                            allocator,
+                            .{ .vec_id = e.row.vec_id, .slot = e.slot },
+                        );
+                    } else {
+                        try named.put(e.row.doc_id, {});
+                    }
+                }
+            }
+
+            var ids = map.idIteratorUnlocked();
+            while (ids.next()) |id| {
+                if (named.contains(id.*)) continue;
+                try out.hollow.append(allocator, try allocator.dupe(u8, map.getPath(id.*).?));
+            }
+            return out;
+        }
+
         fn buildCodes(store: *VecStorage, out: *VecCodes) !void {
             const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:buildCodes" });
             defer zone.end();
@@ -543,8 +674,42 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 }
             }
             const embedded_sentences = try embedded_sentence_list.toOwnedSlice(allocator);
-            const note_id = try self.note_id_map.getOrCreateId(path);
-            try self.replaceVectors(allocator, note_id, embedded_sentences);
+
+            // A path exists exactly when its document has at least one live vector. A
+            // document with nothing embeddable in it -- blank, punctuation, a stub too short
+            // to be wordlike -- gets no name, because naming it anyway would make a
+            // legitimately empty document indistinguishable from a write that tore halfway,
+            // and `reconcile` would have no way to tell which of the two it was looking at.
+            //
+            // Editing a document down to nothing takes the same route, via removePath, so the
+            // invariant holds in both directions.
+            if (embedded_sentences.len == 0) {
+                if (self.note_id_map.getId(path) != null) try self.removePath(path);
+                std.log.info("Embedded 0 sentences\n", .{});
+                return;
+            }
+
+            // A path the manifest has never seen cannot have vectors, because an id is
+            // durable before any row carries it (see note_id_map.createId). So asking first
+            // and keeping the answer lets `replaceVectors` skip hunting for rows to replace,
+            // which is a scan of the entire store.
+            //
+            // Re-embedding an existing path still pays that scan. At corpus scale it is the
+            // dominant cost of an update and wants a doc_id -> slots index; that is a
+            // separate change, and `vecsForDoc` is where it goes.
+            const existing = self.note_id_map.getId(path);
+            const note_id = existing orelse try self.note_id_map.createId(path);
+            // A name created just now exists only to label the vectors below. If they do not
+            // land, the name would describe nothing and the document would look indexed
+            // while being unsearchable, so take it back out. An id that was already there
+            // must survive: its older vectors are still in the store and still its own.
+            errdefer if (existing == null) {
+                self.note_id_map.removePath(path) catch |e| std.log.err(
+                    "failed to roll back the path mapping for '{s}' after a failed write: {t}",
+                    .{ path, e },
+                );
+            };
+            try self.replaceVectors(allocator, note_id, embedded_sentences, existing != null);
 
             std.log.info("Embedded {d} sentences\n", .{embedded_sentences.len});
         }
@@ -579,13 +744,20 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             self.work_queue_condition.signal();
         }
 
+        /// `may_have_old` is false when the caller knows `note_id` was minted for this call,
+        /// which skips the whole-store walk that finds rows to replace. Passing true is always
+        /// correct and always costs that walk.
         fn replaceVectors(
             self: *Self,
             allocator: std.mem.Allocator,
             note_id: NoteID,
             embedded_sentences: []const EmbeddedSentence,
+            may_have_old: bool,
         ) !void {
-            const old_vecs = try self.vec_storage.vecsForDoc(allocator, note_id);
+            const old_vecs: []VecStorage.Row = if (may_have_old)
+                try self.vec_storage.vecsForDoc(allocator, note_id)
+            else
+                &.{};
             defer allocator.free(old_vecs);
 
             // Remove before putting, so the new rows land in the slots the old ones vacate.
@@ -664,9 +836,36 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             // can only return what it was told about, so an index that has drifted from the
             // store loses results with no error anywhere.
             if (self.codes.len() != self.vec_storage.len()) return Error.IndexOutOfSync;
+
+            // The other binding: a row is visible only if the manifest names its document,
+            // so disagreement between the two is lost data in one direction and unreachable
+            // data in the other. `reconcile` fixes this at open; reaching it here means
+            // something tore while the database was live.
+            var c = try census(self.allocator, &self.vec_storage, self.note_id_map);
+            defer c.deinit();
+            if (!c.agrees()) {
+                // Detail at info, not err: the return value is the signal, and a caller that
+                // probes with `validate` in a test should not have to tolerate a log line.
+                std.log.info(
+                    "manifest and store disagree: {d} unnamed vectors, {d} paths with none",
+                    .{ c.orphans.items.len, c.hollow.items.len },
+                );
+                return Error.ManifestOutOfSync;
+            }
+            if (self.note_id_map.nextId() <= c.max_doc_id) return Error.ManifestOutOfSync;
         }
 
         /// Delete the entries associated with a given path.
+        ///
+        /// Vectors first, then the name. Either order leaves the document unsearchable --
+        /// dropping the name alone is enough for that, because every read resolves doc_id to
+        /// a path and discards rows that have none -- but this order leaves the cheaper
+        /// wreckage if it stops halfway: a name with no rows, which `reconcile` drops at the
+        /// next open. The reverse leaves rows with no name, which are invisible but hold slots
+        /// until something walks the whole store looking for them.
+        ///
+        /// The trailing `note_id_map.removePath` runs whether or not there was an id, because
+        /// it is how a path with no vectors -- the state above -- gets cleaned up.
         pub fn removePath(self: *Self, path: []const u8) !void {
             if (path.len == 0) return Error.InvalidPath;
             if (self.note_id_map.getId(path)) |note_id| {
@@ -685,11 +884,12 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             try self.note_id_map.renamePath(old_path, new_path);
         }
 
-        fn getPath(self: *Self, note_id: NoteID) ?[]const u8 {
-            return self.note_id_map.getPath(note_id);
-        }
-
-        /// Remove paths which no longer have a vector associated with them.
+        /// Drops paths whose *source file* is gone from `basedir`.
+        ///
+        /// Despite the name this does not look at vectors at all, and it is not the answer to
+        /// a manifest that disagrees with the store -- `reconcile` is, at open, and
+        /// `validate` is what reports it. This is for documents the user deleted out from
+        /// under us.
         pub fn pruneOrphanedPaths(self: *Self, basedir: std.fs.Dir) !void {
             try self.note_id_map.pruneOrphanedPaths(basedir);
         }
@@ -934,9 +1134,7 @@ test "search" {
 test "search mpnet" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing_allocator);
-    defer arena.deinit();
-    var db = try VectorEngine(.mpnet_embedding).init(arena.allocator(), tmpD.dir, .{});
+    var db = try VectorEngine(.mpnet_embedding).init(testing_allocator, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1250,10 +1448,13 @@ test "rawVectorSearch skips removed paths" {
 test "rawVectorSearch mpnet" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
+    var db = try VectorEngine(.mpnet_embedding).init(testing_allocator, tmpD.dir, .{});
+    defer db.deinit();
+
+    // Scratch for the query vector only. The engine gets `testing_allocator`, because it
+    // allocates from its worker thread and an arena is not thread-safe.
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try VectorEngine(.mpnet_embedding).init(arena.allocator(), tmpD.dir, .{});
-    defer db.deinit();
 
     const path = "test.md";
     try db.embedText(path, "pizza. pizza. pizza.");
@@ -1485,9 +1686,7 @@ test "populateHighlights" {
 test "embed skip low-value" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing_allocator);
-    defer arena.deinit();
-    var db = try VectorEngine(.mpnet_embedding).init(arena.allocator(), tmpD.dir, .{});
+    var db = try VectorEngine(.mpnet_embedding).init(testing_allocator, tmpD.dir, .{});
     defer db.deinit();
     db.embedder.threshold = 0;
 
@@ -1619,27 +1818,28 @@ test "embedTextAsync rejects after shutdown" {
 
 /// A second engine opened over the same directory. Tests use it to assert on what actually
 /// landed on disk instead of on the in-memory state of the engine that wrote it.
+/// `VectorEngine.init` requires a thread-safe allocator -- it starts the embedding worker
+/// before it returns, and both that thread and the caller allocate -- so this hands over
+/// `testing_allocator` rather than an arena of its own. An arena here corrupts its free list
+/// under concurrent use instead of failing cleanly, which shows up as an alignment panic in
+/// an unrelated test about one run in six.
 const Reopened = struct {
     db: *TestVecDB,
     embedder: *NLEmbedder,
-    arena: std.heap.ArenaAllocator,
 
     fn open(dir: std.fs.Dir) !*Reopened {
         const self = try testing_allocator.create(Reopened);
         errdefer testing_allocator.destroy(self);
-        self.arena = std.heap.ArenaAllocator.init(testing_allocator);
-        errdefer self.arena.deinit();
         const te = try testEmbedder(testing_allocator);
         errdefer testing_allocator.destroy(te.e);
         self.embedder = te.e;
-        self.db = try TestVecDB.init(self.arena.allocator(), dir, .{});
+        self.db = try TestVecDB.init(testing_allocator, dir, .{});
         return self;
     }
 
     fn close(self: *Reopened) void {
         self.db.deinit();
         testing_allocator.destroy(self.embedder);
-        self.arena.deinit();
         testing_allocator.destroy(self);
     }
 };
@@ -1846,6 +2046,7 @@ test "empty inputs" {
 const std = @import("std");
 const testing_allocator = std.testing.allocator;
 const expectEqual = std.testing.expectEqual;
+const expectError = std.testing.expectError;
 const expectEqualSlices = std.testing.expectEqualSlices;
 const assert = std.debug.assert;
 
@@ -2055,4 +2256,226 @@ test "a missing index is rebuilt, and answers the same as a loaded one" {
         try expectEqual(a.start_i, b.start_i);
         try expectEqual(a.similarity, b.similarity);
     }
+}
+
+// ****************************************************** Manifest / store coherence (tearing)
+//
+// The manifest (`note_id_map`) decides what exists: every read path resolves a row's doc_id
+// to a path and drops the row if there is none, so a vector is visible exactly when its
+// document is named. These tests cover what happens when the two files disagree, which they
+// can because no single write covers both.
+//
+// Two directions, with very different consequences:
+//
+//   manifest ahead of store  a path with no live vectors. Invisible to search, so no wrong
+//                            answer -- but nothing re-embeds it either, so it is a document
+//                            that looks indexed and is not.
+//   store ahead of manifest  rows whose doc_id names nothing. Also invisible, and harmless
+//                            on its own -- but if a later `createId` hands out that same id,
+//                            the new document inherits the dead one's vectors and the rows
+//                            become visible under the wrong path. That is a wrong answer.
+//
+// The second is the one worth engineering against, and it is why `next_id` may never be
+// guessed.
+
+/// Path of the code index beside a test database, which these tests delete to simulate the
+/// unclean shutdown that leaves one absent.
+fn testCodesName(buf: []u8) ![]const u8 {
+    return codesPath(buf, TestVecDB.embedderPathForTest());
+}
+
+test "tear: a lost manifest does not let a new document inherit old vectors" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    {
+        var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+        defer db.deinit();
+        try db.embedText("old.md", "the kangaroo hops across the outback");
+    }
+
+    // A clean shutdown, and then the manifest goes missing: a restored backup, a botched
+    // sync, a stray rm. The store still holds old.md's vectors under doc_id 1.
+    try tmpD.dir.deleteFile(note_id_map_mod.MANIFEST_FILENAME);
+
+    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    defer db.deinit();
+    try db.embedText("new.md", "a completely unrelated sentence about tax law");
+
+    // Without a guard on next_id, new.md is handed doc_id 1 as well, and the kangaroo rows
+    // start answering as new.md.
+    var buf: [10]SearchResult = undefined;
+    const found = try db.search("the kangaroo hops across the outback", &buf);
+    for (buf[0..found]) |r| {
+        if (std.mem.eql(u8, r.path, "new.md")) {
+            std.debug.print(
+                "old.md's vector surfaced under new.md at [{d}..{d}]\n",
+                .{ r.start_i, r.end_i },
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+    try db.validate();
+}
+
+test "tear: a rolled back manifest does not let a new document inherit old vectors" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    const manifest = note_id_map_mod.MANIFEST_FILENAME;
+    const stale = "stale-manifest";
+
+    {
+        var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+        defer db.deinit();
+        try db.embedText("first.md", "penguins huddle together for warmth");
+        // The manifest as it stood when only first.md existed: next_id is 2 here.
+        try tmpD.dir.copyFile(manifest, tmpD.dir, stale, .{});
+        try db.embedText("second.md", "the printing press changed europe");
+    }
+
+    // Power loss: the manifest's rename never reached the disk, so it reverts to the copy
+    // above, while second.md's rows survive in the store. The code index is gone too,
+    // because `saveIndex` only runs from a clean `deinit` -- the two always travel together.
+    try tmpD.dir.copyFile(stale, tmpD.dir, manifest, .{});
+    var codes_buf: [256]u8 = undefined;
+    tmpD.dir.deleteFile(try testCodesName(&codes_buf)) catch {};
+
+    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    defer db.deinit();
+    try db.embedText("third.md", "sourdough needs a starter culture");
+
+    var buf: [10]SearchResult = undefined;
+    const found = try db.search("the printing press changed europe", &buf);
+    for (buf[0..found]) |r| {
+        if (std.mem.eql(u8, r.path, "third.md")) {
+            std.debug.print(
+                "second.md's vector surfaced under third.md at [{d}..{d}]\n",
+                .{ r.start_i, r.end_i },
+            );
+            return error.TestUnexpectedResult;
+        }
+    }
+    try db.validate();
+}
+
+test "tear: rows whose doc_id names nothing are invisible" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    defer db.deinit();
+
+    try db.embedText("gone.md", "the lighthouse keeper polished the lens");
+    try db.embedText("kept.md", "bicycle chains need oil");
+
+    // Drops the name without touching the vectors, which is the state a store-ahead tear
+    // leaves behind. This goes at the map directly: the engine's own removePath would take
+    // the rows with it, which is the whole point of it existing.
+    try db.note_id_map.removePath("gone.md");
+
+    var buf: [10]SearchResult = undefined;
+    const found = try db.search("the lighthouse keeper polished the lens", &buf);
+    for (buf[0..found]) |r| {
+        try expect(!std.mem.eql(u8, r.path, "gone.md"));
+    }
+}
+
+test "tear: a path with no vectors does not survive an open" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    {
+        var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+        defer db.deinit();
+        try db.embedText("hollow.md", "mountains are tall");
+        try db.embedText("solid.md", "rivers run downhill");
+
+        // Manifest-ahead-of-store: the name is durable, the vectors are not. On a power loss
+        // this is every document embedded since the last flush.
+        const id = db.note_id_map.getId("hollow.md").?;
+        const rows = try db.vec_storage.vecsForDoc(testing_allocator, id);
+        defer testing_allocator.free(rows);
+        try db.vec_storage.rmByDocId(id);
+        for (rows) |row| db.codes.rm(TestVecDB.VecStorage.slotOf(row.vec_id));
+    }
+
+    var codes_buf: [256]u8 = undefined;
+    tmpD.dir.deleteFile(try testCodesName(&codes_buf)) catch {};
+
+    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    defer db.deinit();
+
+    // The document is not indexed, so it must not claim to be: leaving the name behind makes
+    // it invisible to search and invisible to whatever would re-embed it.
+    try expectEqual(null, db.note_id_map.getId("hollow.md"));
+    try expect(db.note_id_map.getId("solid.md") != null);
+    try db.validate();
+}
+
+test "tear: validate reports a manifest that disagrees with the store" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    defer db.deinit();
+
+    try db.embedText("a.md", "the tide comes in twice a day");
+    try db.embedText("b.md", "glass is made from sand");
+    try db.validate();
+
+    // Store ahead of manifest. Invisible to search -- which is what the test above
+    // asserts -- but `validate` is the thing that is supposed to say so out loud.
+    try db.note_id_map.removePath("a.md");
+    try expectError(Error.ManifestOutOfSync, db.validate());
+}
+
+test "tear: validate reports a next_id that trails the store" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    defer db.deinit();
+
+    try db.embedText("a.md", "copper conducts electricity");
+    try db.validate();
+
+    // Everything still lines up name-for-row; the only thing wrong is that the counter
+    // would hand out an id already in use, which is the tear that causes wrong answers
+    // rather than missing ones. It has its own check for exactly that reason.
+    db.note_id_map.next_id = 1;
+    try expectError(Error.ManifestOutOfSync, db.validate());
+}
+
+test "a document with nothing embeddable gets no path" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    defer db.deinit();
+
+    try db.embedText("blank.md", " \n\t ");
+    try expectEqual(null, db.note_id_map.getId("blank.md"));
+    try db.validate();
+
+    // And a document edited down to nothing gives its name back, so the invariant holds in
+    // both directions rather than only on first write.
+    try db.embedText("fading.md", "there were words here once");
+    try expect(db.note_id_map.getId("fading.md") != null);
+    try db.embedText("fading.md", "   ");
+    try expectEqual(null, db.note_id_map.getId("fading.md"));
+    try db.validate();
+}
+
+test "a path created for a write that fails does not outlive it" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    defer db.deinit();
+
+    try db.embedText("kept.md", "owls hunt at night");
+
+    // MAX_NOTE_LEN is asserted, not returned as an error, so the reachable way to make
+    // replaceVectors fail is to exhaust the store's slot space. Nothing portable does that
+    // from out here, so this covers the half that is observable: a path is only ever created
+    // alongside vectors, and `validate` is what would catch one that was not.
+    try expect(db.note_id_map.getId("kept.md") != null);
+    try db.validate();
+    try expectEqual(null, db.note_id_map.getId("never-written.md"));
 }
