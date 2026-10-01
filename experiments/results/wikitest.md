@@ -174,3 +174,100 @@ written, and the next open rebuilt it and saved it without being asked.
 rate of 4.5 docs/s. Because ingest is quadratic, that rate does not survive contact with a
 larger store, and the run was at 2.4 docs/s cumulative when it died. Size ingest runs off the
 interval rate at the target scale, not a small-corpus extrapolation.
+
+---
+
+# 2.72M vectors, after the coherence work [2026-10-01]
+
+Apple M5, `-Dllama -Doptimize=ReleaseFast`. Same `--sample 1` ordering as the run above, so
+the first 9,476 articles are the *same articles* and the two curves overlay point for point --
+the vector count at 2,000 articles is 126,732 in both.
+
+Raw output in `raw/wikitest-llama-fixed-20261001-1201.txt`, per-interval samples in
+`raw/wikitest-llama-fixed.csv`.
+
+## Ingest is no longer quadratic
+
+| articles | before s/doc | after s/doc | speedup |
+|---:|---:|---:|---:|
+| 3,000 | 0.120 | 0.113 | 1.1x |
+| 4,000 | 0.225 | 0.106 | 2.1x |
+| 5,000 | 0.385 | 0.106 | 3.6x |
+| 6,000 | 0.548 | 0.127 | 4.3x |
+| 8,000 | 0.633 | 0.112 | 5.6x |
+| 9,000 | 0.657 | 0.112 | 5.8x |
+| 10,000 | 0.758 | 0.146 | **5.2x** |
+
+The speedup column is not the result. The *shape* is: `before` climbs without bound, `after`
+does not move. Carried out to 22,000 articles and a 10.4 GB store:
+
+| articles | store | vec/s | s/doc |
+|---:|---:|---:|---:|
+| 2,000 | 1.0 GB | 1,430 | 0.091 |
+| 6,000 | 2.9 GB | 1,124 | 0.127 |
+| 10,000 | 4.8 GB | 955 | 0.146 |
+| 14,000 | 6.8 GB | 1,006 | 0.126 |
+| 18,000 | 8.7 GB | 998 | 0.122 |
+| 22,000 | 10.6 GB | 1,001 | 0.132 |
+
+Flat across an eleven-fold growth in the store, oscillating 0.080-0.158 s/doc with no trend.
+Total: **22,000 articles, 2,718,260 vectors, 43m56s**, 10.4 GB, 2.2 GB peak RSS during ingest.
+
+The old run never reached 22,000; it was 67 minutes in at 10,000 articles and still slowing
+when a harness bug killed it. This run passed 10,000 at 17 minutes.
+
+## Search at 2.3x the vectors
+
+| | 1.18M (previous) | 2.72M |
+|---|---:|---:|
+| store | 4.5 GB | 10.4 GB |
+| codes | 56.7 MB | 130.8 MB |
+| open | 416 ms | 1.63 s |
+| **search** | 2.2-6.9 ms | **2.1-4.8 ms** median |
+| exhaustive scan | 710 ms | 1.79 s |
+| **speedup** | ~250-300x | **~390-1280x** |
+| peak RSS | 653 MB | **708 MB** |
+| recall@10 | 0.950 | **0.967** |
+
+Search did not get slower. Stage one is a linear scan of 130 MB of codes, which is still
+nothing, and stage two reads a fixed `candidates` worth of vectors regardless of corpus size
+-- so the only thing that grew is the code scan, and at these sizes it is not the cost. Query
+embedding, at 11-15 ms warm, remains several times the search.
+
+Memory is the headline for the original goal: **708 MB resident for 2.72M vectors over a
+10.4 GB store**, and 547 MB of that is the llama model, not the index.
+
+## A prediction that did not come true
+
+The previous write-up called `createId`'s whole-manifest rewrite the next bottleneck, and this
+run was sized partly to catch it emerging. It did not. The manifest reached 693 KB at 22,000
+paths, written and `F_FULLFSYNC`ed once per new document, and the curve above is flat -- so at
+this scale it is below the noise, even after the fsync was deliberately made *stronger*. It
+is still O(paths) per path and still wrong at 283k, where the manifest would be ~9 MB; it is
+just not wrong yet, and the number to beat is now measured rather than guessed.
+
+## Coherence held
+
+Audited straight off the files afterwards:
+
+```
+manifest : next_id 22001, 22000 paths
+store    : 2718260 slots, 2718260 live, 22000 doc_ids, 0 freed, max doc_id 22000
+paths with zero live vectors : 0
+live doc_ids with no path    : 0
+next_id > max doc_id         : YES
+```
+
+22,000 documents through the fast path -- every one of them skipping `vecsForDoc` on the
+strength of "no path means no vectors" -- and the two files still agree exactly.
+
+## What this still does not measure
+
+- **Cold.** Out of scope by decision, and the 1.63 s open and 1.79 s exhaustive scans here
+  were all warm.
+- **Re-embed.** Every document in this run was new, which is the case the shortcut fixes. An
+  edit to an existing document still walks the whole store, and at 10.4 GB that is ~1.7 s.
+  That is the next piece of work, and it is what a doc_id -> slots index is for.
+- **The full corpus.** 22,000 of 283,547 articles. At this rate the remainder is ~9.5 hours of
+  embedding, but 36.9M chunks is ~151 GB of store, so disk is now the binding constraint
+  rather than time.
