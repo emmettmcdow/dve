@@ -11,4 +11,5 @@ wikitest-db*/
 *.tar*
 *.zip
 wikidata/
+experiments/beirbench/data/
 __pycache__/

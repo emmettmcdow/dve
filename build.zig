@@ -477,6 +477,31 @@ pub fn build(b: *std.Build) !void {
         embedbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
+    ///////////////////
+    // Beirbench     //
+    ///////////////////
+    // dve against BEIR, which has human relevance judgments and published per-model scores --
+    // the only benchmark here that is not scored against our own output.
+    //   experiments/beirbench/download.sh
+    //   zig build beirbench -Dllama -Doptimize=ReleaseFast
+    //   ./zig-out/bin/beirbench --model llama
+    const beirbench_step = b.step("beirbench", "Build the BEIR retrieval-quality benchmark");
+    {
+        const exe = b.addExecutable(.{
+            .name = "beirbench",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("experiments/beirbench/main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        exe.root_module.addImport("dve", dve_mod);
+        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
+        for (addModelInstalls(b, coreml_models)) |s| beirbench_step.dependOn(s);
+        beirbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+        beirbench_step.dependOn(b.getInstallStep());
+    }
+
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(test_vec_storage);
     test_step.dependOn(test_pfile);
