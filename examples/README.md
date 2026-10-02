@@ -25,19 +25,3 @@ The llama model needs a prebuilt llama.cpp — see
 [llama.cpp backend](../USAGE.md#llamacpp-backend). The example passes `-Dllama` to dve for you
 when you select it, and looks in `$HOME/llama.cpp`; pass `-Dllama-path=...` if yours lives
 elsewhere.
-
-## Swift (Experimental)
-
-> **Note:** The Swift example works but the bindings are experimental. First-class Swift support
-> is planned for a future release.
-
-Requires building the XCFramework first (from the repo root):
-```sh
-zig build xcframework
-```
-
-Then:
-```sh
-cd swift
-swift run dve-repl
-```
