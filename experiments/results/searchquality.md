@@ -120,3 +120,65 @@ and SciFact's nDCG@10 should not fall.
   at all. CQADupStack (StackExchange) is the closest BEIR dataset in form.
 - **Lexical queries.** Proper nouns, identifiers, error codes, acronyms -- the things a notes
   user actually types, and where dense retrieval is weakest. No coverage.
+
+---
+
+# Appendix: why the CoreML backend cannot use the GPU [2026-10-02]
+
+The mpnet tests aborted about one process in twelve inside
+MetalPerformanceShadersGraph with `shape.count = 0 != strides.count = 3`. The fix shipped
+was to stop offering CoreML the GPU (`compute_units = .cpu_and_neural_engine`). This is
+the follow-up asking whether the conversion was at fault, since the model is converted by
+hand from sentence-transformers via coremltools.
+
+Two conversion settings were suspects: `compute_precision=FLOAT32` and
+`minimum_deployment_target=macOS13`. Both were tested against the shipped model.
+
+| conversion | GPU aborts | vectors | speed |
+|---|---:|---|---:|
+| fp32 / macOS13 (shipped) | 9/124 | reference | 51.1 chunks/s |
+| fp32 / macOS15 | 1/40 | cosine **1.000000** vs reference | 55.6 chunks/s |
+| fp16 / macOS15 | 0/66 | **broken** | 225.5 chunks/s |
+| fp32 / either, CPU+ANE | 0/40 | reference | 30.7 chunks/s |
+
+**The opset is not the cause.** macOS15 produces bit-identical vectors and still aborts.
+
+**fp16 is not usable for this model.** It never aborted and ran 4.4x faster, and it is
+also wrong:
+
+| | dog~puppy | dog~airplane | cat-on-mat ~ feline-on-rug | cat-on-mat ~ QCD |
+|---|---:|---:|---:|---:|
+| fp32 | 0.778 | 0.301 | 0.708 | 0.007 |
+| fp16 | 1.000 | 1.000 | 0.315 | 0.811 |
+
+Short texts collapse onto one vector and unrelated pairs outscore related ones, which is
+saturation somewhere in the network rather than quantization noise. BERT-family models are
+known to need op-level exclusions to survive fp16. Had this been judged on abort rate and
+throughput alone it would have looked like a 4.4x win.
+
+That also explains the throughput table: the Neural Engine is fp16-only, so an fp32 model
+cannot run on it. `cpu_and_neural_engine` on the shipped model is really *CPU*, which is why
+it is slower than the GPU rather than faster, and why fp16 scored the same (225.5 / 221.8) on
+`all` and `cpu_and_neural_engine` -- it was on the ANE both times.
+
+## So, for CoreML as a general backend
+
+The crash is Apple's, on the fp32 GPU path, and reachable by an ordinary graph: 720 ops, 16 op
+types, and 86 rank-0 constants that are just layer-norm epsilons and the attention scale. We
+did not do anything unusual to provoke it.
+
+What that leaves for a second CoreML model:
+
+- Convert **fp16** if the model survives it, and verify semantically rather than by cosine
+  against an fp32 build -- an fp16 model that is broken still self-consistently embeds.
+  `models/gen-coreml.py --precision` now exposes this, defaulting to fp16 with the hazard
+  written down next to the flag.
+- fp16 is also the only way onto the Neural Engine, which is worth 4.4x.
+- A model that needs fp32 is CPU-only in practice, because the GPU aborts and the ANE will
+  not take it.
+
+One trap was removed along the way: the output `MLMultiArray` was read as `[*]f32` without
+checking `dataType`. Any fp16-output model would have returned silent nonsense -- measured
+0.13 cosine when that was first suspected here. `embed` now switches on the reported dataType.
+The Float16 branch is **unexercised**: every model to hand declares an fp32 output even when
+its weights are fp16.

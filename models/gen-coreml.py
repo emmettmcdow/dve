@@ -47,6 +47,24 @@ def main():
         action="store_true",
         help="Trust remote code for custom models",
     )
+    # Both of these decide which CoreML backend can run the model, which turned out to
+    # matter more than anything else about the conversion. float32 cannot run on the Neural
+    # Engine at all -- it is fp16-only -- so an fp32 model is CPU or GPU only, and the fp32
+    # GPU path is where MetalPerformanceShadersGraph aborted on us with
+    # `shape.count = 0 != strides.count = 3`. See experiments/results/searchquality.md and
+    # the notes on MpnetEmbedder.ComputeUnits.
+    parser.add_argument(
+        "--precision",
+        choices=["float16", "float32"],
+        default="float16",
+        help="Weight/activation precision (default: float16, which the ANE requires)",
+    )
+    parser.add_argument(
+        "--deployment-target",
+        default="macOS15",
+        help="Minimum CoreML deployment target, e.g. macOS13/macOS14/macOS15 "
+        "(default: macOS15). Lower targets pin an older MIL opset.",
+    )
     args = parser.parse_args()
 
     model_name = args.model
@@ -90,14 +108,22 @@ def main():
 
     outputs = [ct.TensorType(name="last_hidden_state", dtype=float)]
 
-    print("Converting to CoreML...")
+    target = getattr(ct.target, args.deployment_target, None)
+    if target is None:
+        raise SystemExit(f"unknown deployment target '{args.deployment_target}'")
+    precision = {
+        "float16": ct.precision.FLOAT16,
+        "float32": ct.precision.FLOAT32,
+    }[args.precision]
+
+    print(f"Converting to CoreML ({args.precision}, {args.deployment_target})...")
     mlmodel = ct.convert(
         traced_model,
         inputs=inputs,
         outputs=outputs,
         convert_to="mlprogram",
-        minimum_deployment_target=ct.target.macOS13,
-        compute_precision=ct.precision.FLOAT32,
+        minimum_deployment_target=target,
+        compute_precision=precision,
     )
 
     mlmodel.save(str(output_path))

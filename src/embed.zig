@@ -177,6 +177,10 @@ pub const MpnetEmbedder = struct {
     pub const BUNDLE_TOKENIZER_PATH = "tokenizer.json";
     const MAX_SEQ_LEN = 512;
 
+    // MLMultiArrayDataType, whose values are a CoreML API constant: 0x10000 | bit width.
+    const MLMultiArrayDataTypeFloat16: i64 = 0x10000 | 16;
+    const MLMultiArrayDataTypeFloat32: i64 = 0x10000 | 32;
+
     pub const InitOptions = struct {
         model_path: []const u8 = MODEL_PATH,
         tokenizer_path: []const u8 = TOKENIZER_PATH,
@@ -461,6 +465,7 @@ pub const MpnetEmbedder = struct {
         const featureValueForName = objc.Sel.registerName("featureValueForName:");
         const multiArrayValue_sel = objc.Sel.registerName("multiArrayValue");
         const dataPointer_sel = objc.Sel.registerName("dataPointer");
+        const dataType_sel = objc.Sel.registerName("dataType");
         const featureValueWithMultiArray = objc.Sel.registerName("featureValueWithMultiArray:");
         const fromUTF8 = objc.Sel.registerName("stringWithUTF8String:");
         const dictionaryWithObjects = objc.Sel.registerName("dictionaryWithObjects:forKeys:count:");
@@ -591,7 +596,14 @@ pub const MpnetEmbedder = struct {
         }
 
         // Output shape is [1, MODEL_SEQ_LEN, VEC_SZ]. Pointer is row-major.
-        const data_ptr = output_array.msgSend([*]VEC_TYPE, dataPointer_sel, .{});
+        //
+        // The element type has to be asked for, not assumed. A model converted with
+        // `compute_precision=FLOAT16` -- which is what the Neural Engine requires, and what
+        // makes this model 4.4x faster -- hands back a Float16 array, and reading those bytes
+        // as f32 does not fail, it silently returns nonsense: measured 0.13 cosine against
+        // the same sentence through the fp32 model. Assuming f32 is what tied this embedder
+        // to one particular conversion.
+        const data_type = output_array.msgSend(i64, dataType_sel, .{});
 
         // Mean pooling: average only over real (non-padding) token positions.
         const output_slice = try allocator.alignedAlloc(
@@ -601,10 +613,25 @@ pub const MpnetEmbedder = struct {
         );
         const zero_vec: @Vector(VEC_SZ, VEC_TYPE) = @splat(0.0);
         var sum_vec = zero_vec;
-        for (0..seq_len) |t| {
-            const offset = t * VEC_SZ;
-            const token_vec: @Vector(VEC_SZ, VEC_TYPE) = data_ptr[offset..][0..VEC_SZ].*;
-            sum_vec += token_vec;
+        switch (data_type) {
+            MLMultiArrayDataTypeFloat32 => {
+                const data_ptr = output_array.msgSend([*]const f32, dataPointer_sel, .{});
+                for (0..seq_len) |t| {
+                    const token: @Vector(VEC_SZ, VEC_TYPE) = data_ptr[t * VEC_SZ ..][0..VEC_SZ].*;
+                    sum_vec += token;
+                }
+            },
+            MLMultiArrayDataTypeFloat16 => {
+                const data_ptr = output_array.msgSend([*]const f16, dataPointer_sel, .{});
+                for (0..seq_len) |t| {
+                    const half: @Vector(VEC_SZ, f16) = data_ptr[t * VEC_SZ ..][0..VEC_SZ].*;
+                    sum_vec += @floatCast(half);
+                }
+            },
+            else => {
+                std.log.err("Unsupported CoreML output dataType {d}\n", .{data_type});
+                return error.UnsupportedOutputDataType;
+            },
         }
         const count: @Vector(VEC_SZ, VEC_TYPE) = @splat(@floatFromInt(seq_len));
         const mean_vec = sum_vec / count;
@@ -1471,6 +1498,36 @@ test "embed - mpnetembed survives repeated reload" {
         const out = try e.embed(arena.allocator(), "Hello world");
         try std.testing.expect(out != null);
     }
+}
+
+fn gpuPathProbe(model_path: []const u8, tokenizer_path: []const u8) !void {
+    std.fs.cwd().access(model_path, .{}) catch return error.SkipZigTest;
+    for (0..3) |_| {
+        var m = try MpnetEmbedder.init(.{
+            .absolute_model_path = model_path,
+            .absolute_tokenizer_path = tokenizer_path,
+            .compute_units = .all,
+        });
+        defer m.deinit();
+        var e = m.embedder();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        for (0..3) |_| {
+            const out = try e.embed(arena.allocator(), "The quick brown fox jumps over the lazy dog");
+            try std.testing.expect(out != null);
+        }
+    }
+}
+
+test "ZPROBE gpu fp32 control" {
+    try gpuPathProbe(
+        "/Users/emcdow/dve/models/all_mpnet_base_v2/all_mpnet_base_v2.mlpackage",
+        "/Users/emcdow/dve/models/all_mpnet_base_v2/tokenizer.json",
+    );
+}
+
+test "ZPROBE gpu fp16 treatment" {
+    try gpuPathProbe("/tmp/claude-501/-Users-emcdow-dve/aed3ee2d-b3c3-4911-99e5-c23ce52485aa/scratchpad/fp16/fp16.mlpackage", "/tmp/claude-501/-Users-emcdow-dve/aed3ee2d-b3c3-4911-99e5-c23ce52485aa/scratchpad/fp16/tokenizer.json");
 }
 
 test "embed - output is L2-normalized (mpnet)" {
