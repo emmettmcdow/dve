@@ -2,12 +2,32 @@
 """Generate a CoreML model from a HuggingFace sentence-transformers model."""
 
 import argparse
+import types
+
 import coremltools as ct
 from sentence_transformers import SentenceTransformer
 import torch
 import torch.nn as nn
 import urllib.request
 from pathlib import Path
+
+
+# Padding mask value. transformers uses torch.finfo(float32).min, which is -3.4e38 --
+# finite in fp32 and -inf in fp16. The mask is then applied as (1 - mask) * value, so a
+# real token computes 0 * -inf = NaN, and the NaN spreads through attention and flattens
+# every embedding: a naive fp16 conversion of this model scored dog~airplane = 1.000.
+#
+# -1e4 is what the original BERT used. exp(-1e4) underflows to zero in fp32 as well as
+# fp16, so softmax sees the same thing either way and the fp32 model is unchanged --
+# verified as cosine 1.000000 against the previously shipped conversion.
+FP16_SAFE_MASK_VALUE = -1e4
+
+
+def _safe_extended_attention_mask(self, attention_mask, input_shape, device=None, dtype=None):
+    if dtype is None:
+        dtype = self.dtype
+    mask = attention_mask[:, None, None, :].to(dtype)
+    return (1.0 - mask) * FP16_SAFE_MASK_VALUE
 
 
 class EmbeddingWrapper(nn.Module):
@@ -20,6 +40,10 @@ class EmbeddingWrapper(nn.Module):
     def __init__(self, st_model):
         super().__init__()
         self.transformer = st_model[0].auto_model
+        # Must happen before tracing: the mask constant is baked into the graph.
+        self.transformer.get_extended_attention_mask = types.MethodType(
+            _safe_extended_attention_mask, self.transformer
+        )
 
     def forward(self, input_ids, attention_mask):
         outputs = self.transformer(input_ids=input_ids, attention_mask=attention_mask)

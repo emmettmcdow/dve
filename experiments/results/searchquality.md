@@ -182,3 +182,82 @@ checking `dataType`. Any fp16-output model would have returned silent nonsense -
 0.13 cosine when that was first suspected here. `embed` now switches on the reported dataType.
 The Float16 branch is **unexercised**: every model to hand declares an fp32 output even when
 its weights are fp16.
+
+---
+
+# Appendix: fp16, and the Neural Engine [2026-10-03]
+
+The previous appendix concluded that mpnet could not be converted to fp16. That was wrong --
+or rather, it was right about the naive conversion and wrong to stop there.
+
+## The cause was one constant
+
+Scanning the fp32 MIL program for values outside fp16's ±65504 range finds exactly one:
+
+```
+ops with immediate constants exceeding fp16 max (65504):
+  const            max |value| = 3.403e+38  (1 values)
+```
+
+That is `torch.finfo(float32).min`, the value transformers uses for masked-out positions.
+The mask is applied as `(1 - mask) * value`, so in fp16 that constant becomes `-inf` and a
+*real* token computes `0 * -inf = NaN`. The NaN spreads through attention and flattens every
+embedding, which is why the first attempt scored `dog~airplane` at 1.000.
+
+`models/gen-coreml.py` now overrides `get_extended_attention_mask` to use -1e4, which is the
+value original BERT used. `exp(-1e4)` underflows to zero in fp32 as well as fp16, so softmax
+sees the same thing either way. After the change the program contains no constant outside
+fp16 range.
+
+## Which makes the Neural Engine reachable
+
+| config | chunks/s | aborts | agreement |
+|---|---:|---:|---|
+| fp32, GPU | 51.1 | 9/124 | reference |
+| fp32, CPU+ANE (really CPU) | 30.7 | 0/40 | reference |
+| fp16-safe, `all` | 226.5 | 0/40 | cosine 0.999982 |
+| **fp16-safe, CPU+ANE** | **248.8** | **0/40** | cosine 0.999982 |
+
+**8.1x the shipped configuration**, no aborts, and correctness preserved:
+
+| | dog~puppy | dog~airplane | cat-on-mat ~ feline-on-rug | cat-on-mat ~ QCD |
+|---|---:|---:|---:|---:|
+| fp32 | 0.778 | 0.301 | 0.708 | 0.007 |
+| fp16-safe | 0.779 | 0.302 | 0.708 | 0.007 |
+
+Every group in `src/benchmark.zig` scores identically, total 88.5% either way.
+
+Note the ordering of those first two rows: the Neural Engine is the fastest engine on this
+hardware and the GPU is the middle one, 4.4x behind it. For CoreML the ANE is the target, and
+fp16 is the price of entry -- an fp32 model cannot use it at all.
+
+## Cost: fidelity to the reference, slightly
+
+Against the Python reference implementation, fp16 drifts about 1e-3 per component:
+
+```
+c0: ref 0.02624974 got 0.02701905 delta 7.69e-4
+c1: ref 0.01339556 got 0.01353736 delta 1.42e-4
+c2: ref -0.00453320 got -0.00417337 delta 3.60e-4
+sum: ref -0.21557690 got -0.21755816 delta 1.98e-3
+```
+
+`embed - mpnetembed solo` caught this, which is the test doing its job. Its bounds were
+widened to 2e-3 per component and 5e-3 on the sum -- sized to catch a model that is wrong
+rather than one that is imprecise, and the broken conversion would not have squeezed through.
+It also gained a guard that does not care about precision at all: `dog~puppy` must beat
+`dog~airplane` by 0.2. That is the assertion that would have caught the first attempt, and
+no numeric tolerance would have.
+
+## Releasing it
+
+The model ships as a GitHub release tarball, so this cannot be finished from here.
+`models/coreml_models_v5.tar.gz` is built and its package hash computed:
+
+```
+coreml_models-5.0.0-AAAAAPi8Cg30SeBVYopp2lv7QG-GGvb099KEn_PG_s2l
+```
+
+Until it is published, `InitOptions.compute_units` stays at `cpu_and_neural_engine`: the
+released model is still fp32, and `all` would hand it the GPU and bring the abort back. The
+default and the dependency have to move together.

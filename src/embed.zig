@@ -192,15 +192,24 @@ pub const MpnetEmbedder = struct {
         absolute_tokenizer_path: ?[]const u8 = null,
         /// Which engines CoreML may schedule the model on.
         ///
-        /// Defaults to `cpu_and_neural_engine` rather than `all` because `all` offers the GPU,
-        /// and the GPU backend aborts the process: roughly one run in eight,
-        /// MetalPerformanceShadersGraph failed `shape.count = 0 != strides.count = 3` while
-        /// loading output descriptions. Measured 0 failures in 40 runs on this setting against
-        /// 5 in 62 on `all`.
+        /// **This default is pinned to the precision of the shipped model, and should be
+        /// `.all` as soon as an fp16 one is released.** Measured, same model and sentences:
         ///
-        /// It costs throughput -- 26.3 chunks/sec against 50.2 -- and changes nothing
-        /// measurable about quality, which scores identically on every group in
-        /// src/benchmark.zig. Pass `all` to take the speed and the crash.
+        ///     fp16, all              248.8 chunks/sec   0 aborts in 40
+        ///     fp32, gpu               51.1              9 aborts in 124
+        ///     fp32, cpu+ane           30.7              0          (really the CPU)
+        ///
+        /// The Neural Engine is fp16-only. An fp32 model therefore cannot reach it at all and
+        /// quietly runs on the CPU, and an fp32 model offered the GPU aborts the process:
+        /// MetalPerformanceShadersGraph fails `shape.count = 0 != strides.count = 3` in
+        /// roughly one process in twelve. So while `coreml_models` ships fp32, the only safe
+        /// setting is the slow one, and `all` would reintroduce the abort.
+        ///
+        /// `models/gen-coreml.py` now converts fp16 by default, and handles the one constant
+        /// that makes a naive fp16 conversion of a BERT silently wrong. A model built with it
+        /// scores identically on every group in src/benchmark.zig and sits at cosine 0.999982
+        /// against the fp32 conversion, so flipping this to `.all` alongside that release is
+        /// worth 8x and costs nothing measurable.
         compute_units: ComputeUnits = .cpu_and_neural_engine,
     };
 
@@ -287,6 +296,10 @@ pub const MpnetEmbedder = struct {
 
         const model = try acquireModel(resolved, model_url, is_precompiled, opts.compute_units);
         errdefer model.release();
+        // CoreML will not tell us which engine it actually chose, so the next best thing is
+        // to say which ones it was allowed to choose from. Anything other than `all` means
+        // somebody deliberately narrowed it, and `cpu_only` means degraded by construction.
+        std.log.info("mpnet: compute units {t}, model {s}", .{ opts.compute_units, resolved });
 
         return .{
             .model = model,
@@ -1310,13 +1323,31 @@ test "embed - mpnetembed solo" {
 
     const vec = output.?.mpnet_embedding.*;
     const vec_array: [768]f32 = vec;
-    for (&[_]f32{ 2.6249737e-2, 1.3395556e-2, -4.533195e-3 }, vec_array[0..3]) |exp, got| {
-        try std.testing.expectApproxEqAbs(exp, got, 1e-4);
-    }
 
-    // From the Python reference implementation
+    // Reference values come from the Python implementation, which runs in fp32. The shipped
+    // CoreML model is fp16, because that is the only precision the Neural Engine accepts, and
+    // fp16 weights cost about 1e-3 per component here -- measured 7.7e-4, 1.4e-4 and 3.6e-4
+    // on these three, and 2.0e-3 on the sum of all 768. Direction survives: cosine against
+    // the fp32 conversion is 0.999982, and every group in src/benchmark.zig scores identically.
+    //
+    // So these bounds are sized to catch a model that is *wrong*, not one that is imprecise.
+    // They would not have let the first fp16 attempt through: it overflowed the attention mask
+    // and returned vectors unrelated to these.
+    for (&[_]f32{ 2.6249737e-2, 1.3395556e-2, -4.533195e-3 }, vec_array[0..3]) |exp, got| {
+        try std.testing.expectApproxEqAbs(exp, got, 2e-3);
+    }
     const sum = @reduce(.Add, vec);
-    try std.testing.expectApproxEqAbs(-2.155769e-1, sum, 1e-4);
+    try std.testing.expectApproxEqAbs(-2.155769e-1, sum, 5e-3);
+
+    // The guard that does not care about precision at all, and the one that actually caught
+    // the broken conversion: related text has to score above unrelated text. The first fp16
+    // attempt scored dog~airplane at 1.000.
+    const dog = (try e.embed(allocator, "dog")).?.mpnet_embedding.*;
+    const puppy = (try e.embed(allocator, "puppy")).?.mpnet_embedding.*;
+    const airplane = (try e.embed(allocator, "airplane")).?.mpnet_embedding.*;
+    const near = @reduce(.Add, dog * puppy);
+    const far = @reduce(.Add, dog * airplane);
+    try std.testing.expect(near > far + 0.2);
 }
 
 test "embed skip empty" {
@@ -1528,6 +1559,86 @@ test "ZPROBE gpu fp32 control" {
 
 test "ZPROBE gpu fp16 treatment" {
     try gpuPathProbe("/tmp/claude-501/-Users-emcdow-dve/aed3ee2d-b3c3-4911-99e5-c23ce52485aa/scratchpad/fp16/fp16.mlpackage", "/tmp/claude-501/-Users-emcdow-dve/aed3ee2d-b3c3-4911-99e5-c23ce52485aa/scratchpad/fp16/tokenizer.json");
+}
+
+const PR_REF_M = "/Users/emcdow/dve/models/all_mpnet_base_v2/all_mpnet_base_v2.mlpackage";
+const PR_REF_T = "/Users/emcdow/dve/models/all_mpnet_base_v2/tokenizer.json";
+const PR_NEW_M = "/tmp/claude-501/-Users-emcdow-dve/aed3ee2d-b3c3-4911-99e5-c23ce52485aa/scratchpad/fp16safe/fp16safe.mlpackage";
+const PR_NEW_T = "/tmp/claude-501/-Users-emcdow-dve/aed3ee2d-b3c3-4911-99e5-c23ce52485aa/scratchpad/fp16safe/tokenizer.json";
+
+const pr_sentences = [_][]const u8{
+    "The quick brown fox jumps over the lazy dog",
+    "Machine learning models convert text into vector representations",
+    "Mitochondria generate most of the chemical energy a cell needs",
+    "Paris is the capital and most populous city of France",
+    "Sourdough needs a twelve hour bulk ferment before shaping",
+};
+
+fn prCos(a: []const f32, b: []const f32) f64 {
+    var d: f64 = 0;
+    for (a, b) |x, y| d += @as(f64, x) * @as(f64, y);
+    return d;
+}
+
+test "ZSANITY fp16safe" {
+    std.fs.cwd().access(PR_NEW_M, .{}) catch return error.SkipZigTest;
+    var n = try MpnetEmbedder.init(.{ .absolute_model_path = PR_NEW_M, .absolute_tokenizer_path = PR_NEW_T });
+    defer n.deinit();
+    var r = try MpnetEmbedder.init(.{ .absolute_model_path = PR_REF_M, .absolute_tokenizer_path = PR_REF_T });
+    defer r.deinit();
+    var en = n.embedder();
+    var er = r.embedder();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var worst: f64 = 1;
+    for (pr_sentences) |sent| {
+        worst = @min(worst, prCos(
+            (try en.embed(a, sent)).?.slice(),
+            (try er.embed(a, sent)).?.slice(),
+        ));
+    }
+    std.debug.print("PROBE fp16safe vs fp32 reference min cosine: {d:.6}\n", .{worst});
+
+    const words = [_][]const u8{ "dog", "puppy", "airplane", "a cat sat on the mat", "a feline rested on the rug", "quantum chromodynamics" };
+    var v: [words.len][]const f32 = undefined;
+    for (words, 0..) |w, i| v[i] = (try en.embed(a, w)).?.slice();
+    std.debug.print("PROBE fp16safe: dog~puppy {d:.3}  dog~airplane {d:.3}  cat~feline {d:.3}  cat~qcd {d:.3}\n", .{
+        prCos(v[0], v[1]), prCos(v[0], v[2]), prCos(v[3], v[4]), prCos(v[3], v[5]),
+    });
+}
+
+fn prSpeed(label: []const u8, m: []const u8, t: []const u8, cu: MpnetEmbedder.ComputeUnits) !void {
+    std.fs.cwd().access(m, .{}) catch return error.SkipZigTest;
+    var e0 = try MpnetEmbedder.init(.{ .absolute_model_path = m, .absolute_tokenizer_path = t, .compute_units = cu });
+    defer e0.deinit();
+    var e = e0.embedder();
+    var warm = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer warm.deinit();
+    for (0..5) |_| _ = try e.embed(warm.allocator(), pr_sentences[0]);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const n = 60;
+    var timer = try std.time.Timer.start();
+    for (0..n) |i| _ = try e.embed(arena.allocator(), pr_sentences[i % pr_sentences.len]);
+    const secs = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
+    std.debug.print("PROBE {s: <18} {d: >8.1} chunks/s\n", .{ label, @as(f64, n) / secs });
+}
+
+test "ZSPEED fp16safe all" { try prSpeed("fp16safe all", PR_NEW_M, PR_NEW_T, .all); }
+test "ZSPEED fp16safe ane" { try prSpeed("fp16safe cpu+ane", PR_NEW_M, PR_NEW_T, .cpu_and_neural_engine); }
+
+test "ZCRASH fp16safe all" {
+    std.fs.cwd().access(PR_NEW_M, .{}) catch return error.SkipZigTest;
+    for (0..3) |_| {
+        var m = try MpnetEmbedder.init(.{ .absolute_model_path = PR_NEW_M, .absolute_tokenizer_path = PR_NEW_T, .compute_units = .all });
+        defer m.deinit();
+        var e = m.embedder();
+        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+        defer arena.deinit();
+        for (0..3) |_| _ = try e.embed(arena.allocator(), pr_sentences[0]);
+    }
 }
 
 test "embed - output is L2-normalized (mpnet)" {
