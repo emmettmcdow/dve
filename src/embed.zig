@@ -190,27 +190,25 @@ pub const MpnetEmbedder = struct {
         absolute_model_path: ?[]const u8 = null,
         /// If set, bypasses bundle/exe-relative resolution and uses this path directly.
         absolute_tokenizer_path: ?[]const u8 = null,
-        /// Which engines CoreML may schedule the model on.
+        /// Which engines CoreML may schedule the model on. `all` lets CoreML pick, which on
+        /// Apple silicon means the Neural Engine for a model that can use it.
         ///
-        /// **This default is pinned to the precision of the shipped model, and should be
-        /// `.all` as soon as an fp16 one is released.** Measured, same model and sentences:
+        /// **This default assumes an fp16 model**, which is what `coreml_models` ships from
+        /// v5 on. Measured, same sentences:
         ///
         ///     fp16, all              248.8 chunks/sec   0 aborts in 40
         ///     fp32, gpu               51.1              9 aborts in 124
         ///     fp32, cpu+ane           30.7              0          (really the CPU)
         ///
-        /// The Neural Engine is fp16-only. An fp32 model therefore cannot reach it at all and
-        /// quietly runs on the CPU, and an fp32 model offered the GPU aborts the process:
-        /// MetalPerformanceShadersGraph fails `shape.count = 0 != strides.count = 3` in
-        /// roughly one process in twelve. So while `coreml_models` ships fp32, the only safe
-        /// setting is the slow one, and `all` would reintroduce the abort.
+        /// The Neural Engine is fp16-only, so an fp32 model cannot reach it and silently runs
+        /// on the CPU at an eighth the speed -- and an fp32 model offered the GPU aborts the
+        /// process, MetalPerformanceShadersGraph failing `shape.count = 0 != strides.count =
+        /// 3` in roughly one process in twelve. Pointing this at an fp32 model therefore
+        /// wants `.cpu_only` or `.cpu_and_neural_engine`, and the slowdown is the price.
         ///
-        /// `models/gen-coreml.py` now converts fp16 by default, and handles the one constant
-        /// that makes a naive fp16 conversion of a BERT silently wrong. A model built with it
-        /// scores identically on every group in src/benchmark.zig and sits at cosine 0.999982
-        /// against the fp32 conversion, so flipping this to `.all` alongside that release is
-        /// worth 8x and costs nothing measurable.
-        compute_units: ComputeUnits = .cpu_and_neural_engine,
+        /// `models/gen-coreml.py` converts fp16 by default and handles the one constant that
+        /// makes a naive fp16 conversion of a BERT silently wrong.
+        compute_units: ComputeUnits = .all,
     };
 
     /// MLComputeUnits, whose values land in a CoreML API and so are fixed.

@@ -258,6 +258,20 @@ The model ships as a GitHub release tarball, so this cannot be finished from her
 coreml_models-5.0.0-AAAAAPi8Cg30SeBVYopp2lv7QG-GGvb099KEn_PG_s2l
 ```
 
-Until it is published, `InitOptions.compute_units` stays at `cpu_and_neural_engine`: the
-released model is still fp32, and `all` would hand it the GPU and bring the abort back. The
-default and the dependency have to move together.
+Released as `coreml-models-v5` on 2026-10-03, and the hash GitHub serves matches the one
+computed locally. `build.zig.zon` points at it and `compute_units` moved to `all` in the same
+commit -- they have to, because `all` against an fp32 model hands it the GPU and brings the
+abort back.
+
+Verified through the package manager rather than a local path, on a cleared `zig-out`:
+
+```
+zig-out/share/all_mpnet_base_v2.mlpackage   208M        (fp32 was 417M)
+embedbench --model mpnet                    249.3 chunks/s
+src/benchmark.zig mpnet total               88.5%       (unchanged)
+zig build test                              0 failures in 10
+zig build -Dllama test                      0 failures in 4
+```
+
+249.3 chunks/sec out of the released package is the Neural Engine figure, against 30.7 for
+the configuration v4 had to ship. The abort that started this is gone from the default build.
