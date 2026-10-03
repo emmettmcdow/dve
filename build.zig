@@ -47,6 +47,22 @@ pub fn build(b: *std.Build) !void {
     });
     for (model_installs) |s| b.getInstallStep().dependOn(s);
 
+    // The tests load a precompiled copy of the model -- see `addPrecompiledModelInstall`.
+    // Turning this off removes any copy an earlier build installed, so that a stale
+    // compiled model can never shadow the package it was built from.
+    const precompile_model = b.option(
+        bool,
+        "precompile-model",
+        "Precompile the mpnet model for the tests; needs Xcode's coremlcompiler (default: true)",
+    ) orelse true;
+    const precompiled_model: *Step = if (precompile_model)
+        addPrecompiledModelInstall(b, coreml_models)
+    else
+        &b.addRemoveDirTree(.{ .cwd_relative = b.getInstallPath(
+            .{ .custom = "share" },
+            "all_mpnet_base_v2.mlmodelc",
+        ) }).step;
+
     ////////////////////
     // Dependencies   //
     ////////////////////
@@ -108,6 +124,19 @@ pub fn build(b: *std.Build) !void {
     ////////////////
     // Unit Tests //
     ////////////////
+    // `zig build test` is the one way to run tests, and -Dtest-filter the one way to narrow
+    // it. Underneath it is one binary per source file, built and run in parallel, which is
+    // most of why it takes seconds: a single binary would compile and run on one core.
+    //
+    // A test binary runs the tests of its root file and of every file that root imports,
+    // so left unfiltered these overlap heavily -- the one rooted at vector.zig would rerun
+    // embed, vstore, codes, pfile, note_id_map, util and tokenizer. Each is therefore
+    // filtered to the tests declared in its own file, whose names all start "<file>.".
+    // Every file with tests needs a block of its own below for this to cover everything.
+    //
+    // -Dtest-filter replaces that filter rather than narrowing it, because filters can only
+    // be OR'd. A test that matches then runs once in every binary that imports its file.
+    const test_step = b.step("test", "Run all unit tests and the embedding quality benchmark");
     const filters: []const []const u8 = if (test_filter) |f| &.{f} else &.{};
 
     const runTest = struct {
@@ -146,8 +175,8 @@ pub fn build(b: *std.Build) !void {
         }
     }.real;
 
+    // src/vec_storage.zig
     // vec_storage and note_id_map tests use fake config + tracy only (no ObjC).
-    const test_vec_storage = b.step("test-vec_storage", "run tests for src/vec_storage.zig");
     {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -155,7 +184,7 @@ pub fn build(b: *std.Build) !void {
                 .target = target,
                 .optimize = optimize,
             }),
-            .filters = if (test_filter != null) filters else &.{},
+            .filters = if (test_filter != null) filters else &.{"vec_storage."},
         });
         t.root_module.addOptions("config", fake_options);
         t.root_module.addImport("tracy", tracy_dep.module("tracy"));
@@ -163,10 +192,10 @@ pub fn build(b: *std.Build) !void {
             t.root_module.linkLibrary(tracy_dep.artifact("tracy"));
             t.root_module.link_libcpp = true;
         }
-        test_vec_storage.dependOn(&runTest(b, t, use_lldb).step);
+        test_step.dependOn(&runTest(b, t, use_lldb).step);
     }
 
-    const test_pfile = b.step("test-pfile", "run tests for src/pfile.zig");
+    // src/pfile.zig
     {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -174,15 +203,15 @@ pub fn build(b: *std.Build) !void {
                 .target = target,
                 .optimize = optimize,
             }),
-            .filters = if (test_filter != null) filters else &.{},
+            .filters = if (test_filter != null) filters else &.{"pfile."},
         });
         // pfile is a thin shim straight onto libc -- open, pread, pwrite, fsync, fcntl --
         // so it needs libc and nothing else. No config, no tracy.
         t.root_module.link_libc = true;
-        test_pfile.dependOn(&runTest(b, t, use_lldb).step);
+        test_step.dependOn(&runTest(b, t, use_lldb).step);
     }
 
-    const test_vstore = b.step("test-vstore", "run tests for src/vstore.zig");
+    // src/vstore.zig
     {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -190,7 +219,7 @@ pub fn build(b: *std.Build) !void {
                 .target = target,
                 .optimize = optimize,
             }),
-            .filters = if (test_filter != null) filters else &.{},
+            .filters = if (test_filter != null) filters else &.{"vstore."},
         });
         // vstore does its file IO through src/pfile.zig, straight onto libc.
         t.root_module.link_libc = true;
@@ -200,10 +229,10 @@ pub fn build(b: *std.Build) !void {
             t.root_module.linkLibrary(tracy_dep.artifact("tracy"));
             t.root_module.link_libcpp = true;
         }
-        test_vstore.dependOn(&runTest(b, t, use_lldb).step);
+        test_step.dependOn(&runTest(b, t, use_lldb).step);
     }
 
-    const test_codes = b.step("test-codes", "run tests for src/codes.zig");
+    // src/codes.zig
     {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -211,15 +240,15 @@ pub fn build(b: *std.Build) !void {
                 .target = target,
                 .optimize = optimize,
             }),
-            .filters = if (test_filter != null) filters else &.{},
+            .filters = if (test_filter != null) filters else &.{"codes."},
         });
         // codes.zig knows nothing about storage, embeddings, or config -- but it saves and
         // loads itself through pfile.zig, which is a thin shim onto libc.
         t.root_module.link_libc = true;
-        test_codes.dependOn(&runTest(b, t, use_lldb).step);
+        test_step.dependOn(&runTest(b, t, use_lldb).step);
     }
 
-    const test_note_id_map = b.step("test-note_id_map", "run tests for src/note_id_map.zig");
+    // src/note_id_map.zig
     {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -227,7 +256,7 @@ pub fn build(b: *std.Build) !void {
                 .target = target,
                 .optimize = optimize,
             }),
-            .filters = if (test_filter != null) filters else &.{},
+            .filters = if (test_filter != null) filters else &.{"note_id_map."},
         });
         t.root_module.addOptions("config", fake_options);
         t.root_module.addImport("tracy", tracy_dep.module("tracy"));
@@ -235,10 +264,10 @@ pub fn build(b: *std.Build) !void {
             t.root_module.linkLibrary(tracy_dep.artifact("tracy"));
             t.root_module.link_libcpp = true;
         }
-        test_note_id_map.dependOn(&runTest(b, t, use_lldb).step);
+        test_step.dependOn(&runTest(b, t, use_lldb).step);
     }
 
-    const test_util = b.step("test-util", "run tests for src/util.zig");
+    // src/util.zig
     {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -246,13 +275,13 @@ pub fn build(b: *std.Build) !void {
                 .target = target,
                 .optimize = optimize,
             }),
-            .filters = if (test_filter != null) filters else &.{},
+            .filters = if (test_filter != null) filters else &.{"util."},
         });
         // util.zig has no external deps beyond std
-        test_util.dependOn(&runTest(b, t, use_lldb).step);
+        test_step.dependOn(&runTest(b, t, use_lldb).step);
     }
 
-    const test_tokenizer = b.step("test-tokenizer", "run tests for src/tokenizer.zig");
+    // src/tokenizer.zig
     {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -260,12 +289,12 @@ pub fn build(b: *std.Build) !void {
                 .target = target,
                 .optimize = optimize,
             }),
-            .filters = if (test_filter != null) filters else &.{},
+            .filters = if (test_filter != null) filters else &.{"tokenizer."},
         });
-        test_tokenizer.dependOn(&runTest(b, t, use_lldb).step);
+        test_step.dependOn(&runTest(b, t, use_lldb).step);
     }
 
-    const test_embed = b.step("test-embed", "run tests for src/embed.zig");
+    // src/embed.zig
     {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -273,17 +302,18 @@ pub fn build(b: *std.Build) !void {
                 .target = target,
                 .optimize = optimize,
             }),
-            .filters = if (test_filter != null) filters else &.{},
+            .filters = if (test_filter != null) filters else &.{"embed."},
         });
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
         // Compiles src/ directly, so it does not inherit the bridge from dve_mod.
         if (llama_bridge) |bridge| bridge.link(t.root_module);
         const run = runTest(b, t, use_lldb);
         for (model_installs) |s| run.step.dependOn(s);
-        test_embed.dependOn(&run.step);
+        run.step.dependOn(precompiled_model);
+        test_step.dependOn(&run.step);
     }
 
-    const test_vector = b.step("test-vector", "run tests for src/vector.zig");
+    // src/vector.zig
     {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -291,17 +321,18 @@ pub fn build(b: *std.Build) !void {
                 .target = target,
                 .optimize = optimize,
             }),
-            .filters = if (test_filter != null) filters else &.{},
+            .filters = if (test_filter != null) filters else &.{"vector."},
         });
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
         // Compiles src/ directly, so it does not inherit the bridge from dve_mod.
         if (llama_bridge) |bridge| bridge.link(t.root_module);
         const run = runTest(b, t, use_lldb);
         for (model_installs) |s| run.step.dependOn(s);
-        test_vector.dependOn(&run.step);
+        run.step.dependOn(precompiled_model);
+        test_step.dependOn(&run.step);
     }
 
-    const test_benchmark = b.step("test-benchmark", "run embedding quality benchmark tests");
+    // src/benchmark.zig
     {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -315,7 +346,8 @@ pub fn build(b: *std.Build) !void {
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
         const run = runTest(b, t, use_lldb);
         for (model_installs) |s| run.step.dependOn(s);
-        test_benchmark.dependOn(&run.step);
+        run.step.dependOn(precompiled_model);
+        test_step.dependOn(&run.step);
     }
 
     const test_profile = b.step("test-profile", "run profiling tests (not included in test step)");
@@ -332,6 +364,7 @@ pub fn build(b: *std.Build) !void {
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
         const run = runTest(b, t, use_lldb);
         for (model_installs) |s| run.step.dependOn(s);
+        run.step.dependOn(precompiled_model);
         test_profile.dependOn(&run.step);
     }
 
@@ -497,18 +530,6 @@ pub fn build(b: *std.Build) !void {
         beirbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
         beirbench_step.dependOn(b.getInstallStep());
     }
-
-    const test_step = b.step("test", "Run all unit tests");
-    test_step.dependOn(test_vec_storage);
-    test_step.dependOn(test_pfile);
-    test_step.dependOn(test_vstore);
-    test_step.dependOn(test_codes);
-    test_step.dependOn(test_note_id_map);
-    test_step.dependOn(test_util);
-    test_step.dependOn(test_tokenizer);
-    test_step.dependOn(test_embed);
-    test_step.dependOn(test_vector);
-    test_step.dependOn(test_benchmark);
 
     ///////////////////
     // XCFramework   //
@@ -681,6 +702,31 @@ fn addModelInstalls(b: *std.Build, dve_b: *std.Build, models: Models) []const *S
 const LLAMA_MODEL_FILE = "nomic-embed-text-v1.5.f32.gguf";
 const LLAMA_MODEL_URL = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/" ++
     LLAMA_MODEL_FILE;
+
+/// Compiles the mpnet `.mlpackage` to a `.mlmodelc` and installs it beside the package,
+/// where `MpnetEmbedder` prefers it. Returns the install step.
+///
+/// This is what keeps the tests fast. Loading from the package compiles it into a fresh
+/// temporary directory in every process, and CoreML then spends ~2.8s specializing the
+/// model for the Neural Engine. The OS caches that specialization by model path, so a
+/// compiled model at a stable path loads in ~60ms from the second process on.
+///
+/// The compile itself is cached by the build system and reruns only when the model
+/// package changes. It needs `coremlcompiler`, which ships with Xcode; pass
+/// `-Dprecompile-model=false` on a machine without it.
+fn addPrecompiledModelInstall(b: *std.Build, coreml_models: *std.Build.Dependency) *Step {
+    const compile = b.addSystemCommand(&.{ "xcrun", "coremlcompiler", "compile" });
+    compile.addDirectoryArg(coreml_models.path("all_mpnet_base_v2/all_mpnet_base_v2.mlpackage"));
+    const out = compile.addOutputDirectoryArg("mlmodelc");
+    // coremlcompiler reports the output path on stdout; capturing it keeps it quiet.
+    _ = compile.captureStdOut();
+    const install = b.addInstallDirectory(.{
+        .source_dir = out.path(b, "all_mpnet_base_v2.mlmodelc"),
+        .install_dir = .{ .custom = "share" },
+        .install_subdir = "all_mpnet_base_v2.mlmodelc",
+    });
+    return &install.step;
+}
 
 /// src/llama_bridge.c as a static library of its own, linked against a prebuilt
 /// llama.cpp. Building it as one artifact means the public `dve` module and the

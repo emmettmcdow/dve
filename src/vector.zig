@@ -1158,13 +1158,19 @@ test "init opts model paths" {
     defer arena.deinit();
     const alloc = arena.allocator();
 
-    // Under test the default model files live in <cwd>/zig-out/share.
+    // Under test the default model files live in <cwd>/zig-out/share. The build installs a
+    // compiled copy of the model there too, and naming that one keeps this test off the
+    // slow load of the package -- an explicit path is used as given, never swapped.
     const cwd = try std.fs.cwd().realpathAlloc(alloc, ".");
-    const model_path = try std.fmt.allocPrint(
+    const compiled_path = try std.fmt.allocPrint(
         alloc,
-        "{s}/zig-out/{s}",
-        .{ cwd, MpnetEmbedder.MODEL_PATH },
+        "{s}/zig-out/share/{s}",
+        .{ cwd, MpnetEmbedder.BUNDLE_MODEL_PATH },
     );
+    const model_path = if (std.fs.accessAbsolute(compiled_path, .{}))
+        compiled_path
+    else |_|
+        try std.fmt.allocPrint(alloc, "{s}/zig-out/{s}", .{ cwd, MpnetEmbedder.MODEL_PATH });
 
     // A copy of the tokenizer somewhere the default resolution would never look, so the
     // assertion below fails if opts is dropped on the way to the embedder.
@@ -1737,10 +1743,16 @@ test "embedTextAsync" {
     try db.embedTextAsync(path2, "pizza");
     try db.embedTextAsync(path3, "pizza");
 
-    std.Thread.sleep(2 * std.time.ns_per_s);
-
+    // The worker gets the same two seconds it always had, but the test stops waiting as
+    // soon as all three jobs have landed rather than sleeping the whole allowance.
     var buffer: [10]SearchResult = undefined;
-    const found = try db.search("pizza", &buffer);
+    var found: usize = 0;
+    var timer = try std.time.Timer.start();
+    while (timer.read() < 2 * std.time.ns_per_s) {
+        found = try db.search("pizza", &buffer);
+        if (found == 3) break;
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
     try expectEqual(3, found);
 
     try db.validate();

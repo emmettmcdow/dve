@@ -311,9 +311,7 @@ pub const File = struct {
 /// survived, so a crash can leave the old name pointing at the old contents. Syncing the
 /// containing directory afterwards is what commits the swap.
 pub fn syncFd(fd: c_int) SyncError!void {
-    if (is_darwin) {
-        if (c.fcntl(fd, F_FULLFSYNC, @as(c_int, 0)) != -1) return;
-    }
+    if (full_sync and fullSync(fd)) return;
     while (true) {
         if (c.fsync(fd) == 0) return;
         switch (errno()) {
@@ -323,6 +321,19 @@ pub fn syncFd(fd: c_int) SyncError!void {
             else => |e| return unexpected("fsync", e),
         }
     }
+}
+
+/// Whether `syncFd` waits for the drive to empty its write cache.
+///
+/// Off under test, where it is all cost and no coverage: no test can cut the power, so none
+/// can tell the full flush from a plain `fsync`, and at 5-10ms a call it was a third of the
+/// suite's run time -- every embedded document commits at least twice. The call itself is
+/// still exercised, by the one test below that makes it directly.
+const full_sync = is_darwin and !builtin.is_test;
+
+/// Asks the drive to commit its write cache. False if the filesystem cannot.
+fn fullSync(fd: c_int) bool {
+    return c.fcntl(fd, F_FULLFSYNC, @as(c_int, 0)) != -1;
 }
 
 // ****************************************************************************************** Tests
@@ -423,6 +434,17 @@ test "sync commits without error" {
     defer f.close();
     try f.writeAt("durable", 0);
     try f.sync();
+}
+
+// `syncFd` skips the full flush under test, so this is the only place it runs.
+test "sync: the full flush succeeds on a local file" {
+    if (!is_darwin) return error.SkipZigTest;
+    var tmpD = tmpDir(.{});
+    defer tmpD.cleanup();
+    const f = try openTmp(tmpD.dir, "a.bin", .{});
+    defer f.close();
+    try f.writeAt("durable", 0);
+    try std.testing.expect(fullSync(f.fd));
 }
 
 test "contents survive close and reopen" {

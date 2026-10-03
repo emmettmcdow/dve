@@ -146,16 +146,20 @@ fn sequentialEmbedBatch(comptime embedOne: EmbedFn) EmbedBatchFn {
 /// Metal teardown asserting against static destructors -- and one retained model is a far
 /// cheaper problem than that.
 const ModelCache = struct {
-    /// Guards the table below.
+    /// Guards the tables below.
     var mutex: Mutex = .{};
     var by_path: ?std.StringHashMap(Object) = null;
+    /// Parsed tokenizers, keyed and retained the same way as the models.
+    var tokenizers: ?std.StringHashMap(*WordPieceTokenizer) = null;
     /// Held across `MLModel` prediction. Process-wide because the models are.
     var predict_mutex: Mutex = .{};
 };
 
 pub const MpnetEmbedder = struct {
     model: Object,
-    tokenizer: tokenizer_mod.WordPieceTokenizer,
+    /// Shared with every other embedder that loaded the same file -- see `ModelCache`.
+    tokenizer: *tokenizer_mod.WordPieceTokenizer,
+    /// Owns the two paths below, and nothing else now that the tokenizer is shared.
     tokenizer_alloc: std.heap.ArenaAllocator,
     /// The files this embedder actually loaded, after option/bundle/exe-relative resolution.
     /// Owned by `tokenizer_alloc`.
@@ -237,32 +241,7 @@ pub const MpnetEmbedder = struct {
                 return error.TokenizerLoadFailed;
             };
 
-        const tokenizer_file = std.fs.cwd().openFile(tokenizer_path, .{}) catch |err| {
-            if (err == error.FileNotFound) {
-                logModelNotFound("mpnet tokenizer", tokenizer_path, DOWNLOAD_CMD, "tokenizer_path");
-                return error.ModelNotFound;
-            }
-            std.log.err("Failed to open tokenizer.json: {}\n", .{err});
-            return error.TokenizerLoadFailed;
-        };
-        defer tokenizer_file.close();
-
-        const tokenizer_json = tokenizer_file.readToEndAlloc(
-            tokenizer_alloc.allocator(),
-            10 * 1024 * 1024,
-        ) catch |err| {
-            std.log.err("Failed to read tokenizer.json: {}\n", .{err});
-            return error.TokenizerLoadFailed;
-        };
-
-        var tok: WordPieceTokenizer = undefined;
-        tok.init(
-            tokenizer_alloc.allocator(),
-            tokenizer_json,
-        ) catch |err| {
-            std.log.err("Failed to parse tokenizer.json: {}\n", .{err});
-            return error.TokenizerParseFailed;
-        };
+        const tok = try acquireTokenizer(tokenizer_path);
 
         const NSString = objc.getClass("NSString") orelse {
             std.log.err("Failed to get NSString class\n", .{});
@@ -278,9 +257,12 @@ pub const MpnetEmbedder = struct {
         const full_path: [:0]const u8 = if (opts.model_path) |p|
             tokenizer_alloc.allocator().dupeZ(u8, p) catch return error.PathAllocFailed
         else
-            getModelPath(tokenizer_alloc.allocator(), MODEL_PATH, BUNDLE_MODEL_PATH) catch {
-                return error.PathAllocFailed;
-            };
+            preferPrecompiled(
+                tokenizer_alloc.allocator(),
+                getModelPath(tokenizer_alloc.allocator(), MODEL_PATH, BUNDLE_MODEL_PATH) catch {
+                    return error.PathAllocFailed;
+                },
+            ) catch return error.PathAllocFailed;
         std.fs.cwd().access(full_path, .{}) catch {
             logModelNotFound("mpnet model", full_path, DOWNLOAD_CMD, "model_path");
             return error.ModelNotFound;
@@ -315,6 +297,49 @@ pub const MpnetEmbedder = struct {
             .loaded_model_path = full_path,
             .loaded_tokenizer_path = tokenizer_path,
         };
+    }
+
+    /// Returns the tokenizer parsed from `path`. Reads and parses it on the first call for
+    /// that path and never again: the vocabulary is read-only once built, so every embedder
+    /// in the process can share one, and parsing it was most of what a second `init` cost.
+    fn acquireTokenizer(path: []const u8) !*WordPieceTokenizer {
+        ModelCache.mutex.lock();
+        defer ModelCache.mutex.unlock();
+
+        if (ModelCache.tokenizers == null) {
+            ModelCache.tokenizers =
+                std.StringHashMap(*WordPieceTokenizer).init(std.heap.page_allocator);
+        }
+        if (ModelCache.tokenizers.?.get(path)) |cached| return cached;
+
+        // Lives as long as the cache entry does, which is the life of the process.
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        errdefer arena.deinit();
+        const allocator = arena.allocator();
+
+        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+            if (err == error.FileNotFound) {
+                logModelNotFound("mpnet tokenizer", path, DOWNLOAD_CMD, "tokenizer_path");
+                return error.ModelNotFound;
+            }
+            std.log.err("Failed to open tokenizer.json: {}\n", .{err});
+            return error.TokenizerLoadFailed;
+        };
+        defer file.close();
+        const json = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch |err| {
+            std.log.err("Failed to read tokenizer.json: {}\n", .{err});
+            return error.TokenizerLoadFailed;
+        };
+
+        const tok = allocator.create(WordPieceTokenizer) catch return error.TokenizerLoadFailed;
+        tok.init(allocator, json) catch |err| {
+            std.log.err("Failed to parse tokenizer.json: {}\n", .{err});
+            return error.TokenizerParseFailed;
+        };
+
+        const key = allocator.dupe(u8, path) catch return error.TokenizerLoadFailed;
+        ModelCache.tokenizers.?.put(key, tok) catch return error.TokenizerLoadFailed;
+        return tok;
     }
 
     /// Returns the model for `path`, with one retain transferred to the caller. Compiles and
@@ -720,6 +745,27 @@ fn getModelPath(
     return try getExeRelativePath(allocator, exe_relative_path);
 }
 
+/// Returns the `.mlmodelc` beside `path` when `path` is an `.mlpackage` and one is there,
+/// and `path` itself otherwise.
+///
+/// A package has to be compiled before it can be loaded, into a temporary directory that
+/// is different in every process. The compile is quick; what it costs is the load after
+/// it, because the OS caches its Neural Engine specialization by model path and a fresh
+/// path never hits. Measured: 2.8s to load from the package, 60ms from a compiled model
+/// that has been loaded from the same place before.
+fn preferPrecompiled(allocator: Allocator, path: [:0]const u8) ![:0]const u8 {
+    const package_ext = ".mlpackage";
+    if (!std.mem.endsWith(u8, path, package_ext)) return path;
+    const compiled = try std.fmt.allocPrintSentinel(
+        allocator,
+        "{s}.mlmodelc",
+        .{path[0 .. path.len - package_ext.len]},
+        0,
+    );
+    std.fs.accessAbsolute(compiled, .{}) catch return path;
+    return compiled;
+}
+
 fn getExeRelativePath(allocator: Allocator, relative_path: []const u8) ![:0]const u8 {
     var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_path = std.fs.selfExeDirPath(&exe_path_buf) catch |err| {
@@ -881,7 +927,7 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
     pub const VEC_TYPE = f32;
     pub const ID = EmbeddingModel.llama_nomic_embed_text_v1_5_f32;
     pub const REFERENCE_IMPLEMENTATION_NAME = "llama-nomic-embed-text-v1-5-f32";
-    // Tuned against test-benchmark, which scores both matches and non-matches
+    // Tuned against src/benchmark.zig, which scores both matches and non-matches
     // through this cutoff: 0.55 peaks at 89.6%, against 81.7% at 0.45 and 79.1%
     // at 0.65. nomic-embed's similarities sit higher than mpnet's, so mpnet's
     // 0.40 let far too much through.
@@ -1583,116 +1629,6 @@ test "embed - mpnetembed survives repeated reload" {
         defer arena.deinit();
         const out = try e.embed(arena.allocator(), "Hello world");
         try std.testing.expect(out != null);
-    }
-}
-
-fn gpuPathProbe(model_path: []const u8, tokenizer_path: []const u8) !void {
-    std.fs.cwd().access(model_path, .{}) catch return error.SkipZigTest;
-    for (0..3) |_| {
-        var m = try MpnetEmbedder.init(.{
-            .model_path = model_path,
-            .tokenizer_path = tokenizer_path,
-            .compute_units = .all,
-        });
-        defer m.deinit();
-        var e = m.embedder();
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        for (0..3) |_| {
-            const out = try e.embed(arena.allocator(), "The quick brown fox jumps over the lazy dog");
-            try std.testing.expect(out != null);
-        }
-    }
-}
-
-test "ZPROBE gpu fp32 control" {
-    try gpuPathProbe(
-        "/Users/emcdow/dve/models/all_mpnet_base_v2/all_mpnet_base_v2.mlpackage",
-        "/Users/emcdow/dve/models/all_mpnet_base_v2/tokenizer.json",
-    );
-}
-
-test "ZPROBE gpu fp16 treatment" {
-    try gpuPathProbe("/tmp/claude-501/-Users-emcdow-dve/aed3ee2d-b3c3-4911-99e5-c23ce52485aa/scratchpad/fp16/fp16.mlpackage", "/tmp/claude-501/-Users-emcdow-dve/aed3ee2d-b3c3-4911-99e5-c23ce52485aa/scratchpad/fp16/tokenizer.json");
-}
-
-const PR_REF_M = "/Users/emcdow/dve/models/all_mpnet_base_v2/all_mpnet_base_v2.mlpackage";
-const PR_REF_T = "/Users/emcdow/dve/models/all_mpnet_base_v2/tokenizer.json";
-const PR_NEW_M = "/tmp/claude-501/-Users-emcdow-dve/aed3ee2d-b3c3-4911-99e5-c23ce52485aa/scratchpad/fp16safe/fp16safe.mlpackage";
-const PR_NEW_T = "/tmp/claude-501/-Users-emcdow-dve/aed3ee2d-b3c3-4911-99e5-c23ce52485aa/scratchpad/fp16safe/tokenizer.json";
-
-const pr_sentences = [_][]const u8{
-    "The quick brown fox jumps over the lazy dog",
-    "Machine learning models convert text into vector representations",
-    "Mitochondria generate most of the chemical energy a cell needs",
-    "Paris is the capital and most populous city of France",
-    "Sourdough needs a twelve hour bulk ferment before shaping",
-};
-
-fn prCos(a: []const f32, b: []const f32) f64 {
-    var d: f64 = 0;
-    for (a, b) |x, y| d += @as(f64, x) * @as(f64, y);
-    return d;
-}
-
-test "ZSANITY fp16safe" {
-    std.fs.cwd().access(PR_NEW_M, .{}) catch return error.SkipZigTest;
-    var n = try MpnetEmbedder.init(.{ .model_path = PR_NEW_M, .tokenizer_path = PR_NEW_T });
-    defer n.deinit();
-    var r = try MpnetEmbedder.init(.{ .model_path = PR_REF_M, .tokenizer_path = PR_REF_T });
-    defer r.deinit();
-    var en = n.embedder();
-    var er = r.embedder();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    var worst: f64 = 1;
-    for (pr_sentences) |sent| {
-        worst = @min(worst, prCos(
-            (try en.embed(a, sent)).?.slice(),
-            (try er.embed(a, sent)).?.slice(),
-        ));
-    }
-    std.debug.print("PROBE fp16safe vs fp32 reference min cosine: {d:.6}\n", .{worst});
-
-    const words = [_][]const u8{ "dog", "puppy", "airplane", "a cat sat on the mat", "a feline rested on the rug", "quantum chromodynamics" };
-    var v: [words.len][]const f32 = undefined;
-    for (words, 0..) |w, i| v[i] = (try en.embed(a, w)).?.slice();
-    std.debug.print("PROBE fp16safe: dog~puppy {d:.3}  dog~airplane {d:.3}  cat~feline {d:.3}  cat~qcd {d:.3}\n", .{
-        prCos(v[0], v[1]), prCos(v[0], v[2]), prCos(v[3], v[4]), prCos(v[3], v[5]),
-    });
-}
-
-fn prSpeed(label: []const u8, m: []const u8, t: []const u8, cu: MpnetEmbedder.ComputeUnits) !void {
-    std.fs.cwd().access(m, .{}) catch return error.SkipZigTest;
-    var e0 = try MpnetEmbedder.init(.{ .model_path = m, .tokenizer_path = t, .compute_units = cu });
-    defer e0.deinit();
-    var e = e0.embedder();
-    var warm = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer warm.deinit();
-    for (0..5) |_| _ = try e.embed(warm.allocator(), pr_sentences[0]);
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const n = 60;
-    var timer = try std.time.Timer.start();
-    for (0..n) |i| _ = try e.embed(arena.allocator(), pr_sentences[i % pr_sentences.len]);
-    const secs = @as(f64, @floatFromInt(timer.read())) / std.time.ns_per_s;
-    std.debug.print("PROBE {s: <18} {d: >8.1} chunks/s\n", .{ label, @as(f64, n) / secs });
-}
-
-test "ZSPEED fp16safe all" { try prSpeed("fp16safe all", PR_NEW_M, PR_NEW_T, .all); }
-test "ZSPEED fp16safe ane" { try prSpeed("fp16safe cpu+ane", PR_NEW_M, PR_NEW_T, .cpu_and_neural_engine); }
-
-test "ZCRASH fp16safe all" {
-    std.fs.cwd().access(PR_NEW_M, .{}) catch return error.SkipZigTest;
-    for (0..3) |_| {
-        var m = try MpnetEmbedder.init(.{ .model_path = PR_NEW_M, .tokenizer_path = PR_NEW_T, .compute_units = .all });
-        defer m.deinit();
-        var e = m.embedder();
-        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-        defer arena.deinit();
-        for (0..3) |_| _ = try e.embed(arena.allocator(), pr_sentences[0]);
     }
 }
 
