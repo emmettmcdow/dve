@@ -61,6 +61,12 @@ To promote an RC to a final release, run `gh release create` for the final tag. 
 # Every unit test plus the embedding quality benchmark. Run it on every change.
 zig build test
 
+# The benchmark is silent while its scores sit within tolerance of their baselines (see
+# "Scoring" in src/benchmark.zig) and fails with the full table otherwise. To see the table
+# anyway, or to include the llama model, which is only linked on request:
+zig build test -Dbench-report
+zig build test -Dllama
+
 # Narrow it by test name, or to one file's tests by its "<file>." prefix
 zig build test -Dtest-filter="search mpnet"
 zig build test -Dtest-filter="vstore."

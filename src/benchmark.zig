@@ -576,107 +576,156 @@ fn absentAnswer(comptime model: EmbeddingModel) !void {
 // model's totals test has to follow that model's cases.
 
 test "mpnet_embedding: binary single words" {
-    try binarySingleWords(.mpnet_embedding);
+    try runCase(.mpnet_embedding, binarySingleWords);
 }
 test "mpnet_embedding: sentence similarity" {
-    try sentenceSimilarity(.mpnet_embedding);
+    try runCase(.mpnet_embedding, sentenceSimilarity);
 }
 test "mpnet_embedding: sentence split - 1/3 match" {
-    try sentenceSplit(.mpnet_embedding);
+    try runCase(.mpnet_embedding, sentenceSplit);
 }
 test "mpnet_embedding: query length parity" {
-    try queryLengthParity(.mpnet_embedding);
+    try runCase(.mpnet_embedding, queryLengthParity);
 }
 test "mpnet_embedding: long complex sentences" {
-    try longComplexSentences(.mpnet_embedding);
+    try runCase(.mpnet_embedding, longComplexSentences);
 }
 test "mpnet_embedding: markdown structure" {
-    try markdownStructure(.mpnet_embedding);
+    try runCase(.mpnet_embedding, markdownStructure);
 }
 test "mpnet_embedding: distractor density" {
-    try distractorDensity(.mpnet_embedding);
+    try runCase(.mpnet_embedding, distractorDensity);
 }
 test "mpnet_embedding: absent answer precision" {
-    try absentAnswer(.mpnet_embedding);
+    try runCase(.mpnet_embedding, absentAnswer);
 }
 test "mpnet_embedding: all" {
-    reportTotal(.mpnet_embedding);
+    try checkTotal(.mpnet_embedding);
 }
 
 test "apple_nlembedding: binary single words" {
-    try binarySingleWords(.apple_nlembedding);
+    try runCase(.apple_nlembedding, binarySingleWords);
 }
 test "apple_nlembedding: sentence similarity" {
-    try sentenceSimilarity(.apple_nlembedding);
+    try runCase(.apple_nlembedding, sentenceSimilarity);
 }
 test "apple_nlembedding: sentence split - 1/3 match" {
-    try sentenceSplit(.apple_nlembedding);
+    try runCase(.apple_nlembedding, sentenceSplit);
 }
 test "apple_nlembedding: query length parity" {
-    try queryLengthParity(.apple_nlembedding);
+    try runCase(.apple_nlembedding, queryLengthParity);
 }
 test "apple_nlembedding: long complex sentences" {
-    try longComplexSentences(.apple_nlembedding);
+    try runCase(.apple_nlembedding, longComplexSentences);
 }
 test "apple_nlembedding: markdown structure" {
-    try markdownStructure(.apple_nlembedding);
+    try runCase(.apple_nlembedding, markdownStructure);
 }
 test "apple_nlembedding: distractor density" {
-    try distractorDensity(.apple_nlembedding);
+    try runCase(.apple_nlembedding, distractorDensity);
 }
 test "apple_nlembedding: absent answer precision" {
-    try absentAnswer(.apple_nlembedding);
+    try runCase(.apple_nlembedding, absentAnswer);
 }
 test "apple_nlembedding: all" {
-    reportTotal(.apple_nlembedding);
+    try checkTotal(.apple_nlembedding);
 }
 
 // The llama backend is only linked with -Dllama, so these skip by default
 // rather than failing a plain `zig build test`.
 test "llama_nomic_embed_text_v1_5_f32: binary single words" {
     if (!dve.llama.enabled) return error.SkipZigTest;
-    try binarySingleWords(.llama_nomic_embed_text_v1_5_f32);
+    try runCase(.llama_nomic_embed_text_v1_5_f32, binarySingleWords);
 }
 test "llama_nomic_embed_text_v1_5_f32: sentence similarity" {
     if (!dve.llama.enabled) return error.SkipZigTest;
-    try sentenceSimilarity(.llama_nomic_embed_text_v1_5_f32);
+    try runCase(.llama_nomic_embed_text_v1_5_f32, sentenceSimilarity);
 }
 test "llama_nomic_embed_text_v1_5_f32: sentence split - 1/3 match" {
     if (!dve.llama.enabled) return error.SkipZigTest;
-    try sentenceSplit(.llama_nomic_embed_text_v1_5_f32);
+    try runCase(.llama_nomic_embed_text_v1_5_f32, sentenceSplit);
 }
 test "llama_nomic_embed_text_v1_5_f32: query length parity" {
     if (!dve.llama.enabled) return error.SkipZigTest;
-    try queryLengthParity(.llama_nomic_embed_text_v1_5_f32);
+    try runCase(.llama_nomic_embed_text_v1_5_f32, queryLengthParity);
 }
 test "llama_nomic_embed_text_v1_5_f32: long complex sentences" {
     if (!dve.llama.enabled) return error.SkipZigTest;
-    try longComplexSentences(.llama_nomic_embed_text_v1_5_f32);
+    try runCase(.llama_nomic_embed_text_v1_5_f32, longComplexSentences);
 }
 test "llama_nomic_embed_text_v1_5_f32: markdown structure" {
     if (!dve.llama.enabled) return error.SkipZigTest;
-    try markdownStructure(.llama_nomic_embed_text_v1_5_f32);
+    try runCase(.llama_nomic_embed_text_v1_5_f32, markdownStructure);
 }
 test "llama_nomic_embed_text_v1_5_f32: distractor density" {
     if (!dve.llama.enabled) return error.SkipZigTest;
-    try distractorDensity(.llama_nomic_embed_text_v1_5_f32);
+    try runCase(.llama_nomic_embed_text_v1_5_f32, distractorDensity);
 }
 test "llama_nomic_embed_text_v1_5_f32: absent answer precision" {
     if (!dve.llama.enabled) return error.SkipZigTest;
-    try absentAnswer(.llama_nomic_embed_text_v1_5_f32);
+    try runCase(.llama_nomic_embed_text_v1_5_f32, absentAnswer);
 }
 test "llama_nomic_embed_text_v1_5_f32: all" {
     if (!dve.llama.enabled) return error.SkipZigTest;
-    reportTotal(.llama_nomic_embed_text_v1_5_f32);
+    try checkTotal(.llama_nomic_embed_text_v1_5_f32);
 }
 
 /////////////
 // Scoring //
 /////////////
+// A passing run prints nothing. Each case is held to a recorded baseline, and a case that
+// lands outside its tolerance fails with its own row; the totals test then prints the whole
+// table. `-Dbench-report` prints the table regardless.
+//
+// The tolerance is deliberately loose. These models are not bit-reproducible across
+// hardware -- an Intel Mac and an M5 score slightly differently -- so the baselines are
+// there to catch a real regression (or a real improvement that deserves a new baseline),
+// not a flipped tie.
 const t_all = "all";
 
-const Score = struct { got: usize = 0, total: usize = 0 };
-var totals = std.EnumArray(EmbeddingModel, Score).initFill(.{});
+const N_CASES = 8;
+
+/// Scores recorded on an M-series Mac, in the order the cases are declared.
+fn baseline(model: EmbeddingModel) [N_CASES]usize {
+    return switch (model) {
+        .mpnet_embedding => .{ 280, 380, 325, 396, 338, 150, 60, 50 },
+        .apple_nlembedding => .{ 260, 280, 300, 264, 182, 140, 30, 50 },
+        .llama_nomic_embed_text_v1_5_f32 => .{ 320, 390, 300, 396, 338, 150, 60, 50 },
+    };
+}
+const labels = [N_CASES][]const u8{ t1, t2, t3, t4, t5, t6, t7, t8 };
+
+/// The baselines were recorded with unquantized storage; quantizing moves the scores.
+const check_baselines = config.quant == .none;
+
+/// How far a case may land from its baseline, in points: a tenth of what the case is worth,
+/// and never less than two questions' worth so the small cases are not hair-triggered.
+fn caseTolerance(total: usize) usize {
+    return @max(total / 10, 20);
+}
+
+/// The total gets a tighter leash than the cases do, so that every case drifting the same
+/// way within its own tolerance still gets noticed.
+fn totalTolerance(total: usize) usize {
+    return total / 20;
+}
+
+const Row = struct {
+    label: []const u8,
+    got: usize,
+    total: usize,
+    want: ?usize,
+    tolerance: usize,
+
+    fn ok(self: Row) bool {
+        const want = self.want orelse return true;
+        const diff = if (self.got > want) self.got - want else want - self.got;
+        return diff <= self.tolerance;
+    }
+};
+
+const Board = struct { rows: [N_CASES]Row = undefined, n: usize = 0 };
+var boards = std.EnumArray(EmbeddingModel, Board).initFill(.{});
 
 fn outputContains(output: []SearchResult, path: []const u8) bool {
     for (output) |out_item| {
@@ -686,29 +735,80 @@ fn outputContains(output: []SearchResult, path: []const u8) bool {
 }
 
 fn reportTest(model: EmbeddingModel, label: []const u8, got: usize, total: usize) void {
-    report(model, label, got, total);
-    const t = totals.getPtr(model);
-    t.got += got;
-    t.total += total;
+    const board = boards.getPtr(model);
+    const want: ?usize = for (labels, baseline(model)) |l, b| {
+        if (check_baselines and std.mem.eql(u8, l, label)) break b;
+    } else null;
+    board.rows[board.n] = .{
+        .label = label,
+        .got = got,
+        .total = total,
+        .want = want,
+        .tolerance = caseTolerance(total),
+    };
+    board.n += 1;
 }
 
-fn reportTotal(model: EmbeddingModel) void {
-    const t = totals.get(model);
-    report(model, t_all, t.got, t.total);
+/// Runs one case and holds the row it recorded to its baseline.
+fn runCase(comptime model: EmbeddingModel, comptime case: anytype) !void {
+    try case(model);
+    const board = boards.get(model);
+    const row = board.rows[board.n - 1];
+    if (!row.ok()) {
+        report(model, row);
+        return error.UnexpectedBenchmarkScore;
+    }
+    if (config.report) report(model, row);
 }
 
-fn report(model: EmbeddingModel, label: []const u8, got: usize, total: usize) void {
+fn checkTotal(model: EmbeddingModel) !void {
+    const board = boards.get(model);
+    const rows = board.rows[0..board.n];
+
+    var all: Row = .{ .label = t_all, .got = 0, .total = 0, .want = null, .tolerance = 0 };
+    var cases_ok = true;
+    for (rows) |row| {
+        all.got += row.got;
+        all.total += row.total;
+        cases_ok = cases_ok and row.ok();
+    }
+    // Under a -Dtest-filter that ran only some of the cases there is no total to hold to.
+    if (check_baselines and rows.len == N_CASES) {
+        all.want = 0;
+        for (baseline(model)) |b| all.want.? += b;
+        all.tolerance = totalTolerance(all.total);
+    }
+
+    if (cases_ok and all.ok()) {
+        if (config.report and rows.len > 0) report(model, all);
+        return;
+    }
+    // The cases that failed have printed their own rows already, but the table is only
+    // readable whole.
+    std.debug.print("\n", .{});
+    for (rows) |row| report(model, row);
+    report(model, all);
+    return error.UnexpectedBenchmarkScore;
+}
+
+fn report(model: EmbeddingModel, row: Row) void {
     var buf: [50]u8 = undefined;
-    const frac = std.fmt.bufPrint(&buf, "{d} / {d}", .{ got, total }) catch @panic("don't care");
-    std.debug.print("{s:<18} | {s:<26} | {s:^13} | {d:.1}% \n", .{
+    const frac = std.fmt.bufPrint(&buf, "{d} / {d}", .{ row.got, row.total }) catch
+        @panic("don't care");
+    std.debug.print("{s:<18} | {s:<26} | {s:^13} | {d:>5.1}%", .{
         @tagName(model),
-        label,
+        row.label,
         frac,
-        (@as(f32, @floatFromInt(got)) / @as(f32, @floatFromInt(total))) * 100,
+        (@as(f32, @floatFromInt(row.got)) / @as(f32, @floatFromInt(row.total))) * 100,
     });
+    if (!row.ok()) {
+        std.debug.print(" | UNEXPECTED: baseline {d} +/- {d}", .{ row.want.?, row.tolerance });
+    }
+    std.debug.print("\n", .{});
 }
 
 const std = @import("std");
+const config = @import("bench_config");
 const testing_allocator = std.testing.allocator;
 
 const dve = @import("dve");

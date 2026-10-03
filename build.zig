@@ -26,6 +26,11 @@ pub fn build(b: *std.Build) !void {
         "llama-path",
         "Path to a built llama.cpp checkout (default: $HOME/llama.cpp)",
     ) orelse b.pathJoin(&.{ std.posix.getenv("HOME") orelse ".", "llama.cpp" });
+    const bench_report = b.option(
+        bool,
+        "bench-report",
+        "Print the embedding quality benchmark's scores even when they match their baselines",
+    ) orelse false;
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -344,6 +349,12 @@ pub fn build(b: *std.Build) !void {
         });
         t.root_module.addImport("dve", dve_mod);
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        // Its own options module: "config" already reaches this binary through dve, and a
+        // file cannot belong to two modules.
+        const bench_options = b.addOptions();
+        bench_options.addOption(bool, "report", bench_report);
+        bench_options.addOption(StorageQuantize, "quant", quant);
+        t.root_module.addOptions("bench_config", bench_options);
         const run = runTest(b, t, use_lldb);
         for (model_installs) |s| run.step.dependOn(s);
         run.step.dependOn(precompiled_model);
