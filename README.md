@@ -1,12 +1,21 @@
 # dve - dve vector engine
-dve is a library for creating and searching vector embeddings locally on Apple devices.
-Built with Zig. Experimental Swift bindings are also available.
+dve is a vector search library for Apple devices.
 
 dve is early-stage and actively developed. Bug reports, issues, and pull requests are welcome on
 GitHub.
 
 If you're trying dve and run into trouble, feel free to reach out directly:
 [@emmettmcdow](https://github.com/emmettmcdow).
+
+
+## Why
+dve aims to be the SQLite of search. It should run quickly on hardware large and small. Also:
+
+- search is hard (let dve do it for you)
+- it's free, it doesn't call out to inference APIs (let dve do it for you)
+- portable and lightweight inference is tricky (let dve do it for you)
+- ... especially on Apple devices (let dve do it for you)
+
 
 ## Usage
 ```zig
@@ -30,27 +39,18 @@ const n = try vectors.search("artificial intelligence", &results);
 // results[0].path == "doc1"
 ```
 
-See the [examples](./examples) directory for complete working demos in Zig and Swift.
+See the [examples](./examples) directory for complete working demos in Zig.
 See [USAGE.md](./USAGE.md) for installation and full usage details.
 
-## Why
-Vector search is a powerful tool for apps, but on-device implementations are surprisingly hard to
-come by. Developers typically choose between calling a cloud API (adding cost and a third-party
-dependency) or reaching for heavy all-in-one frameworks like Hugging Face Transformers.
-
-This problem is especially acute on Apple platforms. ML frameworks overwhelmingly prioritize
-Linux servers, CoreML is poorly documented, and cross-platform libraries rarely integrate cleanly
-into macOS or iOS apps. dve was built to fill that gap. It starts with Apple with portability as a
-core design goal.
 
 ## Core Principles
-- Portable - dve should use few libraries, such that it can be easily used on any platform.
+- Fast - dve ought to be the fastest local search library.
 - Simple - dve should have a simple but configurable interface, with sane defaults.
-- Local - dve should run performantly, and should never make network calls.
+- Local - dve should run on a single machine without making API calls.
+
 
 ## Roadmap
 - Add Linux support.
-- Make Swift bindings more stable.
 - Make C/C++ bindings more stable.
 - iOS support.
 - Multi-modal embedding support.
