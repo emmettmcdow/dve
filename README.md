@@ -39,7 +39,7 @@ const n = try vectors.search("artificial intelligence", &results);
 // results[0].path == "doc1"
 ```
 
-See the [examples](./examples) directory for complete working demos in Zig and Swift.
+See the [examples](./examples) directory for complete working demos in Zig.
 See [USAGE.md](./USAGE.md) for installation and full usage details.
 
 

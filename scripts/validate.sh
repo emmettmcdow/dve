@@ -2,24 +2,18 @@
 # validate.sh - Verifies that examples/ and bindings/ all build cleanly.
 #
 # This is deliberately separate from `zig build test` (unit tests).
-# It is slow: it builds the XCFramework, Swift packages, and Zig examples.
+# It is slow: it builds the XCFramework and Zig examples.
 # Run it before releases or after touching bindings/examples.
 #
 # Usage:
 #   ./scripts/validate.sh              # run all checks
-#   ./scripts/validate.sh --skip-swift # skip Swift builds (saves several minutes)
 #
-# Requirements: zig and swift must be on PATH.
+# Requirements: zig must be on PATH.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
-
-SKIP_SWIFT=false
-for arg in "$@"; do
-    case $arg in --skip-swift) SKIP_SWIFT=true ;; esac
-done
 
 # ---- Helpers ----------------------------------------------------------------
 
@@ -49,17 +43,6 @@ check "zig build" bash -c "cd '$REPO_ROOT/examples/zig' && zig build"
 
 section "bindings/c (via xcframework)"
 check "zig build xcframework" zig build xcframework
-
-if [ "$SKIP_SWIFT" = true ]; then
-    echo
-    echo "==> Swift (skipped via --skip-swift)"
-else
-    section "Package.swift (root)"
-    check "swift build" swift build --package-path "$REPO_ROOT"
-
-    section "examples/swift"
-    check "swift build" swift build --package-path "$REPO_ROOT/examples/swift"
-fi
 
 # ---- Summary ----------------------------------------------------------------
 
