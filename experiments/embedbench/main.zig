@@ -125,7 +125,7 @@ pub fn main() !void {
         },
         .llama => {
             if (!dve.llama.enabled) fatal("built without -Dllama", .{});
-            var m = try embed.LlamaNomicEmbedTextV15F32.init();
+            var m = try embed.LlamaNomicEmbedTextV15F32.init(.{});
             defer m.deinit();
             var e = m.embedder();
             try run(allocator, &e, docs, opts, byte_n);

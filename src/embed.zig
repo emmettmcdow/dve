@@ -175,6 +175,10 @@ pub const MpnetEmbedder = struct {
     pub const TOKENIZER_PATH = "share/tokenizer.json";
     pub const BUNDLE_MODEL_PATH = "all_mpnet_base_v2.mlmodelc";
     pub const BUNDLE_TOKENIZER_PATH = "tokenizer.json";
+    /// Fetches the model and tokenizer into ./all_mpnet_base_v2/. The release is the one
+    /// build.zig.zon pins as `coreml_models`; keep the two, and USAGE.md, in step.
+    pub const DOWNLOAD_CMD = "curl -L https://github.com/emmettmcdow/dve/releases/download/" ++
+        "coreml-models-v5/coreml_models_v5.tar.gz | tar -xz all_mpnet_base_v2";
     const MAX_SEQ_LEN = 512;
 
     // MLMultiArrayDataType, whose values are a CoreML API constant: 0x10000 | bit width.
@@ -182,14 +186,11 @@ pub const MpnetEmbedder = struct {
     const MLMultiArrayDataTypeFloat32: i64 = 0x10000 | 32;
 
     pub const InitOptions = struct {
-        model_path: []const u8 = MODEL_PATH,
-        tokenizer_path: []const u8 = TOKENIZER_PATH,
-        bundle_model_path: []const u8 = BUNDLE_MODEL_PATH,
-        bundle_tokenizer_path: []const u8 = BUNDLE_TOKENIZER_PATH,
-        /// If set, bypasses bundle/exe-relative resolution and uses this path directly.
-        absolute_model_path: ?[]const u8 = null,
-        /// If set, bypasses bundle/exe-relative resolution and uses this path directly.
-        absolute_tokenizer_path: ?[]const u8 = null,
+        /// Path to the `.mlpackage` or `.mlmodelc`. Null looks for `BUNDLE_MODEL_PATH` in
+        /// the app bundle's resources, then for `MODEL_PATH` beside the executable.
+        model_path: ?[]const u8 = null,
+        /// Path to `tokenizer.json`. Null is resolved the same way as `model_path`.
+        tokenizer_path: ?[]const u8 = null,
         /// Which engines CoreML may schedule the model on. `all` lets CoreML pick, which on
         /// Apple silicon means the Neural Engine for a model that can use it.
         ///
@@ -229,14 +230,18 @@ pub const MpnetEmbedder = struct {
         var tokenizer_alloc = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         errdefer tokenizer_alloc.deinit();
 
-        const tokenizer_path: [:0]const u8 = if (opts.absolute_tokenizer_path) |p|
+        const tokenizer_path: [:0]const u8 = if (opts.tokenizer_path) |p|
             tokenizer_alloc.allocator().dupeZ(u8, p) catch return error.TokenizerLoadFailed
         else
-            getModelPath(tokenizer_alloc.allocator(), opts.tokenizer_path, opts.bundle_tokenizer_path) catch {
+            getModelPath(tokenizer_alloc.allocator(), TOKENIZER_PATH, BUNDLE_TOKENIZER_PATH) catch {
                 return error.TokenizerLoadFailed;
             };
 
-        const tokenizer_file = std.fs.openFileAbsolute(tokenizer_path, .{}) catch |err| {
+        const tokenizer_file = std.fs.cwd().openFile(tokenizer_path, .{}) catch |err| {
+            if (err == error.FileNotFound) {
+                logModelNotFound("mpnet tokenizer", tokenizer_path, DOWNLOAD_CMD, "tokenizer_path");
+                return error.ModelNotFound;
+            }
             std.log.err("Failed to open tokenizer.json: {}\n", .{err});
             return error.TokenizerLoadFailed;
         };
@@ -270,12 +275,16 @@ pub const MpnetEmbedder = struct {
         const fromUTF8 = objc.Sel.registerName("stringWithUTF8String:");
         const fileURLWithPath = objc.Sel.registerName("fileURLWithPath:");
 
-        const full_path: [:0]const u8 = if (opts.absolute_model_path) |p|
+        const full_path: [:0]const u8 = if (opts.model_path) |p|
             tokenizer_alloc.allocator().dupeZ(u8, p) catch return error.PathAllocFailed
         else
-            getModelPath(tokenizer_alloc.allocator(), opts.model_path, opts.bundle_model_path) catch {
+            getModelPath(tokenizer_alloc.allocator(), MODEL_PATH, BUNDLE_MODEL_PATH) catch {
                 return error.PathAllocFailed;
             };
+        std.fs.cwd().access(full_path, .{}) catch {
+            logModelNotFound("mpnet model", full_path, DOWNLOAD_CMD, "model_path");
+            return error.ModelNotFound;
+        };
 
         const path_ns = NSString.msgSend(Object, fromUTF8, .{full_path.ptr});
         if (path_ns.value == 0) {
@@ -660,6 +669,24 @@ pub const MpnetEmbedder = struct {
     }
 };
 
+/// Says where a model file was expected and how to get one. Every embedder that loads files
+/// reports a missing one through here, so the advice reads the same whichever model it is.
+fn logModelNotFound(
+    comptime what: []const u8,
+    path: []const u8,
+    comptime download_cmd: []const u8,
+    comptime option: []const u8,
+) void {
+    std.log.err(
+        \\{s} not found at '{s}'.
+        \\Download it with:
+        \\
+        \\    {s}
+        \\
+        \\then point `.{s}` in InitOptions at it. See "Model selection" in USAGE.md.
+    , .{ what, path, download_cmd, option });
+}
+
 fn getModelPath(
     allocator: Allocator,
     exe_relative_path: []const u8,
@@ -864,18 +891,48 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
     // build, so the two live side by side rather than one refusing the other's file.
     pub const PATH = @tagName(ID) ++ db_suffix ++ ".db";
 
+    pub const MODEL_FILE = "nomic-embed-text-v1.5.f32.gguf";
+    pub const MODEL_PATH = "share/" ++ MODEL_FILE;
+    pub const BUNDLE_MODEL_PATH = MODEL_FILE;
+    /// Fetches the gguf into the current directory. Keep in step with build.zig and USAGE.md.
+    pub const DOWNLOAD_CMD = "curl -LO https://huggingface.co/nomic-ai/" ++
+        "nomic-embed-text-v1.5-GGUF/resolve/main/" ++ MODEL_FILE;
+
     pub const MAX_CTX = 8192;
 
-    pub fn init() !LlamaNomicEmbedTextV15F32 {
-        // The bridge loads the model lazily on first embed, so there is nothing
-        // to set up here -- but fail loudly now rather than per-call if the
-        // backend was never linked.
+    pub const InitOptions = struct {
+        /// Path to the `.gguf`. Null takes the DVE_LLAMA_MODEL environment variable, then
+        /// looks for `BUNDLE_MODEL_PATH` in the app bundle's resources, then for
+        /// `MODEL_PATH` beside the executable.
+        model_path: ?[]const u8 = null,
+    };
+
+    pub fn init(opts: InitOptions) !LlamaNomicEmbedTextV15F32 {
         if (comptime !llama.enabled) return llama.Error.LlamaNotLinked;
+
+        // Nothing here outlives init: the bridge keeps its own copy of the path.
+        var path_buf: [4 * std.fs.max_path_bytes]u8 = undefined;
+        var path_alloc = std.heap.FixedBufferAllocator.init(&path_buf);
+        const model_path_z: [:0]const u8 =
+            if (opts.model_path orelse std.posix.getenv("DVE_LLAMA_MODEL")) |p|
+                path_alloc.allocator().dupeZ(u8, p) catch return error.NameTooLong
+            else
+                getModelPath(path_alloc.allocator(), MODEL_PATH, BUNDLE_MODEL_PATH) catch
+                    return error.PathAllocFailed;
+        std.fs.cwd().access(model_path_z, .{}) catch {
+            logModelNotFound("llama model", model_path_z, DOWNLOAD_CMD, "model_path");
+            return error.ModelNotFound;
+        };
+
+        // The model lives in the bridge, one per process, rather than in this
+        // struct. Loading it here is what makes a bad path fail at init
+        // instead of on the first embed.
+        try llama.load(model_path_z);
         return .{};
     }
 
-    pub fn init_self(self: *LlamaNomicEmbedTextV15F32) !void {
-        self.* = try LlamaNomicEmbedTextV15F32.init();
+    pub fn init_self(self: *LlamaNomicEmbedTextV15F32, opts: InitOptions) !void {
+        self.* = try LlamaNomicEmbedTextV15F32.init(opts);
     }
 
     pub fn deinit(self: *LlamaNomicEmbedTextV15F32) void {
@@ -1533,8 +1590,8 @@ fn gpuPathProbe(model_path: []const u8, tokenizer_path: []const u8) !void {
     std.fs.cwd().access(model_path, .{}) catch return error.SkipZigTest;
     for (0..3) |_| {
         var m = try MpnetEmbedder.init(.{
-            .absolute_model_path = model_path,
-            .absolute_tokenizer_path = tokenizer_path,
+            .model_path = model_path,
+            .tokenizer_path = tokenizer_path,
             .compute_units = .all,
         });
         defer m.deinit();
@@ -1580,9 +1637,9 @@ fn prCos(a: []const f32, b: []const f32) f64 {
 
 test "ZSANITY fp16safe" {
     std.fs.cwd().access(PR_NEW_M, .{}) catch return error.SkipZigTest;
-    var n = try MpnetEmbedder.init(.{ .absolute_model_path = PR_NEW_M, .absolute_tokenizer_path = PR_NEW_T });
+    var n = try MpnetEmbedder.init(.{ .model_path = PR_NEW_M, .tokenizer_path = PR_NEW_T });
     defer n.deinit();
-    var r = try MpnetEmbedder.init(.{ .absolute_model_path = PR_REF_M, .absolute_tokenizer_path = PR_REF_T });
+    var r = try MpnetEmbedder.init(.{ .model_path = PR_REF_M, .tokenizer_path = PR_REF_T });
     defer r.deinit();
     var en = n.embedder();
     var er = r.embedder();
@@ -1609,7 +1666,7 @@ test "ZSANITY fp16safe" {
 
 fn prSpeed(label: []const u8, m: []const u8, t: []const u8, cu: MpnetEmbedder.ComputeUnits) !void {
     std.fs.cwd().access(m, .{}) catch return error.SkipZigTest;
-    var e0 = try MpnetEmbedder.init(.{ .absolute_model_path = m, .absolute_tokenizer_path = t, .compute_units = cu });
+    var e0 = try MpnetEmbedder.init(.{ .model_path = m, .tokenizer_path = t, .compute_units = cu });
     defer e0.deinit();
     var e = e0.embedder();
     var warm = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1630,7 +1687,7 @@ test "ZSPEED fp16safe ane" { try prSpeed("fp16safe cpu+ane", PR_NEW_M, PR_NEW_T,
 test "ZCRASH fp16safe all" {
     std.fs.cwd().access(PR_NEW_M, .{}) catch return error.SkipZigTest;
     for (0..3) |_| {
-        var m = try MpnetEmbedder.init(.{ .absolute_model_path = PR_NEW_M, .absolute_tokenizer_path = PR_NEW_T, .compute_units = .all });
+        var m = try MpnetEmbedder.init(.{ .model_path = PR_NEW_M, .tokenizer_path = PR_NEW_T, .compute_units = .all });
         defer m.deinit();
         var e = m.embedder();
         var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
@@ -1706,7 +1763,7 @@ test "embed - LlamaNomicEmbedTextV15F32 solo" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var nl = try LlamaNomicEmbedTextV15F32.init();
+    var nl = try LlamaNomicEmbedTextV15F32.init(.{});
     defer nl.deinit();
 
     var e = nl.embedder();
@@ -1799,7 +1856,7 @@ test "embedBatch - empty batch" {
     try expectEqual(0, out.len);
 
     if (!llama.enabled) return;
-    var ll = try LlamaNomicEmbedTextV15F32.init();
+    var ll = try LlamaNomicEmbedTextV15F32.init(.{});
     defer ll.deinit();
     var le = ll.embedder();
     const llama_out = try le.embedBatch(std.testing.allocator, &.{});
@@ -1815,7 +1872,7 @@ const LLAMA_BATCH_TOLERANCE: f32 = 2e-3;
 test "embedBatch - LlamaNomicEmbedTextV15F32 matches embed" {
     if (!llama.enabled) return error.SkipZigTest;
 
-    var ll = try LlamaNomicEmbedTextV15F32.init();
+    var ll = try LlamaNomicEmbedTextV15F32.init(.{});
     defer ll.deinit();
     var e = ll.embedder();
     try expectBatchMatchesSingles(&e, &batch_phrases, LLAMA_BATCH_TOLERANCE);
@@ -1824,7 +1881,7 @@ test "embedBatch - LlamaNomicEmbedTextV15F32 matches embed" {
 test "embedBatch - LlamaNomicEmbedTextV15F32 all empty" {
     if (!llama.enabled) return error.SkipZigTest;
 
-    var ll = try LlamaNomicEmbedTextV15F32.init();
+    var ll = try LlamaNomicEmbedTextV15F32.init(.{});
     defer ll.deinit();
     var e = ll.embedder();
     try expectBatchMatchesSingles(&e, &.{ "", "" }, LLAMA_BATCH_TOLERANCE);
@@ -1847,7 +1904,7 @@ test "embedBatch - LlamaNomicEmbedTextV15F32 spans several decodes" {
         str.* = try std.fmt.allocPrint(arena.allocator(), "sentence number {d} about badgers", .{i});
     }
 
-    var ll = try LlamaNomicEmbedTextV15F32.init();
+    var ll = try LlamaNomicEmbedTextV15F32.init(.{});
     defer ll.deinit();
     var e = ll.embedder();
     try expectBatchMatchesSingles(&e, strs, LLAMA_BATCH_TOLERANCE);
@@ -1871,7 +1928,7 @@ test "embedBatch - LlamaNomicEmbedTextV15F32 splits on the token budget" {
         str.* = try std.fmt.allocPrint(allocator, "{d} {s}", .{ i, long[0 .. long.len - 1] });
     }
 
-    var ll = try LlamaNomicEmbedTextV15F32.init();
+    var ll = try LlamaNomicEmbedTextV15F32.init(.{});
     defer ll.deinit();
     var e = ll.embedder();
     try expectBatchMatchesSingles(&e, strs, LLAMA_BATCH_TOLERANCE);

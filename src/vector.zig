@@ -21,14 +21,14 @@ pub const SearchResult = struct {
     similarity: f32 = 0.0,
 };
 
-/// Optional overrides for the files an embedding model loads at startup. Both fields are
-/// absolute paths; a null field leaves the embedder's own resolution (bundle resource, then
-/// exe-relative) in place. Embedding models that ship no files of their own -- currently
-/// `.apple_nlembedding` -- ignore these.
+/// Optional overrides for the files an embedding model loads at startup. A null field leaves
+/// the embedder's own default in place; see each embedder's `InitOptions` for what that is.
+/// Embedding models that need no files of their own -- currently `.apple_nlembedding` --
+/// ignore these.
 pub const InitOptions = struct {
-    /// Absolute path to the tokenizer file.
+    /// Path to the tokenizer file. Only `.mpnet_embedding` has one.
     tokenizer_path: ?[]const u8 = null,
-    /// Absolute path to the model file or package directory.
+    /// Path to the model file or package directory.
     model_path: ?[]const u8 = null,
     /// Candidates stage one hands to stage two, which is also the number of vectors read from
     /// disk per query. Measured on real embeddings, K=100 recovers 0.957 of the exact top-10
@@ -144,17 +144,15 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                     var e = try allocator.create(MpnetEmbedder);
                     errdefer allocator.destroy(e);
                     try e.init_self(.{
-                        .absolute_model_path = opts.model_path,
-                        .absolute_tokenizer_path = opts.tokenizer_path,
+                        .model_path = opts.model_path,
+                        .tokenizer_path = opts.tokenizer_path,
                     });
                     break :o BaseEmbedder{ .mpnet_embedding = e };
                 },
                 .llama_nomic_embed_text_v1_5_f32 => {
                     const e = try allocator.create(LlamaNomicEmbedTextV15F32);
                     errdefer allocator.destroy(e);
-                    // The gguf is resolved by the bridge, not by opts: it comes
-                    // from -Dllama-model or DVE_LLAMA_MODEL.
-                    try e.init_self();
+                    try e.init_self(.{ .model_path = opts.model_path });
                     break :o BaseEmbedder{ .llama_nomic_embed_text_v1_5_f32 = e };
                 },
             };

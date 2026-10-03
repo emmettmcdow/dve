@@ -26,14 +26,6 @@ pub fn build(b: *std.Build) !void {
         "llama-path",
         "Path to a built llama.cpp checkout (default: $HOME/llama.cpp)",
     ) orelse b.pathJoin(&.{ std.posix.getenv("HOME") orelse ".", "llama.cpp" });
-    // Overrides the gguf baked into src/llama_bridge.c. The DVE_LLAMA_MODEL
-    // environment variable overrides both at run time.
-    const llama_model_path = b.option(
-        []const u8,
-        "llama-model",
-        "Path to the .gguf embedding model (default: <llama-path>/build/bin/nomic-embed-text-v1.5.f32.gguf)",
-    ) orelse b.pathJoin(&.{ llama_root, "build", "bin", "nomic-embed-text-v1.5.f32.gguf" });
-
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -44,12 +36,16 @@ pub fn build(b: *std.Build) !void {
     const mpnet_model_path = coreml_models.path("all_mpnet_base_v2/all_mpnet_base_v2.mlpackage");
     const mpnet_tokenizer_path = coreml_models.path("all_mpnet_base_v2/tokenizer.json");
 
-    // Install the mpnet runtime assets (model + tokenizer) to zig-out/share/ so the
-    // exe can find them at their default relative paths.
+    // Install the model files for the backends this build has to zig-out/share/ so
+    // the exe can find them at their default relative paths.
     // This covers dve's own builds only -- a dependency's install steps write to
     // the dependency's private prefix, not the consumer's. Consumers call
     // `installModels` below instead.
-    for (addModelInstalls(b, coreml_models)) |s| b.getInstallStep().dependOn(s);
+    const model_installs = addModelInstalls(b, b, .{
+        .mpnet_embedding = true,
+        .llama_nomic_embed_text_v1_5_f32 = llama,
+    });
+    for (model_installs) |s| b.getInstallStep().dependOn(s);
 
     ////////////////////
     // Dependencies   //
@@ -103,7 +99,7 @@ pub fn build(b: *std.Build) !void {
     // Same idea for the llama bridge: carried on the module, so a consumer that
     // builds with -Dllama gets the bridge and the libllama link for free.
     const llama_bridge: ?LlamaBridge = if (llama)
-        llamaBridgeLib(b, target, optimize, llama_root, llama_model_path)
+        llamaBridgeLib(b, target, optimize, llama_root)
     else
         null;
     if (llama_bridge) |bridge| bridge.link(dve_mod);
@@ -283,7 +279,7 @@ pub fn build(b: *std.Build) !void {
         // Compiles src/ directly, so it does not inherit the bridge from dve_mod.
         if (llama_bridge) |bridge| bridge.link(t.root_module);
         const run = runTest(b, t, use_lldb);
-        for (addModelInstalls(b, coreml_models)) |s| run.step.dependOn(s);
+        for (model_installs) |s| run.step.dependOn(s);
         test_embed.dependOn(&run.step);
     }
 
@@ -301,7 +297,7 @@ pub fn build(b: *std.Build) !void {
         // Compiles src/ directly, so it does not inherit the bridge from dve_mod.
         if (llama_bridge) |bridge| bridge.link(t.root_module);
         const run = runTest(b, t, use_lldb);
-        for (addModelInstalls(b, coreml_models)) |s| run.step.dependOn(s);
+        for (model_installs) |s| run.step.dependOn(s);
         test_vector.dependOn(&run.step);
     }
 
@@ -318,7 +314,7 @@ pub fn build(b: *std.Build) !void {
         t.root_module.addImport("dve", dve_mod);
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
         const run = runTest(b, t, use_lldb);
-        for (addModelInstalls(b, coreml_models)) |s| run.step.dependOn(s);
+        for (model_installs) |s| run.step.dependOn(s);
         test_benchmark.dependOn(&run.step);
     }
 
@@ -335,7 +331,7 @@ pub fn build(b: *std.Build) !void {
         t.root_module.addImport("dve", dve_mod);
         addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
         const run = runTest(b, t, use_lldb);
-        for (addModelInstalls(b, coreml_models)) |s| run.step.dependOn(s);
+        for (model_installs) |s| run.step.dependOn(s);
         test_profile.dependOn(&run.step);
     }
 
@@ -473,7 +469,7 @@ pub fn build(b: *std.Build) !void {
         exe.root_module.addImport("dve", dve_mod);
         addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
         // The CoreML backend resolves its model bundle relative to the executable.
-        for (addModelInstalls(b, coreml_models)) |s| embedbench_step.dependOn(s);
+        for (model_installs) |s| embedbench_step.dependOn(s);
         embedbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
@@ -497,7 +493,7 @@ pub fn build(b: *std.Build) !void {
         });
         exe.root_module.addImport("dve", dve_mod);
         addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
-        for (addModelInstalls(b, coreml_models)) |s| beirbench_step.dependOn(s);
+        for (model_installs) |s| beirbench_step.dependOn(s);
         beirbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
         beirbench_step.dependOn(b.getInstallStep());
     }
@@ -622,38 +618,69 @@ pub fn build(b: *std.Build) !void {
     }
 }
 
-/// Installs the mpnet runtime assets (model + tokenizer) into `b`'s install prefix
-/// under `share/`, where `MpnetEmbedder` looks for them by default
-/// (`<exe_dir>/../share/`). Call this from your own build.zig:
+/// Which models' files to install. One field per `EmbeddingModel` tag that needs files,
+/// under that tag's name; all off by default. `apple_nlembedding` is served by the OS and
+/// has no files, so it has no field.
+pub const Models = struct {
+    mpnet_embedding: bool = false,
+    llama_nomic_embed_text_v1_5_f32: bool = false,
+};
+
+/// Fetches the files for the selected models and installs them into `b`'s install prefix
+/// under `share/`, where the embedders look for them by default (`<exe_dir>/../share/`).
+/// Call this from your own build.zig:
 ///
 ///     const dve_dep = b.dependency("dve", .{ .target = target, .optimize = optimize });
-///     @import("dve").installModels(b, dve_dep);
+///     @import("dve").installModels(b, dve_dep, .{ .mpnet_embedding = true });
 ///
 /// Note `@import("dve")` resolves to this build script, not to the `dve` module --
 /// inside build.zig a dependency name refers to its build.zig struct.
 ///
-/// Only needed if you use the `mpnet_embedding` model; `apple_nlembedding` is
-/// served by the OS and requires no model files.
-pub fn installModels(b: *std.Build, dve_dep: *std.Build.Dependency) void {
-    const coreml_models = dve_dep.builder.dependency("coreml_models", .{});
-    for (addModelInstalls(b, coreml_models)) |s| b.getInstallStep().dependOn(s);
+/// Fetching `llama_nomic_embed_text_v1_5_f32` runs `curl`, which must be on PATH.
+pub fn installModels(b: *std.Build, dve_dep: *std.Build.Dependency, models: Models) void {
+    for (addModelInstalls(b, dve_dep.builder, models)) |s| b.getInstallStep().dependOn(s);
 }
 
-/// Creates install steps for the mpnet model + tokenizer, owned by `b`. Returns the
-/// steps so callers can attach them to whichever step needs the assets present (the
-/// install step, or a specific test's run step).
-fn addModelInstalls(b: *std.Build, coreml_models: *std.Build.Dependency) [2]*Step {
-    const install_model = b.addInstallDirectory(.{
-        .source_dir = coreml_models.path("all_mpnet_base_v2/all_mpnet_base_v2.mlpackage"),
-        .install_dir = .{ .custom = "share" },
-        .install_subdir = "all_mpnet_base_v2.mlpackage",
-    });
-    const install_tokenizer = b.addInstallFile(
-        coreml_models.path("all_mpnet_base_v2/tokenizer.json"),
-        "share/tokenizer.json",
-    );
-    return .{ &install_model.step, &install_tokenizer.step };
+/// Creates install steps for the selected models' files, owned by `b`. `dve_b` is dve's own
+/// builder, which is where the files are fetched. Returns the steps so callers can attach
+/// them to whichever step needs the assets present (the install step, or a specific test's
+/// run step).
+fn addModelInstalls(b: *std.Build, dve_b: *std.Build, models: Models) []const *Step {
+    var steps: std.ArrayList(*Step) = .empty;
+    if (models.mpnet_embedding) {
+        const coreml_models = dve_b.dependency("coreml_models", .{});
+        const install_model = b.addInstallDirectory(.{
+            .source_dir = coreml_models.path("all_mpnet_base_v2/all_mpnet_base_v2.mlpackage"),
+            .install_dir = .{ .custom = "share" },
+            .install_subdir = "all_mpnet_base_v2.mlpackage",
+        });
+        const install_tokenizer = b.addInstallFile(
+            coreml_models.path("all_mpnet_base_v2/tokenizer.json"),
+            "share/tokenizer.json",
+        );
+        steps.append(b.allocator, &install_model.step) catch @panic("OOM");
+        steps.append(b.allocator, &install_tokenizer.step) catch @panic("OOM");
+    }
+    if (models.llama_nomic_embed_text_v1_5_f32) {
+        // A bare 547MB file, not an archive, so it cannot be a build.zig.zon dependency the
+        // way `coreml_models` is; curl fetches it instead. The result is cached like any
+        // other build output.
+        const curl = dve_b.addSystemCommand(&.{
+            "curl", "--fail", "--location", "--silent", "--show-error", "--output",
+        });
+        const gguf = curl.addOutputFileArg(LLAMA_MODEL_FILE);
+        curl.addArg(LLAMA_MODEL_URL);
+        curl.setName("download " ++ LLAMA_MODEL_FILE);
+        const install_gguf = b.addInstallFile(gguf, "share/" ++ LLAMA_MODEL_FILE);
+        steps.append(b.allocator, &install_gguf.step) catch @panic("OOM");
+    }
+    return steps.items;
 }
+
+// Keep in step with LlamaNomicEmbedTextV15F32 in src/embed.zig, and with USAGE.md.
+const LLAMA_MODEL_FILE = "nomic-embed-text-v1.5.f32.gguf";
+const LLAMA_MODEL_URL = "https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/main/" ++
+    LLAMA_MODEL_FILE;
 
 /// src/llama_bridge.c as a static library of its own, linked against a prebuilt
 /// llama.cpp. Building it as one artifact means the public `dve` module and the
@@ -667,7 +694,6 @@ fn llamaBridgeLib(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     llama_root: []const u8,
-    llama_model_path: []const u8,
 ) LlamaBridge {
     const lib_dir = b.pathJoin(&.{ llama_root, "build", "bin" });
     const lib = b.addLibrary(.{
@@ -685,7 +711,6 @@ fn llamaBridgeLib(
             "-std=c11",
             "-Wall",
             "-Wextra",
-            b.fmt("-DDVE_LLAMA_MODEL_PATH=\"{s}\"", .{llama_model_path}),
         },
     });
     lib.root_module.addIncludePath(b.path("src"));

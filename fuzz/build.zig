@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
 
     // Install mpnet model files into this project's zig-out/share/,
     // where the exe will find them at their default relative paths.
-    @import("dve").installModels(b, dve_dep);
+    @import("dve").installModels(b, dve_dep, .{ .mpnet_embedding = true });
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());

@@ -1,7 +1,7 @@
 //! Zig side of the llama.cpp C bridge.
 //!
 //! All of llama.cpp's API lives in src/llama_bridge.c; this file only declares
-//! the two symbols that cross over. Build wiring is gated on -Dllama, so
+//! the symbols that cross over. Build wiring is gated on -Dllama, so
 //! llama.cpp is neither compiled nor linked unless that flag is set.
 
 pub const enabled = config.llama;
@@ -15,7 +15,18 @@ pub const Error = error{
     TokenizeFailed,
     DecodeFailed,
     NoEmbedding,
+    /// The bridge holds one model per process, and it came from another path.
+    ModelAlreadyLoaded,
 };
+
+/// Loads the .gguf at `model_path`, which every `embed` after it then uses.
+/// Loading the same path again is a no-op.
+pub fn load(model_path: [:0]const u8) Error!void {
+    if (comptime !enabled) return Error.LlamaNotLinked;
+
+    const rc = dve_embed_load(model_path.ptr);
+    if (rc != 0) return errorFor(rc);
+}
 
 /// Embeds `text` into `out`, returning the number of floats written. `out` must
 /// have room for the model's embedding dimension (768). The result is
@@ -52,10 +63,12 @@ fn errorFor(rc: c_int) Error {
         -4 => Error.TokenizeFailed,
         -5 => Error.DecodeFailed,
         -6 => Error.NoEmbedding,
+        -7 => Error.ModelAlreadyLoaded,
         else => Error.InitFailed,
     };
 }
 
+extern fn dve_embed_load(model_path: [*:0]const u8) c_int;
 extern fn dve_embed(out: [*]f32, out_len: usize, text: [*:0]const u8) c_int;
 extern fn dve_embed_batch(
     outs: [*]const [*]f32,

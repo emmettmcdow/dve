@@ -14,12 +14,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-// Overridable with -DDVE_LLAMA_MODEL_PATH="..." at compile time, and by the
-// DVE_LLAMA_MODEL environment variable at run time.
-#ifndef DVE_LLAMA_MODEL_PATH
-#define DVE_LLAMA_MODEL_PATH "/Users/emcdow/llama.cpp/build/bin/nomic-embed-text-v1.5.f32.gguf"
-#endif
-
 // nomic-embed-text-v1.5 trains at 2048 and stretches to 8192 with YaRN at
 // freq_scale 0.75 -- the same knobs llama-embedding takes on the command line.
 #define DVE_N_CTX_PER_SEQ   8192
@@ -44,14 +38,16 @@
 // of model.
 #define DVE_N_CTX (DVE_N_CTX_PER_SEQ * DVE_MAX_SEQ)
 
-// llama_context is not thread-safe, and neither is lazy init. One lock covers
+// llama_context is not thread-safe, and neither is loading. One lock covers
 // both; embedding is compute-bound inside llama.cpp anyway.
 static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct llama_model   *g_model;
 static struct llama_context *g_ctx;
 static int                   g_n_embd;
-static int                   g_load_failed; // sticky: don't re-read a 500MB gguf per call
+static char                 *g_model_path; // what g_model was loaded from
+static int                   g_backend_up;
+static int                   g_atexit_set;
 
 static void discard_log(enum ggml_log_level level, const char *text, void *user_data) {
     (void)level;
@@ -61,8 +57,8 @@ static void discard_log(enum ggml_log_level level, const char *text, void *user_
 
 // ggml-metal asserts at teardown that every Metal resource set has been
 // released, so the context has to go before libggml's own static destructors
-// run. Registering from ensure_loaded() puts this ahead of them in the
-// atexit/__cxa_finalize order, since libggml was loaded first.
+// run. Registering once a context exists puts this ahead of them in the
+// atexit/__cxa_finalize order: by then ggml-metal has registered its own.
 static void shutdown_bridge(void) {
     if (g_ctx != NULL) {
         llama_free(g_ctx);
@@ -72,26 +68,28 @@ static void shutdown_bridge(void) {
         llama_model_free(g_model);
         g_model = NULL;
     }
+    free(g_model_path);
+    g_model_path = NULL;
     llama_backend_free();
 }
 
-// Caller must hold g_lock. Returns 0 on success.
-static int ensure_loaded(void) {
+// Caller must hold g_lock.
+static int load_locked(const char *model_path) {
     if (g_ctx != NULL) {
-        return 0;
-    }
-    if (g_load_failed) {
-        return -1;
+        return strcmp(model_path, g_model_path) == 0 ? 0 : DVE_EMBED_ERR_LOADED;
     }
 
-    if (getenv("DVE_LLAMA_VERBOSE") == NULL) {
-        llama_log_set(discard_log, NULL);
+    char *path_copy = strdup(model_path);
+    if (path_copy == NULL) {
+        return DVE_EMBED_ERR_INIT;
     }
-    llama_backend_init();
 
-    const char *model_path = getenv("DVE_LLAMA_MODEL");
-    if (model_path == NULL || model_path[0] == '\0') {
-        model_path = DVE_LLAMA_MODEL_PATH;
+    if (!g_backend_up) {
+        if (getenv("DVE_LLAMA_VERBOSE") == NULL) {
+            llama_log_set(discard_log, NULL);
+        }
+        llama_backend_init();
+        g_backend_up = 1;
     }
 
     struct llama_model_params mparams = llama_model_default_params();
@@ -100,8 +98,8 @@ static int ensure_loaded(void) {
     g_model = llama_model_load_from_file(model_path, mparams);
     if (g_model == NULL) {
         fprintf(stderr, "dve_embed: failed to load model '%s'\n", model_path);
-        g_load_failed = 1;
-        return -1;
+        free(path_copy);
+        return DVE_EMBED_ERR_INIT;
     }
 
     struct llama_context_params cparams = llama_context_default_params();
@@ -119,13 +117,27 @@ static int ensure_loaded(void) {
         fprintf(stderr, "dve_embed: failed to create context\n");
         llama_model_free(g_model);
         g_model = NULL;
-        g_load_failed = 1;
-        return -1;
+        free(path_copy);
+        return DVE_EMBED_ERR_INIT;
     }
 
     g_n_embd = llama_model_n_embd(g_model);
-    atexit(shutdown_bridge);
+    g_model_path = path_copy;
+    if (!g_atexit_set) {
+        atexit(shutdown_bridge);
+        g_atexit_set = 1;
+    }
     return 0;
+}
+
+int dve_embed_load(const char *model_path) {
+    if (model_path == NULL) {
+        return DVE_EMBED_ERR_ARGS;
+    }
+    pthread_mutex_lock(&g_lock);
+    const int rc = load_locked(model_path);
+    pthread_mutex_unlock(&g_lock);
+    return rc;
 }
 
 // Tokenizes `text` into a freshly malloc'd array, which the caller frees.
@@ -195,7 +207,7 @@ int dve_embed_batch(float *const *outs, size_t out_len, const char *const *texts
     struct llama_batch batch = {0};
     int batch_alloced = 0;
 
-    if (ensure_loaded() != 0) {
+    if (g_ctx == NULL) {
         rc = DVE_EMBED_ERR_INIT;
         goto done;
     }
