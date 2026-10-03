@@ -1560,6 +1560,10 @@ test "opening a non-existent db creates an empty one" {
 }
 
 test "a db written for a different vector type is rejected" {
+    // The rejection logs a warning, which is the behavior under test rather than news.
+    std.testing.log_level = .err;
+    defer std.testing.log_level = .warn;
+
     var tmpD = tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
     {
@@ -1601,6 +1605,10 @@ test "format: the file is a whole number of pages and vectors are page aligned" 
 }
 
 test "format: a flipped byte in the vector region is caught by the checksum" {
+    // The rejection logs a warning, which is the behavior under test rather than news.
+    std.testing.log_level = .err;
+    defer std.testing.log_level = .warn;
+
     var tmpD = tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
@@ -1886,6 +1894,10 @@ test "validate rejects overlapping ranges within a doc" {
 }
 
 test "validate rejects a vector that is not L2 normalized" {
+    // The rejection logs a warning, which is the behavior under test rather than news.
+    std.testing.log_level = .err;
+    defer std.testing.log_level = .warn;
+
     var tmpD = tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
     var inst = try open(tmpD.dir);
