@@ -11,6 +11,20 @@ pub const Error = error{
     CorruptManifest,
 };
 
+/// How the workspace root moved, for `reroot`.
+///
+/// Paths in the manifest are relative to the workspace root, so moving the root re-expresses
+/// every one of them. Which of the two this is depends only on where the new root sits relative
+/// to the old one, and the caller is the one holding both absolute paths.
+pub const Reroot = union(enum) {
+    /// The root rose, and the notes are now this much further down it. Moving a workspace from
+    /// `~/web/md-src` up to `~/web` makes every note deeper by `md-src`.
+    deeper: []const u8,
+    /// The root descended into this subfolder. Notes outside it are no longer in the workspace
+    /// at all, and `reroot` reports them so their vectors can go too.
+    shallower: []const u8,
+};
+
 pub const NoteIdMap = struct {
     path_to_id: std.StringHashMap(NoteID),
     id_to_path: std.AutoHashMap(NoteID, []u8),
@@ -171,10 +185,83 @@ pub const NoteIdMap = struct {
         return self.next_id;
     }
 
+    /// Re-express every path against a workspace root that has moved, and save once.
+    ///
+    /// This is what makes moving a workspace cheap. A note's vectors are keyed by its id, and
+    /// the path appears nowhere but here, so a root that moves costs one rewrite of this
+    /// manifest rather than re-reading and re-embedding every note behind it.
+    ///
+    /// Ids the move puts outside the workspace are appended to `dropped` and removed from the
+    /// map; their vectors are the caller's to delete, this layer having no reach into them.
+    pub fn reroot(self: *Self, move: Reroot, dropped: *std.ArrayList(NoteID)) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        // Every new path is built before a single old one is touched. A failure halfway through
+        // an in-place rewrite would leave some entries relative to the old root and some to the
+        // new, and nothing afterwards could tell which was which.
+        const Pending = struct { id: NoteID, path: []u8 };
+        var pending: std.ArrayList(Pending) = .{};
+        defer pending.deinit(self.allocator);
+        errdefer for (pending.items) |item| self.allocator.free(item.path);
+
+        const drop_from = dropped.items.len;
+        errdefer dropped.shrinkRetainingCapacity(drop_from);
+
+        var it = self.id_to_path.iterator();
+        while (it.next()) |entry| {
+            const id = entry.key_ptr.*;
+            const old_path = entry.value_ptr.*;
+            const new_path: []u8 = switch (move) {
+                .deeper => |prefix| try std.fs.path.join(self.allocator, &.{ prefix, old_path }),
+                .shallower => |prefix| blk: {
+                    const rest = stripDir(old_path, prefix) orelse {
+                        try dropped.append(self.allocator, id);
+                        continue;
+                    };
+                    break :blk try self.allocator.dupe(u8, rest);
+                },
+            };
+            errdefer self.allocator.free(new_path);
+            try pending.append(self.allocator, .{ .id = id, .path = new_path });
+        }
+
+        // Room for the rebuilt index before anything is dismantled, so the commit below cannot
+        // fail partway.
+        try self.path_to_id.ensureTotalCapacity(@intCast(pending.items.len));
+
+        for (dropped.items[drop_from..]) |id| {
+            if (self.id_to_path.fetchRemove(id)) |kv| self.allocator.free(kv.value);
+        }
+        // `path_to_id`'s keys are the very buffers `id_to_path` owns, so it is rebuilt wholesale
+        // rather than edited around the paths being freed underneath it.
+        self.path_to_id.clearRetainingCapacity();
+        for (pending.items) |item| {
+            const slot = self.id_to_path.getPtr(item.id).?;
+            self.allocator.free(slot.*);
+            slot.* = item.path;
+            self.path_to_id.putAssumeCapacity(item.path, item.id);
+        }
+        // Ownership has moved into the map; the errdefer above must not free them now.
+        pending.clearRetainingCapacity();
+
+        try self.save();
+    }
+
     pub fn count(self: *Self) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.path_to_id.count();
+    }
+
+    /// `path` with a leading `dir/` removed, or null when it is not under `dir` at all.
+    fn stripDir(path: []const u8, dir: []const u8) ?[]const u8 {
+        if (dir.len == 0) return path;
+        if (!std.mem.startsWith(u8, path, dir)) return null;
+        const rest = path[dir.len..];
+        // A prefix has to end at a separator: `md-src` must not claim `md-srcery/a.md`.
+        if (rest.len < 2 or rest[0] != '/') return null;
+        return rest[1..];
     }
 
     // Possibly update the save and load to use SOA. We want to write the fields of the struct all
@@ -593,3 +680,94 @@ fn writeIntLE(writer: *std.fs.File.Writer, comptime T: type, value: T) !void {
     try writer.interface.writeAll(&buf);
 }
 
+test "reroot deeper prefixes every path and keeps the ids" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    defer map.deinit();
+
+    const one = try map.getOrCreateId("one.md");
+    const two = try map.getOrCreateId("sub/two.md");
+
+    var dropped: std.ArrayList(NoteID) = .{};
+    defer dropped.deinit(testing_allocator);
+    try map.reroot(.{ .deeper = "md-src" }, &dropped);
+
+    // The point of the operation: the vectors never move, so the ids must not either.
+    try expectEqual(@as(usize, 0), dropped.items.len);
+    try expectEqual(one, map.getId("md-src/one.md").?);
+    try expectEqual(two, map.getId("md-src/sub/two.md").?);
+    try expectEqual(@as(?NoteID, null), map.getId("one.md"));
+    try expectEqualStrings("md-src/one.md", map.getPath(one).?);
+    try expectEqual(@as(usize, 2), map.count());
+}
+
+test "reroot shallower strips the prefix and reports what fell outside" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    defer map.deinit();
+
+    const inside = try map.getOrCreateId("md-src/one.md");
+    const deeper = try map.getOrCreateId("md-src/sub/two.md");
+    const outside = try map.getOrCreateId("elsewhere/three.md");
+    // A name that merely starts with the same letters is not inside the folder.
+    const lookalike = try map.getOrCreateId("md-srcery/four.md");
+
+    var dropped: std.ArrayList(NoteID) = .{};
+    defer dropped.deinit(testing_allocator);
+    try map.reroot(.{ .shallower = "md-src" }, &dropped);
+
+    try expectEqual(inside, map.getId("one.md").?);
+    try expectEqual(deeper, map.getId("sub/two.md").?);
+    try expectEqual(@as(usize, 2), map.count());
+
+    try expectEqual(@as(usize, 2), dropped.items.len);
+    var saw_outside = false;
+    var saw_lookalike = false;
+    for (dropped.items) |id| {
+        if (id == outside) saw_outside = true;
+        if (id == lookalike) saw_lookalike = true;
+    }
+    try expect(saw_outside and saw_lookalike);
+    try expectEqual(@as(?[]const u8, null), map.getPath(outside));
+}
+
+test "reroot survives a restart" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var id: NoteID = undefined;
+    {
+        var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+        defer map.deinit();
+        id = try map.getOrCreateId("one.md");
+
+        var dropped: std.ArrayList(NoteID) = .{};
+        defer dropped.deinit(testing_allocator);
+        try map.reroot(.{ .deeper = "md-src" }, &dropped);
+    }
+    {
+        // The manifest on disk is what the next launch reads, so the rewrite has to be in it
+        // and not just in the map that performed it.
+        var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+        defer map.deinit();
+        try expectEqual(id, map.getId("md-src/one.md").?);
+        try expectEqual(@as(usize, 1), map.count());
+    }
+}
+
+test "rerooting an empty map is not an error" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    defer map.deinit();
+
+    var dropped: std.ArrayList(NoteID) = .{};
+    defer dropped.deinit(testing_allocator);
+    try map.reroot(.{ .deeper = "md-src" }, &dropped);
+    try expectEqual(@as(usize, 0), map.count());
+}

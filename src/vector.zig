@@ -882,6 +882,37 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             try self.note_id_map.renamePath(old_path, new_path);
         }
 
+        /// Re-express every stored path against a workspace root that has moved, dropping the
+        /// vectors of any note the move puts outside it. Returns how many notes were dropped.
+        ///
+        /// This is the cheap half of moving a workspace, and the reason it is cheap is the
+        /// layout: a vector is keyed by note id and carries no path at all, so a root that moves
+        /// costs one rewrite of the id manifest. Nothing here re-reads or re-embeds a note.
+        pub fn reroot(self: *Self, move: note_id_map_mod.Reroot) !usize {
+            var dropped: std.ArrayList(NoteID) = .{};
+            defer dropped.deinit(self.allocator);
+
+            try self.note_id_map.reroot(move, &dropped);
+            for (dropped.items) |id| {
+                // Collected before the removal, because afterwards there is nothing to look up.
+                const rows = try self.vec_storage.vecsForDoc(self.allocator, id);
+                defer self.allocator.free(rows);
+                try self.vec_storage.rmByDocId(id);
+                for (rows) |row| self.codes.rm(VecStorage.slotOf(row.vec_id));
+            }
+            if (dropped.items.len > 0) try self.save();
+            return dropped.items.len;
+        }
+
+        /// The files this engine keeps inside the workspace directory.
+        ///
+        /// Named here because they are ours: a caller moving a workspace has to bring them
+        /// along, and the alternative is it hardcoding a filename that depends on the embedding
+        /// model and the quantization it was built with.
+        pub fn storageFiles(self: *const Self) [2][]const u8 {
+            return .{ self.embedder.path, note_id_map_mod.MANIFEST_FILENAME };
+        }
+
         /// Drops paths whose *source file* is gone from `basedir`.
         ///
         /// Despite the name this does not look at vectors at all, and it is not the answer to
@@ -2488,4 +2519,75 @@ test "a path created for a write that fails does not outlive it" {
     try expect(db.note_id_map.getId("kept.md") != null);
     try db.validate();
     try expectEqual(null, db.note_id_map.getId("never-written.md"));
+}
+
+test "reroot re-expresses paths without re-embedding" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    defer db.deinit();
+
+    try db.embedText("one.md", "hello");
+
+    // The workspace root rises a level, so the note is now a level deeper beneath it.
+    try expectEqual(0, try db.reroot(.{ .deeper = "md-src" }));
+
+    // The same vectors answer the same query, under the new path. Nothing was embedded again.
+    var buf: [1]SearchResult = undefined;
+    try expectEqual(1, try db.search("hello", &buf));
+    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+        .{ .path = "md-src/one.md", .start_i = 0, .end_i = 5 },
+    }, buf[0..1]);
+    try db.validate();
+
+    // The names a caller needs to carry the database to the new root. Asserted here because an
+    // uncalled function in this module would not be analysed at all, and could quietly stop
+    // compiling until the day someone reached for it.
+    const files = db.storageFiles();
+    try expect(std.mem.endsWith(u8, files[0], ".db"));
+    try expect(std.mem.startsWith(u8, files[1], ".dve_ids"));
+}
+
+test "reroot drops the notes the new root no longer contains" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    defer db.deinit();
+
+    try db.embedText("md-src/kept.md", "hello");
+    try db.embedText("elsewhere/gone.md", "hello");
+
+    // Descending into md-src leaves the other note outside the workspace entirely, so its
+    // vectors go with it rather than lingering as rows nothing can name.
+    try expectEqual(1, try db.reroot(.{ .shallower = "md-src" }));
+
+    var buf: [4]SearchResult = undefined;
+    try expectEqual(1, try db.search("hello", &buf));
+    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+        .{ .path = "kept.md", .start_i = 0, .end_i = 5 },
+    }, buf[0..1]);
+    try db.validate();
+}
+
+test "search counts only the results it wrote" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    defer db.deinit();
+
+    try db.embedText("gone.md", "hello");
+
+    // Drop the path but leave its vectors, which is what any stale index looks like: an id the
+    // store still has rows for and the manifest can no longer name. A count that included it
+    // would hand back a SearchResult nothing had written.
+    try db.note_id_map.removePath("gone.md");
+
+    var buf: [4]SearchResult = undefined;
+    try expectEqual(0, try db.search("hello", &buf));
 }
