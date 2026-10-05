@@ -149,6 +149,9 @@ const ModelCache = struct {
     /// Guards the tables below.
     var mutex: Mutex = .{};
     var by_path: ?std.StringHashMap(Object) = null;
+    /// Keys that were asked for and are not there: a batch function in a model converted
+    /// without any. Remembered so that every `init` after the first does not ask again.
+    var missing: ?std.StringHashMap(void) = null;
     /// Parsed tokenizers, keyed and retained the same way as the models.
     var tokenizers: ?std.StringHashMap(*WordPieceTokenizer) = null;
     /// Held across `MLModel` prediction. Process-wide because the models are.
@@ -156,7 +159,13 @@ const ModelCache = struct {
 };
 
 pub const MpnetEmbedder = struct {
+    /// The model's default function: one row of `SINGLE.seq` tokens.
     model: Object,
+    /// The model's batch functions, loaded by the first `embedBatch` rather than by `init`:
+    /// an embedder that only ever embeds queries should not pay to load them. Guarded by
+    /// `ModelCache.predict_mutex`.
+    batch: BatchModels = .unloaded,
+    compute_units: ComputeUnits,
     /// Shared with every other embedder that loaded the same file -- see `ModelCache`.
     tokenizer: *tokenizer_mod.WordPieceTokenizer,
     /// Owns the two paths below, and nothing else now that the tokenizer is shared.
@@ -182,8 +191,45 @@ pub const MpnetEmbedder = struct {
     /// Fetches the model and tokenizer into ./all_mpnet_base_v2/. The release is the one
     /// build.zig.zon pins as `coreml_models`; keep the two, and USAGE.md, in step.
     pub const DOWNLOAD_CMD = "curl -L https://github.com/emmettmcdow/dve/releases/download/" ++
-        "coreml-models-v5/coreml_models_v5.tar.gz | tar -xz all_mpnet_base_v2";
+        "coreml-models-v6/coreml_models_v6.tar.gz | tar -xz all_mpnet_base_v2";
     const MAX_SEQ_LEN = 512;
+
+    /// An input shape the model was converted for. The Neural Engine takes fixed shapes
+    /// only, so each one is a separate function in the model package.
+    const Shape = struct {
+        rows: usize,
+        seq: usize,
+        /// Function name in the package. Null is the default function.
+        function: ?[:0]const u8 = null,
+        /// Fewest rows worth a prediction of this shape. A prediction costs the same however
+        /// many of its rows are padding, so below this it is cheaper to send the stragglers
+        /// through `SINGLE` one at a time. Derived from the measured cost of each shape:
+        /// 4.3ms for 1x128, 13.3ms for 32x16 and 28.0ms for 32x32.
+        min_rows: usize = 1,
+    };
+
+    const SINGLE: Shape = .{ .rows = 1, .seq = 128 };
+
+    /// Ascending by `seq`: a sentence goes to the first shape it fits in, and to `SINGLE`
+    /// if it fits in none. Keep in step with `--batch-shapes` in models/gen-coreml.py.
+    ///
+    /// Short rows are the point. The Neural Engine gets through about 37,000 token slots a
+    /// second however they are arranged, and a sentence averages a dozen tokens, so rows of
+    /// 128 are nine-tenths padding: measured, 32x128 embeds 255 sentences a second against
+    /// 232 for 1x128, where 32x16 embeds 2,400.
+    const BATCH_SHAPES = [_]Shape{
+        .{ .rows = 32, .seq = 16, .function = "b32_s16", .min_rows = 4 },
+        .{ .rows = 32, .seq = 32, .function = "b32_s32", .min_rows = 7 },
+    };
+    const MAX_ROWS = 32;
+
+    const BatchModels = union(enum) {
+        unloaded,
+        /// The model has no batch functions, as every `coreml_models` release up to v5.
+        /// `embedBatch` then embeds one string at a time.
+        unavailable,
+        ready: [BATCH_SHAPES.len]Object,
+    };
 
     // MLMultiArrayDataType, whose values are a CoreML API constant: 0x10000 | bit width.
     const MLMultiArrayDataTypeFloat16: i64 = 0x10000 | 16;
@@ -283,7 +329,13 @@ pub const MpnetEmbedder = struct {
         const resolved = std.mem.sliceTo(full_path, 0);
         const is_precompiled = std.mem.endsWith(u8, resolved, ".mlmodelc");
 
-        const model = try acquireModel(resolved, model_url, is_precompiled, opts.compute_units);
+        const model = try acquireModel(
+            resolved,
+            model_url,
+            is_precompiled,
+            opts.compute_units,
+            null,
+        );
         errdefer model.release();
         // CoreML will not tell us which engine it actually chose, so the next best thing is
         // to say which ones it was allowed to choose from. Anything other than `all` means
@@ -292,6 +344,7 @@ pub const MpnetEmbedder = struct {
 
         return .{
             .model = model,
+            .compute_units = opts.compute_units,
             .tokenizer = tok,
             .tokenizer_alloc = tokenizer_alloc,
             .loaded_model_path = full_path,
@@ -344,22 +397,34 @@ pub const MpnetEmbedder = struct {
 
     /// Returns the model for `path`, with one retain transferred to the caller. Compiles and
     /// loads it on the first call for that path and never again -- see `ModelCache`.
+    ///
+    /// `function` picks one function of a multifunction model, null being the default one.
+    /// A function the model does not have is `error.ModelFunctionNotFound`, and is expected:
+    /// it is how a model converted without batch shapes says so.
     fn acquireModel(
         path: []const u8,
         model_url: Object,
         is_precompiled: bool,
         compute_units: ComputeUnits,
+        function: ?[:0]const u8,
     ) !Object {
         ModelCache.mutex.lock();
         defer ModelCache.mutex.unlock();
 
         if (ModelCache.by_path == null) {
             ModelCache.by_path = std.StringHashMap(Object).init(std.heap.page_allocator);
+            ModelCache.missing = std.StringHashMap(void).init(std.heap.page_allocator);
         }
-        // Keyed by path alone: the first `compute_units` asked for wins for the life of the
-        // process. Nothing here loads one model two ways, and making the key a pair would
-        // invite doing it.
-        if (ModelCache.by_path.?.get(path)) |cached| return cached.retain();
+        // Keyed by path and function: the first `compute_units` asked for wins for the life
+        // of the process. Nothing here loads one model two ways, and adding it to the key
+        // would invite doing it.
+        var key_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+        const lookup_key = if (function) |f|
+            std.fmt.bufPrint(&key_buf, "{s}#{s}", .{ path, f }) catch return error.PathAllocFailed
+        else
+            path;
+        if (ModelCache.by_path.?.get(lookup_key)) |cached| return cached.retain();
+        if (ModelCache.missing.?.contains(lookup_key)) return error.ModelFunctionNotFound;
 
         const MLModel = objc.getClass("MLModel") orelse return error.ObjCClassNotFound;
         const compileModelAtURL = objc.Sel.registerName("compileModelAtURL:error:");
@@ -394,6 +459,18 @@ pub const MpnetEmbedder = struct {
         config.msgSend(void, objc.Sel.registerName("setComputeUnits:"), .{
             @intFromEnum(compute_units),
         });
+        if (function) |f| {
+            // macOS 15. An older system cannot load a multifunction model's other functions
+            // at all, which reads the same from here as the model not having any.
+            const setFunctionName = objc.Sel.registerName("setFunctionName:");
+            if (!config.msgSend(bool, objc.Sel.registerName("respondsToSelector:"), .{
+                setFunctionName,
+            })) return error.ModelFunctionNotFound;
+            const NSString = objc.getClass("NSString") orelse return error.ObjCClassNotFound;
+            config.msgSend(void, setFunctionName, .{
+                NSString.msgSend(Object, objc.Sel.registerName("stringWithUTF8String:"), .{f.ptr}),
+            });
+        }
 
         var load_error: ?*anyopaque = null;
         const model = MLModel.msgSend(Object, modelWithContentsOfURL, .{
@@ -401,6 +478,16 @@ pub const MpnetEmbedder = struct {
             config,
             &load_error,
         });
+        if (function != null and (load_error != null or model.value == 0)) {
+            // The table keeps the key, so it is freed only if the table did not take it:
+            // an errdefer would free it on the way out through the error below.
+            const key = try std.heap.page_allocator.dupe(u8, lookup_key);
+            ModelCache.missing.?.put(key, {}) catch |err| {
+                std.heap.page_allocator.free(key);
+                return err;
+            };
+            return error.ModelFunctionNotFound;
+        }
         if (load_error) |err_ptr| {
             const err = Object{ .value = @intFromPtr(err_ptr) };
             const desc_sel = objc.Sel.registerName("localizedDescription");
@@ -415,7 +502,7 @@ pub const MpnetEmbedder = struct {
 
         // One retain for the cache and one for the caller; the autoreleased original belongs
         // to whatever pool is current.
-        const key = try std.heap.page_allocator.dupe(u8, path);
+        const key = try std.heap.page_allocator.dupe(u8, lookup_key);
         errdefer std.heap.page_allocator.free(key);
         try ModelCache.by_path.?.put(key, model.retain());
         return model.retain();
@@ -424,6 +511,8 @@ pub const MpnetEmbedder = struct {
     pub fn init_self(self: *MpnetEmbedder, opts: InitOptions) !void {
         const obj = try MpnetEmbedder.init(opts);
         self.model = obj.model;
+        self.batch = obj.batch;
+        self.compute_units = obj.compute_units;
         self.tokenizer = obj.tokenizer;
         self.tokenizer_alloc = obj.tokenizer_alloc;
         self.loaded_model_path = obj.loaded_model_path;
@@ -435,7 +524,7 @@ pub const MpnetEmbedder = struct {
             .ptr = self,
             .splitFn = split,
             .embedFn = embed,
-            .embedBatchFn = sequentialEmbedBatch(embed),
+            .embedBatchFn = embedBatch,
             .deinitFn = deinitFn,
             .id = ID,
             .threshold = THRESHOLD,
@@ -446,6 +535,10 @@ pub const MpnetEmbedder = struct {
 
     pub fn deinit(self: *MpnetEmbedder) void {
         self.model.release();
+        switch (self.batch) {
+            .ready => |models| for (models) |m| m.release(),
+            .unloaded, .unavailable => {},
+        }
         self.tokenizer_alloc.deinit();
     }
 
@@ -467,8 +560,6 @@ pub const MpnetEmbedder = struct {
         const self: *MpnetEmbedder = @ptrCast(@alignCast(ptr));
         const zone = tracy.beginZone(@src(), .{ .name = "embed.zig:MpnetEmbedder.embed" });
         defer zone.end();
-        const pool = objc.AutoreleasePool.init();
-        defer pool.deinit();
 
         if (str.len == 0) {
             std.log.info("Skipping embed of zero-length string\n", .{});
@@ -481,6 +572,9 @@ pub const MpnetEmbedder = struct {
         const token_ids = try self.tokenizer.tokenize(allocator, str);
         defer allocator.free(token_ids);
 
+        const out = try allocVec(allocator);
+        errdefer allocator.destroy(out);
+
         // Serializes prediction, as NLEmbedder has always done. The engine embeds documents
         // on its worker thread while a search embeds the query on the caller's, through one
         // shared Embedder, so concurrent prediction is the normal case rather than an edge
@@ -490,8 +584,163 @@ pub const MpnetEmbedder = struct {
         ModelCache.predict_mutex.lock();
         defer ModelCache.predict_mutex.unlock();
 
-        const MODEL_SEQ_LEN: usize = 128;
-        const seq_len: usize = @min(token_ids.len, MODEL_SEQ_LEN);
+        try predictRows(
+            self.model,
+            SINGLE,
+            &.{token_ids[0..@min(token_ids.len, SINGLE.seq)]},
+            &.{out},
+        );
+        return EmbeddingModelOutput{ .mpnet_embedding = out };
+    }
+
+    /// Embeds the strings several to a prediction, through the model's batch functions.
+    ///
+    /// Each string goes to the shortest shape its tokens fit in, and those that fit in none
+    /// go through `SINGLE` as `embed` would send them. So does the tail of a shape's queue
+    /// when it is too short to be worth a mostly-empty prediction -- see `Shape.min_rows`.
+    ///
+    /// A model with no batch functions gets every string through `SINGLE`, which is what
+    /// this was before there were any.
+    fn embedBatch(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        strs: []const []const u8,
+    ) ![]?EmbeddingModelOutput {
+        const self: *MpnetEmbedder = @ptrCast(@alignCast(ptr));
+        const zone = tracy.beginZone(@src(), .{ .name = "embed.zig:MpnetEmbedder.embedBatch" });
+        defer zone.end();
+
+        const outs = try allocator.alloc(?EmbeddingModelOutput, strs.len);
+        errdefer allocator.free(outs);
+        @memset(outs, null);
+        if (strs.len == 0) return outs;
+
+        // Parallel arrays over the strings that survive filtering: the tokens, the vector
+        // to fill, and whether a prediction has filled it yet.
+        const Vec = @Vector(VEC_SZ, VEC_TYPE);
+        const tokens = try allocator.alloc([]const u32, strs.len);
+        const vecs = try allocator.alloc(*Vec, strs.len);
+        const done = try allocator.alloc(bool, strs.len);
+        var n: usize = 0;
+        for (strs, 0..) |str, i| {
+            if (str.len == 0) {
+                std.log.info("Skipping embed of zero-length string\n", .{});
+                continue;
+            }
+            if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
+                std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'\n", .{str});
+            }
+            const token_ids = try self.tokenizer.tokenize(allocator, str);
+            tokens[n] = token_ids[0..@min(token_ids.len, SINGLE.seq)];
+            vecs[n] = try allocVec(allocator);
+            done[n] = false;
+            outs[i] = EmbeddingModelOutput{ .mpnet_embedding = vecs[n] };
+            n += 1;
+        }
+
+        var shape_seq_min: usize = 0;
+        for (BATCH_SHAPES, 0..) |shape, shape_i| {
+            defer shape_seq_min = shape.seq;
+
+            var rows: [MAX_ROWS][]const u32 = undefined;
+            var row_vecs: [MAX_ROWS]*Vec = undefined;
+            var row_items: [MAX_ROWS]usize = undefined;
+            var row_n: usize = 0;
+            for (0..n + 1) |item| {
+                if (item < n) {
+                    if (tokens[item].len <= shape_seq_min or tokens[item].len > shape.seq) continue;
+                    rows[row_n] = tokens[item];
+                    row_vecs[row_n] = vecs[item];
+                    row_items[row_n] = item;
+                    row_n += 1;
+                    if (row_n < shape.rows) continue;
+                } else if (row_n < shape.min_rows) break;
+
+                // The lock is taken per prediction and not across the batch, so that a
+                // search embedding its query waits for one prediction, not for a document.
+                ModelCache.predict_mutex.lock();
+                defer ModelCache.predict_mutex.unlock();
+                const model = (try self.batchModels() orelse break)[shape_i];
+                try predictRows(model, shape, rows[0..row_n], row_vecs[0..row_n]);
+                for (row_items[0..row_n]) |filled| done[filled] = true;
+                row_n = 0;
+            }
+        }
+
+        for (tokens[0..n], vecs[0..n], done[0..n]) |row, vec, filled| {
+            if (filled) continue;
+            ModelCache.predict_mutex.lock();
+            defer ModelCache.predict_mutex.unlock();
+            try predictRows(self.model, SINGLE, &.{row}, &.{vec});
+        }
+        return outs;
+    }
+
+    /// One vector's worth of memory, aligned for `@Vector(VEC_SZ, VEC_TYPE)`.
+    fn allocVec(allocator: Allocator) !*@Vector(VEC_SZ, VEC_TYPE) {
+        const Vec = @Vector(VEC_SZ, VEC_TYPE);
+        const buf = try allocator.alignedAlloc(VEC_TYPE, std.mem.Alignment.of(Vec), VEC_SZ);
+        return @ptrCast(buf.ptr);
+    }
+
+    /// The batch functions, loading them on the first call. Null when the model has none.
+    /// The caller holds `ModelCache.predict_mutex`.
+    fn batchModels(self: *MpnetEmbedder) !?[BATCH_SHAPES.len]Object {
+        switch (self.batch) {
+            .ready => |models| return models,
+            .unavailable => return null,
+            .unloaded => {},
+        }
+        const pool = objc.AutoreleasePool.init();
+        defer pool.deinit();
+
+        const NSString = objc.getClass("NSString") orelse return error.ObjCClassNotFound;
+        const NSURL = objc.getClass("NSURL") orelse return error.ObjCClassNotFound;
+        const model_url = NSURL.msgSend(Object, objc.Sel.registerName("fileURLWithPath:"), .{
+            NSString.msgSend(Object, objc.Sel.registerName("stringWithUTF8String:"), .{
+                self.loaded_model_path.ptr,
+            }),
+        });
+        const path = std.mem.sliceTo(self.loaded_model_path, 0);
+
+        var models: [BATCH_SHAPES.len]Object = undefined;
+        for (BATCH_SHAPES, 0..) |shape, i| {
+            models[i] = acquireModel(
+                path,
+                model_url,
+                std.mem.endsWith(u8, path, ".mlmodelc"),
+                self.compute_units,
+                shape.function,
+            ) catch |err| {
+                for (models[0..i]) |m| m.release();
+                if (err != error.ModelFunctionNotFound) return err;
+                std.log.info(
+                    "mpnet: model has no '{s}' function, embedding one string at a time",
+                    .{shape.function.?},
+                );
+                self.batch = .unavailable;
+                return null;
+            };
+        }
+        self.batch = .{ .ready = models };
+        return models;
+    }
+
+    /// Runs one prediction of `shape` and writes the pooled, normalized vector for
+    /// `rows[i]` to `outs[i]`. `rows` may be shorter than the shape; the rest is padding.
+    /// Every row must be non-empty and fit in `shape.seq`.
+    ///
+    /// The caller holds `ModelCache.predict_mutex`.
+    fn predictRows(
+        model: Object,
+        shape: Shape,
+        rows: []const []const u32,
+        outs: []const *@Vector(VEC_SZ, VEC_TYPE),
+    ) !void {
+        assert(rows.len == outs.len);
+        assert(rows.len > 0 and rows.len <= shape.rows);
+        const pool = objc.AutoreleasePool.init();
+        defer pool.deinit();
 
         const MLMultiArray = objc.getClass("MLMultiArray") orelse return error.ObjCClassNotFound;
         const NSNumber = objc.getClass("NSNumber") orelse return error.ObjCClassNotFound;
@@ -499,12 +748,12 @@ pub const MpnetEmbedder = struct {
         const MLDictionaryFeatureProvider = objc.getClass("MLDictionaryFeatureProvider") orelse return error.ObjCClassNotFound;
         const NSDictionary = objc.getClass("NSDictionary") orelse return error.ObjCClassNotFound;
         const MLFeatureValue = objc.getClass("MLFeatureValue") orelse return error.ObjCClassNotFound;
+        const NSString = objc.getClass("NSString") orelse return error.ObjCClassNotFound;
 
         const numberWithInt = objc.Sel.registerName("numberWithInt:");
         const arrayWithObjects = objc.Sel.registerName("arrayWithObjects:count:");
         const initWithShape = objc.Sel.registerName("initWithShape:dataType:error:");
         const alloc_sel = objc.Sel.registerName("alloc");
-        const setObject = objc.Sel.registerName("setObject:atIndexedSubscript:");
         const initWithDictionary = objc.Sel.registerName("initWithDictionary:error:");
         const predictionFromFeatures = objc.Sel.registerName("predictionFromFeatures:error:");
         const featureValueForName = objc.Sel.registerName("featureValueForName:");
@@ -515,26 +764,22 @@ pub const MpnetEmbedder = struct {
         const fromUTF8 = objc.Sel.registerName("stringWithUTF8String:");
         const dictionaryWithObjects = objc.Sel.registerName("dictionaryWithObjects:forKeys:count:");
 
-        const NSString = objc.getClass("NSString").?;
-
-        const batch_size: i32 = 1;
-        const model_seq_len_i32: i32 = @intCast(MODEL_SEQ_LEN);
-        const batch_num = NSNumber.msgSend(Object, numberWithInt, .{batch_size});
-        const seq_num = NSNumber.msgSend(Object, numberWithInt, .{model_seq_len_i32});
-        var shape_arr = [_]Object{ batch_num, seq_num };
-        const shape = NSArray.msgSend(
+        const rows_num = NSNumber.msgSend(Object, numberWithInt, .{@as(i32, @intCast(shape.rows))});
+        const seq_num = NSNumber.msgSend(Object, numberWithInt, .{@as(i32, @intCast(shape.seq))});
+        var shape_arr = [_]Object{ rows_num, seq_num };
+        const shape_ns = NSArray.msgSend(
             Object,
             arrayWithObjects,
             .{ @as([*]Object, &shape_arr), @as(usize, 2) },
         );
 
-        const MLMultiArrayDataTypeInt32: i32 = 0x20000 | 32; // 131104
+        const MLMultiArrayDataTypeInt32: i64 = 0x20000 | 32;
 
         var input_err: ?*anyopaque = null;
         const input_ids_array = MLMultiArray.msgSend(Object, alloc_sel, .{}).msgSend(
             Object,
             initWithShape,
-            .{ shape, MLMultiArrayDataTypeInt32, &input_err },
+            .{ shape_ns, MLMultiArrayDataTypeInt32, &input_err },
         );
         defer input_ids_array.release();
         if (input_err != null) return error.MLMultiArrayInitFailed;
@@ -543,27 +788,24 @@ pub const MpnetEmbedder = struct {
         const attention_mask_array = MLMultiArray.msgSend(Object, alloc_sel, .{}).msgSend(
             Object,
             initWithShape,
-            .{ shape, MLMultiArrayDataTypeInt32, &input_err },
+            .{ shape_ns, MLMultiArrayDataTypeInt32, &input_err },
         );
         defer attention_mask_array.release();
         if (input_err != null) return error.MLMultiArrayInitFailed;
         if (attention_mask_array.value == 0) return error.MLMultiArrayInitFailed;
 
-        const zero_val = NSNumber.msgSend(Object, numberWithInt, .{@as(i32, 0)});
-        const one_val = NSNumber.msgSend(Object, numberWithInt, .{@as(i32, 1)});
-
-        for (0..MODEL_SEQ_LEN) |i| {
-            if (i < seq_len) {
-                const token_val = NSNumber.msgSend(
-                    Object,
-                    numberWithInt,
-                    .{@as(i32, @intCast(token_ids[i]))},
-                );
-                input_ids_array.msgSend(void, setObject, .{ token_val, i });
-                attention_mask_array.msgSend(void, setObject, .{ one_val, i });
-            } else {
-                input_ids_array.msgSend(void, setObject, .{ zero_val, i });
-                attention_mask_array.msgSend(void, setObject, .{ zero_val, i });
+        // Row-major, [rows, seq]. Padding is a zero id under a zero mask, both within a
+        // row and for the rows past `rows.len`.
+        const slot_n = shape.rows * shape.seq;
+        const ids = input_ids_array.msgSend([*]i32, dataPointer_sel, .{})[0..slot_n];
+        const mask = attention_mask_array.msgSend([*]i32, dataPointer_sel, .{})[0..slot_n];
+        @memset(ids, 0);
+        @memset(mask, 0);
+        for (rows, 0..) |row, r| {
+            assert(row.len > 0 and row.len <= shape.seq);
+            for (row, 0..) |token, t| {
+                ids[r * shape.seq + t] = @intCast(token);
+                mask[r * shape.seq + t] = 1;
             }
         }
 
@@ -607,7 +849,7 @@ pub const MpnetEmbedder = struct {
         // Note to future me: This prediction section is by far the slowest section. Should you
         // choose to optimize it, look here first.
         var pred_err: ?*anyopaque = null;
-        const prediction = self.model.msgSend(
+        const prediction = model.msgSend(
             Object,
             predictionFromFeatures,
             .{ feature_provider, &pred_err },
@@ -640,8 +882,25 @@ pub const MpnetEmbedder = struct {
             return error.OutputNotFound;
         }
 
-        // Output shape is [1, MODEL_SEQ_LEN, VEC_SZ]. Pointer is row-major.
-        //
+        // Output shape is [rows, seq, VEC_SZ], read below as row-major with no gaps. CoreML
+        // does not promise that -- an array may carry strides wider than its shape -- so it
+        // is checked rather than assumed: reading a padded layout as a packed one would
+        // hand back vectors assembled from the wrong tokens, and nothing would fail.
+        const strides = output_array.msgSend(Object, objc.Sel.registerName("strides"), .{});
+        const expected_strides = [_]i64{ @intCast(shape.seq * VEC_SZ), VEC_SZ, 1 };
+        for (expected_strides, 0..) |expected, axis| {
+            const stride = strides
+                .msgSend(Object, objc.Sel.registerName("objectAtIndex:"), .{axis})
+                .msgSend(i64, objc.Sel.registerName("integerValue"), .{});
+            if (stride != expected) {
+                std.log.err(
+                    "Unexpected CoreML output stride {d} on axis {d}, wanted {d}\n",
+                    .{ stride, axis, expected },
+                );
+                return error.UnsupportedOutputLayout;
+            }
+        }
+
         // The element type has to be asked for, not assumed. A model converted with
         // `compute_precision=FLOAT16` -- which is what the Neural Engine requires, and what
         // makes this model 4.4x faster -- hands back a Float16 array, and reading those bytes
@@ -650,47 +909,42 @@ pub const MpnetEmbedder = struct {
         // to one particular conversion.
         const data_type = output_array.msgSend(i64, dataType_sel, .{});
 
-        // Mean pooling: average only over real (non-padding) token positions.
-        const output_slice = try allocator.alignedAlloc(
-            VEC_TYPE,
-            std.mem.Alignment.of(@Vector(VEC_SZ, VEC_TYPE)),
-            VEC_SZ,
-        );
-        const zero_vec: @Vector(VEC_SZ, VEC_TYPE) = @splat(0.0);
-        var sum_vec = zero_vec;
-        switch (data_type) {
-            MLMultiArrayDataTypeFloat32 => {
-                const data_ptr = output_array.msgSend([*]const f32, dataPointer_sel, .{});
-                for (0..seq_len) |t| {
-                    const token: @Vector(VEC_SZ, VEC_TYPE) = data_ptr[t * VEC_SZ ..][0..VEC_SZ].*;
-                    sum_vec += token;
-                }
-            },
-            MLMultiArrayDataTypeFloat16 => {
-                const data_ptr = output_array.msgSend([*]const f16, dataPointer_sel, .{});
-                for (0..seq_len) |t| {
-                    const half: @Vector(VEC_SZ, f16) = data_ptr[t * VEC_SZ ..][0..VEC_SZ].*;
-                    sum_vec += @floatCast(half);
-                }
-            },
-            else => {
-                std.log.err("Unsupported CoreML output dataType {d}\n", .{data_type});
-                return error.UnsupportedOutputDataType;
-            },
+        for (rows, outs, 0..) |row, out, r| {
+            const row_start = r * shape.seq * VEC_SZ;
+
+            // Mean pooling: average only over real (non-padding) token positions.
+            const zero_vec: @Vector(VEC_SZ, VEC_TYPE) = @splat(0.0);
+            var sum_vec = zero_vec;
+            switch (data_type) {
+                MLMultiArrayDataTypeFloat32 => {
+                    const data_ptr = output_array.msgSend([*]const f32, dataPointer_sel, .{});
+                    for (0..row.len) |t| {
+                        const token: @Vector(VEC_SZ, VEC_TYPE) =
+                            data_ptr[row_start + t * VEC_SZ ..][0..VEC_SZ].*;
+                        sum_vec += token;
+                    }
+                },
+                MLMultiArrayDataTypeFloat16 => {
+                    const data_ptr = output_array.msgSend([*]const f16, dataPointer_sel, .{});
+                    for (0..row.len) |t| {
+                        const half: @Vector(VEC_SZ, f16) =
+                            data_ptr[row_start + t * VEC_SZ ..][0..VEC_SZ].*;
+                        sum_vec += @floatCast(half);
+                    }
+                },
+                else => {
+                    std.log.err("Unsupported CoreML output dataType {d}\n", .{data_type});
+                    return error.UnsupportedOutputDataType;
+                },
+            }
+            const count: @Vector(VEC_SZ, VEC_TYPE) = @splat(@floatFromInt(row.len));
+            const mean_vec = sum_vec / count;
+
+            // L2 normalize
+            const dot = @reduce(.Add, mean_vec * mean_vec);
+            const norm: @Vector(VEC_SZ, VEC_TYPE) = @splat(@sqrt(dot));
+            out.* = mean_vec / norm;
         }
-        const count: @Vector(VEC_SZ, VEC_TYPE) = @splat(@floatFromInt(seq_len));
-        const mean_vec = sum_vec / count;
-
-        // L2 normalize
-        const dot = @reduce(.Add, mean_vec * mean_vec);
-        const norm: @Vector(VEC_SZ, VEC_TYPE) = @splat(@sqrt(dot));
-        const normed_vec = mean_vec / norm;
-
-        @as(*@Vector(VEC_SZ, VEC_TYPE), @ptrCast(output_slice)).* = normed_vec;
-
-        return EmbeddingModelOutput{
-            .mpnet_embedding = @as(*const @Vector(VEC_SZ, VEC_TYPE), @ptrCast(output_slice)),
-        };
     }
 };
 
@@ -1776,11 +2030,53 @@ test "embedBatch - nlembed matches embed" {
     try expectBatchMatchesSingles(&e, &batch_phrases, 0);
 }
 
+// Measured over 9,480 Wikipedia sentences: max |delta| 1.0e-3, min cosine 0.99999. A model
+// with no batch functions embeds the batch one string at a time and matches exactly.
+const mpnet_batch_tolerance = 2e-3;
+
 test "embedBatch - mpnetembed matches embed" {
     var mpnet = try MpnetEmbedder.init(.{});
     defer mpnet.deinit();
     var e = mpnet.embedder();
-    try expectBatchMatchesSingles(&e, &batch_phrases, 0);
+    try expectBatchMatchesSingles(&e, &batch_phrases, mpnet_batch_tolerance);
+}
+
+// Enough strings of each length to reach every path through the batch: full and partial
+// predictions of both batch shapes, a tail too short to be worth one, and a string too long
+// for either. A vector filed under the wrong string shows up as a cosine far below 1.
+test "embedBatch - mpnetembed spans every shape" {
+    var mpnet = try MpnetEmbedder.init(.{});
+    defer mpnet.deinit();
+    var e = mpnet.embedder();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const subjects = [_][]const u8{ "river", "engine", "violin", "glacier", "market", "falcon", "harbor" };
+    var strs: std.ArrayList([]const u8) = .{};
+    // 70 short: two full predictions of the 16-token shape and a partial one.
+    for (0..70) |i| {
+        try strs.append(allocator, try std.fmt.allocPrint(
+            allocator,
+            "The {s} number {d} is here",
+            .{ subjects[i % subjects.len], i },
+        ));
+    }
+    // 35 medium: one full prediction of the 32-token shape and a tail of three.
+    for (0..35) |i| {
+        try strs.append(allocator, try std.fmt.allocPrint(
+            allocator,
+            "Every {s} that was counted on day {d} of the long survey turned out to be " ++
+                "older than the people counting it had first believed",
+            .{ subjects[i % subjects.len], i },
+        ));
+    }
+    try strs.append(allocator, "");
+    try strs.append(allocator, "The archive held letters from the harbor master, ledgers of every " ++
+        "ship that had docked in forty years, and a long report on the falcon that nested " ++
+        "in the lighthouse, which nobody had asked for and nobody had read until now");
+    try expectBatchMatchesSingles(&e, strs.items, mpnet_batch_tolerance);
 }
 
 test "embedBatch - empty batch" {

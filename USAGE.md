@@ -95,7 +95,7 @@ and the command to fetch it.
 Fallback download, which unpacks both files into `./all_mpnet_base_v2/`:
 
 ```sh
-URL=https://github.com/emmettmcdow/dve/releases/download/coreml-models-v5/coreml_models_v5.tar.gz
+URL=https://github.com/emmettmcdow/dve/releases/download/coreml-models-v6/coreml_models_v6.tar.gz
 curl -L "$URL" | tar -xz all_mpnet_base_v2
 ```
 

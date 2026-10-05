@@ -1,6 +1,6 @@
 .{
     .name = .coreml_models,
-    .version = "5.0.0",
+    .version = "6.0.0",
     .dependencies = .{},
     .paths = .{
         "build.zig.zon",

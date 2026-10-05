@@ -57,6 +57,12 @@ const Options = struct {
     /// Lets another tool (llama.cpp's own llama-embedding, say) be pointed at exactly
     /// the text this harness would have embedded.
     dump: ?[]const u8 = null,
+    /// Which engines CoreML may put mpnet on. Ignored by the other backends: llama.cpp
+    /// has no Neural Engine backend to offer, only Metal and the CPU.
+    compute_units: embed.MpnetEmbedder.ComputeUnits = .all,
+    /// mpnet model to load instead of the installed one, for trying a fresh conversion.
+    /// The installed tokenizer is still used; it does not change with the conversion.
+    model_path: ?[]const u8 = null,
 };
 
 /// One document's worth of text, already split and filtered the way
@@ -93,6 +99,7 @@ pub fn main() !void {
         \\documents  {d}
         \\sentences  {d} ({d:.1} per document, {d:.1} bytes each)
         \\model      {t}
+        \\units      {s}
         \\
         \\
     , .{
@@ -102,6 +109,7 @@ pub fn main() !void {
         @as(f64, @floatFromInt(sentence_n)) / @as(f64, @floatFromInt(docs.len)),
         @as(f64, @floatFromInt(byte_n)) / @as(f64, @floatFromInt(sentence_n)),
         opts.model,
+        if (opts.model == .mpnet) @tagName(opts.compute_units) else "n/a",
     });
 
     if (opts.dump) |path| {
@@ -112,7 +120,10 @@ pub fn main() !void {
 
     switch (opts.model) {
         .mpnet => {
-            var m = try embed.MpnetEmbedder.init(.{});
+            var m = try embed.MpnetEmbedder.init(.{
+                .compute_units = opts.compute_units,
+                .model_path = opts.model_path,
+            });
             defer m.deinit();
             var e = m.embedder();
             try run(allocator, &e, docs, opts, byte_n);
@@ -411,6 +422,16 @@ fn parseArgs(args: []const []const u8) !Options {
             opts.reverse = true;
         } else if (std.mem.eql(u8, arg, "--dump")) {
             opts.dump = nextArg(args, &i);
+        } else if (std.mem.eql(u8, arg, "--model-path")) {
+            opts.model_path = nextArg(args, &i);
+        } else if (std.mem.eql(u8, arg, "--compute-units")) {
+            opts.compute_units = std.meta.stringToEnum(
+                embed.MpnetEmbedder.ComputeUnits,
+                nextArg(args, &i),
+            ) orelse fatal(
+                "--compute-units must be all, cpu_only, cpu_and_gpu or cpu_and_neural_engine",
+                .{},
+            );
         } else if (std.mem.eql(u8, arg, "--max-sentences")) {
             opts.max_sentences = try std.fmt.parseInt(usize, nextArg(args, &i), 10);
         } else if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) {
@@ -442,6 +463,10 @@ fn usage(code: u8) noreturn {
         \\  --verify           compare batch against single instead of timing
         \\  --reverse          time batch before single
         \\  --dump <file>      write the selected sentences one per line and exit
+        \\  --compute-units <u>  mpnet only: all | cpu_only | cpu_and_gpu |
+        \\                     cpu_and_neural_engine (default: all)
+        \\  --model-path <p>   mpnet only: .mlpackage or .mlmodelc to load instead of
+        \\                     the installed one
         \\
     , .{});
     std.process.exit(code);

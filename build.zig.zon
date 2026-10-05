@@ -12,8 +12,8 @@
             .hash = "tracy-0.0.10-Dn49m2RUAAAdadZoiLef0OCmVdUyeu5GmEzXoTAokcZl",
         },
         .coreml_models = .{
-            .url = "https://github.com/emmettmcdow/dve/releases/download/coreml-models-v5/coreml_models_v5.tar.gz",
-            .hash = "coreml_models-5.0.0-AAAAAPi8Cg30SeBVYopp2lv7QG-GGvb099KEn_PG_s2l",
+            .url = "https://github.com/emmettmcdow/dve/releases/download/coreml-models-v6/coreml_models_v6.tar.gz",
+            .hash = "coreml_models-6.0.0-AAAAACwJHg25_dWLJ1BujwaXG76R0rk863OHhkt9OVyO",
         },
     },
     .paths = .{

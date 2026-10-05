@@ -2,6 +2,7 @@
 """Generate a CoreML model from a HuggingFace sentence-transformers model."""
 
 import argparse
+import tempfile
 import types
 
 import coremltools as ct
@@ -50,6 +51,20 @@ class EmbeddingWrapper(nn.Module):
         return outputs.last_hidden_state
 
 
+def parse_batch_shapes(text):
+    """'32x16,32x32' -> [(32, 16), (32, 32)]. Empty means no batch functions."""
+    shapes = []
+    for part in filter(None, text.split(",")):
+        rows, _, seq = part.partition("x")
+        shapes.append((int(rows), int(seq)))
+    return shapes
+
+
+def batch_function_name(rows, seq):
+    """Keep in step with MpnetEmbedder.BATCH_SHAPES in src/embed.zig."""
+    return f"b{rows}_s{seq}"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate CoreML model from HuggingFace model"
@@ -89,6 +104,20 @@ def main():
         help="Minimum CoreML deployment target, e.g. macOS13/macOS14/macOS15 "
         "(default: macOS15). Lower targets pin an older MIL opset.",
     )
+    # The Neural Engine only takes fixed shapes: one model converted with enumerated shapes
+    # fails ANE compilation and lands on the CPU at a twentieth of the speed. So each batch
+    # shape is its own conversion, merged into the package as an extra function. The
+    # functions share one copy of the weights, so the package does not grow.
+    #
+    # The shapes are short on purpose. The ANE gets through a fixed number of token slots a
+    # second however they are arranged, and a typical sentence is a dozen tokens, so a batch
+    # of 128-token rows is mostly padding and barely beats one row at a time.
+    parser.add_argument(
+        "--batch-shapes",
+        default="32x16,32x32",
+        help="Extra ROWSxSEQ input shapes to add as functions, comma separated "
+        "(default: 32x16,32x32; pass '' for none)",
+    )
     args = parser.parse_args()
 
     model_name = args.model
@@ -114,23 +143,7 @@ def main():
     wrapper.eval()
 
     max_seq_length = args.seq_length
-    example_input_ids = torch.randint(
-        0, model.tokenizer.vocab_size, (1, max_seq_length)
-    )
-    example_attention_mask = torch.ones(1, max_seq_length, dtype=torch.long)
-
-    print("Tracing model...")
-    with torch.no_grad():
-        traced_model = torch.jit.trace(
-            wrapper, (example_input_ids, example_attention_mask), strict=False
-        )
-
-    inputs = [
-        ct.TensorType(name="input_ids", shape=(1, max_seq_length), dtype=int),
-        ct.TensorType(name="attention_mask", shape=(1, max_seq_length), dtype=int),
-    ]
-
-    outputs = [ct.TensorType(name="last_hidden_state", dtype=float)]
+    batch_shapes = parse_batch_shapes(args.batch_shapes)
 
     target = getattr(ct.target, args.deployment_target, None)
     if target is None:
@@ -140,17 +153,55 @@ def main():
         "float32": ct.precision.FLOAT32,
     }[args.precision]
 
-    print(f"Converting to CoreML ({args.precision}, {args.deployment_target})...")
-    mlmodel = ct.convert(
-        traced_model,
-        inputs=inputs,
-        outputs=outputs,
-        convert_to="mlprogram",
-        minimum_deployment_target=target,
-        compute_precision=precision,
-    )
+    def convert(rows, seq):
+        example_input_ids = torch.randint(0, model.tokenizer.vocab_size, (rows, seq))
+        example_attention_mask = torch.ones(rows, seq, dtype=torch.long)
 
-    mlmodel.save(str(output_path))
+        print(f"Tracing model at {rows}x{seq}...")
+        with torch.no_grad():
+            traced_model = torch.jit.trace(
+                wrapper, (example_input_ids, example_attention_mask), strict=False
+            )
+
+        inputs = [
+            ct.TensorType(name="input_ids", shape=(rows, seq), dtype=int),
+            ct.TensorType(name="attention_mask", shape=(rows, seq), dtype=int),
+        ]
+        outputs = [ct.TensorType(name="last_hidden_state", dtype=float)]
+
+        print(f"Converting to CoreML ({args.precision}, {args.deployment_target})...")
+        return ct.convert(
+            traced_model,
+            inputs=inputs,
+            outputs=outputs,
+            convert_to="mlprogram",
+            minimum_deployment_target=target,
+            compute_precision=precision,
+        )
+
+    mlmodel = convert(1, max_seq_length)
+    if not batch_shapes:
+        mlmodel.save(str(output_path))
+    else:
+        # `main` stays the default function and stays one row, so a caller that knows
+        # nothing about the batch functions loads exactly the model it always did.
+        with tempfile.TemporaryDirectory() as tmp:
+            single_path = str(Path(tmp) / "single.mlpackage")
+            mlmodel.save(single_path)
+            desc = ct.utils.MultiFunctionDescriptor()
+            desc.add_function(
+                single_path, src_function_name="main", target_function_name="main"
+            )
+            for rows, seq in batch_shapes:
+                shape_path = str(Path(tmp) / f"{rows}x{seq}.mlpackage")
+                convert(rows, seq).save(shape_path)
+                desc.add_function(
+                    shape_path,
+                    src_function_name="main",
+                    target_function_name=batch_function_name(rows, seq),
+                )
+            desc.default_function_name = "main"
+            ct.utils.save_multifunction(desc, str(output_path))
     print(f"Model saved to {output_path}")
 
     # Download tokenizer alongside the mlpackage (not inside it, so Xcode
