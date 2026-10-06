@@ -139,19 +139,17 @@ const Result = struct {
     vec_n: usize = 0,
 };
 
-pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
 
-    const args = try std.process.argsAlloc(gpa);
-    defer std.process.argsFree(gpa, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     const opts = parseArgs(args);
 
-    std.fs.cwd().makePath(opts.dir) catch {};
-    var dir = try std.fs.cwd().openDir(opts.dir, .{ .iterate = true });
-    defer dir.close();
-    defer if (!opts.keep) std.fs.cwd().deleteTree(opts.dir) catch {};
+    std.Io.Dir.cwd().createDirPath(io, opts.dir) catch {};
+    var dir = try std.Io.Dir.cwd().openDir(io, opts.dir, .{ .iterate = true });
+    defer dir.close(io);
+    defer if (!opts.keep) std.Io.Dir.cwd().deleteTree(io, opts.dir) catch {};
 
     std.debug.print(
         \\storebench -- vec_storage.zig (v1) vs vstore.zig (v2)
@@ -176,18 +174,18 @@ pub fn main() !void {
         opts.dir,
     });
 
-    var results: std.ArrayList(Result) = .{};
+    var results: std.ArrayList(Result) = .empty;
     defer results.deinit(gpa);
 
     const want = opts.which;
     if (want == .v1 or want == .both or want == .all) {
-        try results.append(gpa, try runOne(gpa, dir, opts, V1, false, "v1 vec_storage"));
+        try results.append(gpa, try runOne(gpa, io, dir, opts, V1, false, "v1 vec_storage"));
     }
     if (want == .v2 or want == .all) {
-        try results.append(gpa, try runOne(gpa, dir, opts, V2, false, "v2 vstore"));
+        try results.append(gpa, try runOne(gpa, io, dir, opts, V2, false, "v2 vstore"));
     }
     if (want == .v2_indexed or want == .both or want == .all) {
-        try results.append(gpa, try runOne(gpa, dir, opts, V2, true, "v2 vstore+codes"));
+        try results.append(gpa, try runOne(gpa, io, dir, opts, V2, true, "v2 vstore+codes"));
     }
 
     report(results.items, opts);
@@ -198,7 +196,8 @@ pub fn main() !void {
 /// not an abstraction waiting to be factored out.
 fn runOne(
     gpa: std.mem.Allocator,
-    dir: std.fs.Dir,
+    io: std.Io,
+    dir: std.Io.Dir,
     opts: Options,
     comptime Store: type,
     /// Search through the codes index rather than scanning the store. Only meaningful for V2;
@@ -208,7 +207,7 @@ fn runOne(
 ) !Result {
     var res = Result{ .label = label };
     const path = if (Store == V1) "bench-v1.db" else "bench-v2.db";
-    if (!opts.reuse) dir.deleteFile(path) catch {};
+    if (!opts.reuse) dir.deleteFile(io, path) catch {};
 
     var prng = std.Random.DefaultPrng.init(opts.seed);
     const rng = prng.random();
@@ -220,13 +219,13 @@ fn runOne(
         // v1 preallocates and doubles; v2 grows a chunk at a time. Both start where
         // `vector.zig` starts them, so the growth cost each design carries is in the number.
         var store = if (Store == V1)
-            try Store.init(gpa, dir, .{})
+            try Store.init(gpa, io, dir, .{})
         else
-            try Store.init(gpa, dir, .{ .path = path });
+            try Store.init(gpa, io, dir, .{ .path = path });
         defer store.deinit();
 
         var vec: [VEC_SZ]f32 = undefined;
-        var put_timer = try std.time.Timer.start();
+        var put_timer = Timer.start(io);
         var persist_ns: u64 = 0;
         var put_ns: u64 = 0;
 
@@ -262,7 +261,7 @@ fn runOne(
     }
 
     res.rss_peak = rssBytes();
-    res.bytes = (dir.statFile(path) catch |e| switch (e) {
+    res.bytes = (dir.statFile(io, path, .{}) catch |e| switch (e) {
         error.FileNotFound => fatal("{s}: no database at {s}/{s} to reuse", .{ label, opts.dir, path }),
         else => return e,
     }).size;
@@ -272,11 +271,11 @@ fn runOne(
     // ------------------------------------------------------------------------------ open
     // v1 reads the whole file into its arrays; v2 scans every metadata trailer. Both are O(n),
     // and this is the number the sidecar index exists to remove.
-    var open_timer = try std.time.Timer.start();
+    var open_timer = Timer.start(io);
     var store = if (Store == V1)
-        try Store.init(gpa, dir, .{})
+        try Store.init(gpa, io, dir, .{})
     else
-        try Store.init(gpa, dir, .{ .path = path });
+        try Store.init(gpa, io, dir, .{ .path = path });
     defer store.deinit();
     if (Store == V1) try store.load(path);
     res.open_ns = open_timer.read();
@@ -289,9 +288,9 @@ fn runOne(
     var idx: ?Codes = null;
     defer if (idx) |*c| c.deinit();
     if (Store == V2 and indexed) {
-        var c = try Codes.init(gpa, .{ .capacity = store.slot_n });
+        var c = try Codes.init(gpa, io, .{ .capacity = store.slot_n });
         errdefer c.deinit();
-        var build_timer = try std.time.Timer.start();
+        var build_timer = Timer.start(io);
         var it = try store.iterate();
         defer it.deinit();
         while (try it.next()) |e| try c.put(e.slot, e.vec);
@@ -302,12 +301,12 @@ fn runOne(
         // same index. `load` consumes the file, which is how a saved index is kept from
         // outliving the process that wrote it, so this saves again afterwards.
         const stamp = codesStamp(&store);
-        var save_timer = try std.time.Timer.start();
+        var save_timer = Timer.start(io);
         try c.save(dir, CODES_FILE, stamp);
         res.index_save_ns = save_timer.read();
 
-        var load_timer = try std.time.Timer.start();
-        var reloaded = (try Codes.load(gpa, dir, CODES_FILE, stamp, .{})) orelse
+        var load_timer = Timer.start(io);
+        var reloaded = (try Codes.load(gpa, io, dir, CODES_FILE, stamp, .{})) orelse
             fatal("the index just written would not load back", .{});
         res.index_load_ns = load_timer.read();
 
@@ -332,7 +331,7 @@ fn runOne(
     var qprng = std.Random.DefaultPrng.init(opts.seed +% 1);
     const qrng = qprng.random();
     var query: [VEC_SZ]f32 = undefined;
-    var search_timer = try std.time.Timer.start();
+    var search_timer = Timer.start(io);
     var search_ns: u64 = 0;
     for (0..opts.queries) |q| {
         corpus.draw(qrng, q, &query);
@@ -407,8 +406,13 @@ fn report(results: []const Result, opts: Options) void {
         const put_rate = rate(r.vec_n, r.put_ns);
         _ = r.persists;
         const ms_q = if (opts.queries == 0) 0 else msOf(r.search_ns) / @as(f64, @floatFromInt(opts.queries));
-        w("{s:<18} {d:>12.0} {D:>12} {D:>12} {d:>12.3} {f:>12}\n", .{
-            r.label, put_rate, r.persist_ns, r.open_ns, ms_q, fmtBytes(r.bytes),
+        w("{s:<18} {d:>12.0} {f} {f} {d:>12.3} {f:>12}\n", .{
+            r.label,
+            put_rate,
+            Nanos{ .ns = r.persist_ns, .width = 12 },
+            Nanos{ .ns = r.open_ns, .width = 12 },
+            ms_q,
+            fmtBytes(r.bytes),
         });
     }
 
@@ -426,8 +430,8 @@ fn report(results: []const Result, opts: Options) void {
 
     for (results) |r| {
         if (r.index_ns == 0) continue;
-        w("\n{s}: index build {D} (reads every vector), save {D}, load {D}\n", .{
-            r.label, r.index_ns, r.index_save_ns, r.index_load_ns,
+        w("\n{s}: index build {f} (reads every vector), save {f}, load {f}\n", .{
+            r.label, nanos(r.index_ns), nanos(r.index_save_ns), nanos(r.index_load_ns),
         });
         w("  loading instead of rebuilding is {d:.0}x, and that ratio is what grows:\n" ++
             "  the build reads the whole store, the load reads {f}.\n", .{
@@ -500,14 +504,14 @@ fn fmtBytes(bytes: u64) ByteSize {
 }
 
 // ***************************************************************************** Argument parsing
-fn parseArgs(args: [][:0]u8) Options {
+fn parseArgs(args: []const [:0]const u8) Options {
     var o = Options{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (eq(a, "-h") or eq(a, "--help")) usage(0);
         const val = struct {
-            fn next(as: [][:0]u8, idx: *usize, name: []const u8) []const u8 {
+            fn next(as: []const [:0]const u8, idx: *usize, name: []const u8) []const u8 {
                 idx.* += 1;
                 if (idx.* >= as.len) fatal("{s} needs a value", .{name});
                 return as[idx.*];
@@ -592,6 +596,9 @@ fn usage(code: u8) noreturn {
 const std = @import("std");
 const builtin = @import("builtin");
 const dve = @import("dve");
+const Timer = dve.util.Timer;
+const nanos = dve.util.nanos;
+const Nanos = dve.util.Nanos;
 
 /// mpnet's width, which is what the design target is sized against. The v1 store holds these
 /// as `@Vector(768, f32)`, padded to 4096 bytes -- the same ~24% the v2 store pays on disk,

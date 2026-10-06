@@ -43,7 +43,7 @@ pub inline fn readSlice(
     return r.interface.readSliceAll(buf);
 }
 
-pub inline fn readVec(N: usize, T: type, v: *@Vector(N, T), r: *FileReader, endian: std.builtin.Endian) !void {
+pub inline fn readVec(N: usize, T: type, v: *@Vector(N, T), r: *FileReader, endian: std.lang.Endian) !void {
     const native_endian = @import("builtin").cpu.arch.endian();
     const Stored = BinaryTypeRepresentation.to_binary(T).stored_as();
 
@@ -61,15 +61,17 @@ pub inline fn readVec(N: usize, T: type, v: *@Vector(N, T), r: *FileReader, endi
     }
 }
 
-pub inline fn writeVec(N: usize, T: type, w: *FileWriter, v: @Vector(N, T), endian: std.builtin.Endian) !void {
+pub inline fn writeVec(N: usize, T: type, w: *FileWriter, v: @Vector(N, T), endian: std.lang.Endian) !void {
     const zone = tracy.beginZone(@src(), .{ .name = "vec_storage.zig:writeVec" });
     defer zone.end();
 
     const native_endian = @import("builtin").cpu.arch.endian();
     const Stored = BinaryTypeRepresentation.to_binary(T).stored_as();
+    // A vector cannot be indexed at runtime, so it is read through an array of the same shape.
+    const elems: [N]T = v;
     var buf: [N]Stored = undefined;
     for (0..N) |i| {
-        const as_int: Stored = @bitCast(v[i]);
+        const as_int: Stored = @bitCast(elems[i]);
         buf[i] = if (endian != native_endian)
             @byteSwap(as_int)
         else
@@ -135,7 +137,18 @@ pub const StorageMetadata = packed struct {
 
     const Self = @This();
 
-    pub fn endianness(self: Self) std.builtin.Endian {
+    /// Swaps the byte order of each field in place, for a file written on a machine of the
+    /// other endianness. Only the two `usize` fields are wider than a byte.
+    ///
+    /// Written out by hand because `std.mem.byteSwapAllFields` now swaps a packed struct as
+    /// one integer, and this one is 153 bits wide. Field by field is also what the files
+    /// already on disk were written against.
+    pub fn byteSwapFields(self: *Self) void {
+        self.vec_sz = @byteSwap(self.vec_sz);
+        self.capacity = @byteSwap(self.capacity);
+    }
+
+    pub fn endianness(self: Self) std.lang.Endian {
         if (self.endian) {
             return .big;
         } else {
@@ -182,7 +195,8 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
         end_is: []usize,
         vec_n: usize,
         allocator: std.mem.Allocator,
-        dir: std.fs.Dir,
+        io: std.Io,
+        dir: std.Io.Dir,
 
         const Opts = struct {
             sz: usize = 32,
@@ -190,7 +204,7 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
 
         const Self = @This();
 
-        pub fn init(allocator: std.mem.Allocator, dir: std.fs.Dir, opts: Opts) !Self {
+        pub fn init(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, opts: Opts) !Self {
             const vecs = try allocator.alloc(Vector, opts.sz);
             @memset(vecs, std.mem.zeroes(Vector));
             const idx = try allocator.alloc(IndexEntry, opts.sz);
@@ -216,6 +230,7 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
                 .end_is = end_is,
                 .vec_n = 0,
                 .allocator = allocator,
+                .io = io,
                 .dir = dir,
             };
         }
@@ -295,18 +310,18 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
                 }
             };
 
-            var pq = std.PriorityQueue(entry, void, entry.order).init(arena.allocator(), undefined);
+            var pq: std.PriorityQueue(entry, void, entry.order) = .empty;
 
             for (self.index, 0..) |idx_entry, id| {
                 if (!idx_entry.occupied) continue;
                 const raw_similar = storedDot(vec_sz, vec_type, self.vectors[id], query);
                 if (raw_similar > threshold) {
-                    try pq.add(.{ .id = id, .sim = raw_similar });
+                    try pq.push(arena.allocator(), .{ .id = id, .sim = raw_similar });
                 }
             }
 
             var i: usize = 0;
-            while (pq.removeOrNull()) |pair| : (i += 1) {
+            while (pq.pop()) |pair| : (i += 1) {
                 if (i >= buf.len) {
                     std.log.debug("Results capped", .{});
                     break;
@@ -326,18 +341,19 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
             const zone = tracy.beginZone(@src(), .{ .name = "vec_storage.zig:save" });
             defer zone.end();
 
-            var f = self.dir.openFile(path, .{ .mode = .write_only }) catch |err| switch (err) {
-                std.fs.File.OpenError.FileNotFound => try self.dir.createFile(path, .{}),
+            const io = self.io;
+            var f = self.dir.openFile(io, path, .{ .mode = .write_only }) catch |err| switch (err) {
+                std.Io.File.OpenError.FileNotFound => try self.dir.createFile(io, path, .{}),
                 else => return err,
             };
-            defer f.close();
+            defer f.close(io);
             var wbuf: [8192]u8 = undefined;
-            var writer = f.writer(&wbuf);
+            var writer = f.writer(io, &wbuf);
 
             const endian = self.meta.endianness();
             const native_endian = @import("builtin").cpu.arch.endian();
             var meta_copy = self.meta;
-            if (native_endian != endian) std.mem.byteSwapAllFields(StorageMetadata, &meta_copy);
+            if (native_endian != endian) meta_copy.byteSwapFields();
             try writer.interface.writeAll(std.mem.asBytes(&meta_copy));
 
             const cap = self.meta.capacity;
@@ -364,13 +380,14 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
         // unnecessary. We should refactor some of this to be less confusing.
         // TODO: vec_sz and vec_type should be capitalized, per convention
         pub fn load(self: *Self, path: []const u8) !void {
-            var f = self.dir.openFile(path, .{ .mode = .read_only }) catch |err| switch (err) {
-                std.fs.File.OpenError.FileNotFound => return,
+            const io = self.io;
+            var f = self.dir.openFile(io, path, .{ .mode = .read_only }) catch |err| switch (err) {
+                std.Io.File.OpenError.FileNotFound => return,
                 else => return err,
             };
-            defer f.close();
+            defer f.close(io);
             var rbuf: [8192]u8 = undefined;
-            var reader = f.reader(&rbuf);
+            var reader = f.reader(io, &rbuf);
 
             const endian = self.meta.endianness();
             // Save this capacity because when we read the struct, the cap gets set to a value
@@ -378,7 +395,7 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
             const old_capacity = self.meta.capacity;
             const native_endian = @import("builtin").cpu.arch.endian();
             try reader.interface.readSliceAll(std.mem.asBytes(&self.meta));
-            if (native_endian != endian) std.mem.byteSwapAllFields(StorageMetadata, &self.meta);
+            if (native_endian != endian) self.meta.byteSwapFields();
             if (self.meta.fmt_v != LATEST_META_FORMAT_VERSION or
                 self.meta.vec_sz != vec_sz or
                 self.meta.vec_type != BinaryTypeRepresentation.to_binary(vec_type) or
@@ -499,7 +516,7 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
 
         /// Returns all vectors for a given note_id, sorted by start_i
         pub fn vecsForNote(self: Self, allocator: std.mem.Allocator, note_id: NoteID) ![]VecForNoteEntry {
-            var results: std.ArrayList(VecForNoteEntry) = .{};
+            var results: std.ArrayList(VecForNoteEntry) = .empty;
             errdefer results.deinit(allocator);
 
             for (self.index, 0..) |idx_entry, i| {
@@ -587,7 +604,7 @@ test "test put / get" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var inst = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer inst.deinit();
 
     try expect(inst.vec_n == 0);
@@ -607,7 +624,7 @@ test "re Storage" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var inst = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer inst.deinit();
 
     try expect(inst.vec_n == 0);
@@ -617,7 +634,7 @@ test "re Storage" {
     try inst.save("temp.db");
     inst.deinit();
 
-    var inst2 = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst2 = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer inst2.deinit();
     try inst2.load("temp.db");
     try expect(inst2.vec_n == 1);
@@ -642,7 +659,7 @@ test "re Storage multiple" {
         .{ .vec = .{ -0.5, -0.5, -0.5 }, .note_id = 4, .start_i = 30, .end_i = 40 },
     };
 
-    var inst = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     try expect(inst.vec_n == 0);
     for (rows) |row| {
         _ = try inst.put(row.note_id, row.start_i, row.end_i, row.vec);
@@ -651,7 +668,7 @@ test "re Storage multiple" {
     try inst.save("temp.db");
     inst.deinit();
 
-    var inst2 = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst2 = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer inst2.deinit();
     try inst2.load("temp.db");
     try expect(inst2.vec_n == rows.len);
@@ -679,7 +696,7 @@ test "re Storage index" {
     };
     var ids: [4]VectorID = undefined;
 
-    var inst = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     try expect(inst.vec_n == 0);
     for (rows, 0..) |row, i| {
         ids[i] = try inst.put(row.note_id, row.start_i, row.end_i, row.vec);
@@ -698,7 +715,7 @@ test "re Storage index" {
     try inst.save("temp.db");
     inst.deinit();
 
-    var inst2 = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst2 = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer inst2.deinit();
     try inst2.load("temp.db");
     try expect(inst2.vec_n == rows.len - 2);
@@ -714,7 +731,7 @@ test "test put resize" {
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
 
-    var inst = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer inst.deinit();
     try expect(inst.vec_n == 0);
     try expect(inst.meta.capacity == 32);
@@ -736,7 +753,7 @@ test "no failure on loading non-existent db" {
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
 
-    var inst = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer inst.deinit();
     try inst.load("vecs.db");
 }
@@ -747,7 +764,7 @@ test "grow" {
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
 
-    var inst = try TestStorage.init(arena.allocator(), tmpD.dir, .{ .sz = 1 });
+    var inst = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{ .sz = 1 });
     defer inst.deinit();
     try inst.grow();
     try expect(inst.meta.capacity == 1);
@@ -782,7 +799,7 @@ test "copy" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var inst = try TestStorage.init(arena.allocator(), tmpD.dir, .{ .sz = 2 });
+    var inst = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{ .sz = 2 });
 
     const vec1: TestVecType = .{ 1, 1, 1 };
     const old_id = try inst.put(42, 5, 15, vec1);
@@ -802,7 +819,7 @@ test "dirty and occupied" {
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
 
-    var inst = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer inst.deinit();
 
     const id1 = try inst.put(1, 0, 10, .{ 1, 1, 1 });
@@ -829,13 +846,13 @@ test "no write dirty" {
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
 
-    var inst = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer inst.deinit();
     const vec1_a: TestVecType = .{ 1, 1, 1 };
     const id = try inst.put(100, 0, 10, vec1_a);
     try inst.save("temp.db");
 
-    var inst2 = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst2 = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer inst2.deinit();
     try inst2.load("temp.db");
 
@@ -843,7 +860,7 @@ test "no write dirty" {
     inst2.setDirty(id, false);
     try inst2.save("temp.db");
 
-    var inst3 = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst3 = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer inst3.deinit();
     try inst3.load("temp.db");
     const row1_b = inst3.get(id);
@@ -857,7 +874,7 @@ test "loaded not dirty" {
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
 
-    var inst = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer inst.deinit();
     var ids: [10]VectorID = undefined;
     for (0..10) |i| {
@@ -866,7 +883,7 @@ test "loaded not dirty" {
     }
     try inst.save("temp.db");
 
-    var inst2 = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst2 = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer inst2.deinit();
     try inst2.load("temp.db");
     for (ids) |id| {
@@ -880,7 +897,7 @@ test "search returns VectorRow" {
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
 
-    var inst = try TestStorage.init(arena.allocator(), tmpD.dir, .{});
+    var inst = try TestStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer inst.deinit();
 
     _ = try inst.put(10, 0, 5, .{ 1, 0, 0 });
@@ -906,13 +923,14 @@ test "search hugebuf" {
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
 
-    var inst = try HugeStorage.init(arena.allocator(), tmpD.dir, .{ .sz = 2048 });
+    var inst = try HugeStorage.init(arena.allocator(), std.testing.io, tmpD.dir, .{ .sz = 2048 });
     defer inst.deinit();
 
     // Insert 1000 vectors
     for (0..1000) |i| {
-        var vec: HugeVecType = @splat(0);
-        vec[i % HugeN] = 1.0; // Each vector has a single 1.0 at position i%N
+        var elems: [HugeN]f32 = @splat(0);
+        elems[i % HugeN] = 1.0; // Each vector has a single 1.0 at position i%N
+        const vec: HugeVecType = elems;
         _ = try inst.put(@intCast(i), i * 10, (i + 1) * 10, vec);
     }
 
@@ -997,7 +1015,7 @@ test "rmByNoteId" {
     var tmpD = tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
-    var s = try TestStorage.init(testing_allocator, tmpD.dir, .{});
+    var s = try TestStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer s.deinit();
 
     const note1: NoteID = 1;
@@ -1027,7 +1045,7 @@ test "re Storage capacity mismatch with scattered deletes" {
 
     {
         // Start small, grow by inserting 8 entries (sz=2 → capacity 16)
-        var inst = try TestStorage.init(testing_allocator, tmpD.dir, .{ .sz = 2 });
+        var inst = try TestStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{ .sz = 2 });
         defer inst.deinit();
         for (0..N) |i| {
             const note_id: NoteID = @intCast(i + 1);
@@ -1047,7 +1065,7 @@ test "re Storage capacity mismatch with scattered deletes" {
 
     {
         // Load into a fresh instance (starts at sz=2, must grow to fit)
-        var inst2 = try TestStorage.init(testing_allocator, tmpD.dir, .{ .sz = 2 });
+        var inst2 = try TestStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{ .sz = 2 });
         defer inst2.deinit();
         try inst2.load("temp.db");
 
@@ -1069,7 +1087,7 @@ test "re Storage stale file data after trailing delete" {
     defer tmpD.cleanup();
 
     // Cycle 1: insert 4 entries, save (writes len=4 worth of scalars)
-    var inst = try TestStorage.init(testing_allocator, tmpD.dir, .{ .sz = 8 });
+    var inst = try TestStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{ .sz = 8 });
     _ = try inst.put(10, 0, 100, .{ 1, 0, 0 });
     _ = try inst.put(20, 100, 200, .{ 0, 1, 0 });
     _ = try inst.put(30, 200, 300, .{ 0, 0, 1 });
@@ -1082,7 +1100,7 @@ test "re Storage stale file data after trailing delete" {
     inst.deinit();
 
     // Cycle 2: load, add 2 new entries (one reuses slot 3, one goes to slot 4)
-    var inst2 = try TestStorage.init(testing_allocator, tmpD.dir, .{ .sz = 8 });
+    var inst2 = try TestStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{ .sz = 8 });
     try inst2.load("temp.db");
     try expectEqual(@as(usize, 3), inst2.vec_n);
 
@@ -1092,7 +1110,7 @@ test "re Storage stale file data after trailing delete" {
     inst2.deinit();
 
     // Cycle 3: load and verify all 5 entries have correct scalars
-    var inst3 = try TestStorage.init(testing_allocator, tmpD.dir, .{ .sz = 8 });
+    var inst3 = try TestStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{ .sz = 8 });
     defer inst3.deinit();
     try inst3.load("temp.db");
 
@@ -1124,7 +1142,7 @@ const ChurnRow = struct {
 test "churn: multi-cycle save/load with interleaved insert, delete, and slot reuse" {
     var tmpD = tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var inst = try TestStorage.init(testing_allocator, tmpD.dir, .{ .sz = 2 });
+    var inst = try TestStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{ .sz = 2 });
 
     // --- Cycle 1: fill past initial capacity, forcing multiple grows ---
     var live = std.AutoHashMap(VectorID, ChurnRow).init(testing_allocator);
@@ -1149,7 +1167,7 @@ test "churn: multi-cycle save/load with interleaved insert, delete, and slot reu
     inst.deinit();
 
     // --- Cycle 2: load, verify, delete scattered entries, save ---
-    var inst2 = try TestStorage.init(testing_allocator, tmpD.dir, .{ .sz = 2 });
+    var inst2 = try TestStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{ .sz = 2 });
     try inst2.load("temp.db");
 
     try verifyAll(&inst2, &live);
@@ -1165,7 +1183,7 @@ test "churn: multi-cycle save/load with interleaved insert, delete, and slot reu
     inst2.deinit();
 
     // --- Cycle 3: load, verify holes, insert into reused slots, save ---
-    var inst3 = try TestStorage.init(testing_allocator, tmpD.dir, .{ .sz = 2 });
+    var inst3 = try TestStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{ .sz = 2 });
     try inst3.load("temp.db");
 
     try verifyAll(&inst3, &live);
@@ -1190,7 +1208,7 @@ test "churn: multi-cycle save/load with interleaved insert, delete, and slot reu
     inst3.deinit();
 
     // --- Cycle 4: load, verify everything survived, delete all of one note, save ---
-    var inst4 = try TestStorage.init(testing_allocator, tmpD.dir, .{ .sz = 2 });
+    var inst4 = try TestStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{ .sz = 2 });
     try inst4.load("temp.db");
 
     try verifyAll(&inst4, &live);
@@ -1214,7 +1232,7 @@ test "churn: multi-cycle save/load with interleaved insert, delete, and slot reu
     inst4.deinit();
 
     // --- Cycle 5: load, add a large batch forcing another grow, verify ---
-    var inst5 = try TestStorage.init(testing_allocator, tmpD.dir, .{ .sz = 2 });
+    var inst5 = try TestStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{ .sz = 2 });
     try inst5.load("temp.db");
 
     try verifyAll(&inst5, &live);
@@ -1239,7 +1257,7 @@ test "churn: multi-cycle save/load with interleaved insert, delete, and slot reu
     inst5.deinit();
 
     // --- Final: load one more time and verify nothing was lost ---
-    var inst6 = try TestStorage.init(testing_allocator, tmpD.dir, .{ .sz = 2 });
+    var inst6 = try TestStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{ .sz = 2 });
     defer inst6.deinit();
     try inst6.load("temp.db");
 
@@ -1270,8 +1288,8 @@ fn verifyAll(inst: *TestStorage, live: *const std.AutoHashMap(VectorID, ChurnRow
 
 const std = @import("std");
 const assert = std.debug.assert;
-const FileWriter = std.fs.File.Writer;
-const FileReader = std.fs.File.Reader;
+const FileWriter = std.Io.File.Writer;
+const FileReader = std.Io.File.Reader;
 
 const tmpDir = std.testing.tmpDir;
 const testing_allocator = std.testing.allocator;

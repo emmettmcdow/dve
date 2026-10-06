@@ -6,13 +6,14 @@ pub fn UniqueCircularBuffer(T: type, ID_T: type, GET_ID_FN: fn (T) ID_T) type {
         ring_buf: []T,
         id_to_idx: *HashMap,
         allocator: Allocator,
+        io: Io,
         read_i: usize = 0,
         write_i: usize = 0,
-        mutex: Mutex = Mutex{},
+        mutex: Mutex = .init,
 
         pub const Error = error{Full};
 
-        pub fn init(allocator: Allocator, sz: u32) !*@This() {
+        pub fn init(allocator: Allocator, io: Io, sz: u32) !*@This() {
             var map = try allocator.create(HashMap);
             map.* = .empty;
             try map.ensureTotalCapacity(allocator, sz);
@@ -22,6 +23,7 @@ pub fn UniqueCircularBuffer(T: type, ID_T: type, GET_ID_FN: fn (T) ID_T) type {
                 .ring_buf = try allocator.alloc(T, sz),
                 .id_to_idx = map,
                 .allocator = allocator,
+                .io = io,
             };
             return self;
         }
@@ -36,8 +38,8 @@ pub fn UniqueCircularBuffer(T: type, ID_T: type, GET_ID_FN: fn (T) ID_T) type {
         /// Pop from the front of the queue.
         pub fn pop(self: *@This()) ?T {
             const output = b: {
-                self.mutex.lock();
-                defer self.mutex.unlock();
+                self.mutex.lockUncancelable(self.io);
+                defer self.mutex.unlock(self.io);
 
                 if (self.read_i == self.write_i) {
                     return null;
@@ -56,8 +58,8 @@ pub fn UniqueCircularBuffer(T: type, ID_T: type, GET_ID_FN: fn (T) ID_T) type {
         /// position. The replaced item is returned so the caller can release anything it
         /// owns; dropping the return value leaks it.
         pub fn push(self: *@This(), item: T) Error!?T {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             // Check if we can update rather than add.
             if (self.id_to_idx.getEntry(GET_ID_FN(item))) |entry| {
@@ -77,6 +79,54 @@ pub fn UniqueCircularBuffer(T: type, ID_T: type, GET_ID_FN: fn (T) ID_T) type {
     };
 }
 
+/// A monotonic stopwatch. Stands in for `std.time.Timer`, which std no longer has: reading
+/// the clock is an `Io` operation now, so the stopwatch carries the `Io` it was started on.
+pub const Timer = struct {
+    io: Io,
+    started: Io.Timestamp,
+
+    pub fn start(io: Io) Timer {
+        return .{ .io = io, .started = .now(io, .awake) };
+    }
+
+    /// Nanoseconds since `start` or the last `reset`.
+    pub fn read(self: *const Timer) u64 {
+        return @intCast(self.started.untilNow(self.io, .awake).toNanoseconds());
+    }
+
+    pub fn reset(self: *Timer) void {
+        self.started = .now(self.io, .awake);
+    }
+
+    /// `read` followed by `reset`, off a single reading of the clock.
+    pub fn lap(self: *Timer) u64 {
+        const now: Io.Timestamp = .now(self.io, .awake);
+        defer self.started = now;
+        return @intCast(self.started.durationTo(now).toNanoseconds());
+    }
+};
+
+/// Nanoseconds that print as a duration under `{f}`, e.g. `1.204s`. Stands in for the `{D}`
+/// specifier, which std no longer has. `width` right-aligns the text, because `{f}` ignores
+/// a width written in the format string.
+pub const Nanos = struct {
+    ns: u64,
+    width: usize = 0,
+
+    pub fn format(self: Nanos, w: *Io.Writer) Io.Writer.Error!void {
+        var buf: [48]u8 = undefined;
+        var fixed: Io.Writer = .fixed(&buf);
+        Io.Duration.fromNanoseconds(self.ns).format(&fixed) catch unreachable;
+        const text = fixed.buffered();
+        if (text.len < self.width) try w.splatByteAll(' ', self.width - text.len);
+        try w.writeAll(text);
+    }
+};
+
+pub fn nanos(ns: u64) Nanos {
+    return .{ .ns = ns };
+}
+
 fn usizeID(a: usize) usize {
     return a;
 }
@@ -87,13 +137,13 @@ test "UniqueCircularBuffer" {
     const allocator = std.testing.allocator;
 
     { // FIFO base
-        var buf = try UsizeCircularBuf.init(allocator, capacity);
+        var buf = try UsizeCircularBuf.init(allocator, std.testing.io, capacity);
         defer buf.deinit();
         for (0..capacity - 1) |i| try expectEqual(null, try buf.push(i));
         for (0..capacity - 1) |i| try expectEqual(i, buf.pop());
     }
     { // Error Cases
-        var buf = try UsizeCircularBuf.init(allocator, capacity);
+        var buf = try UsizeCircularBuf.init(allocator, std.testing.io, capacity);
         defer buf.deinit();
         try expectEqual(null, buf.pop());
         for (0..capacity - 1) |i| _ = try buf.push(i);
@@ -109,7 +159,7 @@ test "UniqueCircularBuffer" {
             }
         };
         const StructCircularBuf = UniqueCircularBuffer(TestStruct, usize, TestStruct.getID);
-        var buf = try StructCircularBuf.init(allocator, capacity);
+        var buf = try StructCircularBuf.init(allocator, std.testing.io, capacity);
         defer buf.deinit();
 
         const a = TestStruct{ .id = 1, .val = 1 };
@@ -129,7 +179,7 @@ test "UniqueCircularBuffer" {
         try expectEqualDeep(c, buf.pop());
     }
     { // A replacement does not consume a slot.
-        var buf = try UsizeCircularBuf.init(allocator, capacity);
+        var buf = try UsizeCircularBuf.init(allocator, std.testing.io, capacity);
         defer buf.deinit();
         for (0..capacity - 1) |i| _ = try buf.push(i);
         try expectEqual(0, try buf.push(0));
@@ -295,28 +345,14 @@ pub const TrackingAllocator = struct {
     }
 
     fn TAdumpStack(self: *Self, ret_addr: usize) void {
-        var aw = std.io.Writer.Allocating.init(self.parent);
+        var aw = std.Io.Writer.Allocating.init(self.parent);
         defer aw.deinit();
 
-        const debug_info = std.debug.getSelfDebugInfo() catch unreachable;
-        var stack_it = std.debug.StackIterator.init(null, null);
-        var started_printing = false;
-        o: while (stack_it.next()) |address| {
-            const module = debug_info.getModuleForAddress(address) catch break;
-            const symbol_info = module.getSymbolAtAddress(debug_info.allocator, address) catch break;
-            const sl = symbol_info.source_location orelse continue;
-            if (!started_printing) {
-                if (std.mem.indexOf(u8, sl.file_name, "dve/src") != null) { // Our source code
-                    const our_fns = [_][]const u8{ "TAalloc", "TAresize", "TAfree", "TAremap", "TAresizeAdj", "TAreport", "TAdumpStack" };
-                    for (our_fns) |our_fn| if (std.mem.eql(u8, symbol_info.name, our_fn)) continue :o;
-                    // dve/src and not
-                } else { // no dve/src
-                    continue;
-                }
-                started_printing = true;
-            }
-            aw.writer.print("        {s} @ {s}:{d}\n", .{ symbol_info.name, sl.file_name, sl.line }) catch unreachable;
-        }
+        // std no longer exposes the iterator that let this pick frames out one at a time,
+        // so the trace is captured from the allocating call down and written out whole.
+        var addrs: [32]usize = undefined;
+        const trace = std.debug.captureCurrentStackTrace(.{ .first_address = ret_addr }, &addrs);
+        std.debug.writeStackTrace(&trace, .{ .writer = &aw.writer, .mode = .no_color }) catch unreachable;
         const stack = aw.toOwnedSlice() catch unreachable;
         self.stack_info.put(self.parent, ret_addr, stack) catch unreachable;
     }
@@ -330,4 +366,5 @@ const AutoContext = std.hash_map.AutoContext;
 const expectEqual = std.testing.expectEqual;
 const expectEqualDeep = std.testing.expectEqualDeep;
 const HashMapUnmanaged = std.hash_map.HashMapUnmanaged;
-const Mutex = std.Thread.Mutex;
+const Io = std.Io;
+const Mutex = Io.Mutex;

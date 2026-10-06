@@ -8,7 +8,7 @@ fn binarySingleWords(comptime model: EmbeddingModel) !void {
 
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try dve.VectorEngine(model).init(testing_allocator, tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const BiCase = struct { a: []const u8, b: []const u8, query: []const u8, want: []const u8 };
@@ -56,7 +56,7 @@ fn sentenceSimilarity(comptime model: EmbeddingModel) !void {
 
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try dve.VectorEngine(model).init(testing_allocator, tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     var searchBuf: [20]SearchResult = undefined;
@@ -123,7 +123,7 @@ fn sentenceSplit(comptime model: EmbeddingModel) !void {
 
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try dve.VectorEngine(model).init(testing_allocator, tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     var searchBuf: [20]SearchResult = undefined;
@@ -178,7 +178,7 @@ fn queryLengthParity(comptime model: EmbeddingModel) !void {
 
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try dve.VectorEngine(model).init(testing_allocator, tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     var searchBuf: [20]SearchResult = undefined;
@@ -226,7 +226,7 @@ fn longComplexSentences(comptime model: EmbeddingModel) !void {
 
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try dve.VectorEngine(model).init(testing_allocator, tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     var searchBuf: [20]SearchResult = undefined;
@@ -306,7 +306,7 @@ fn markdownStructure(comptime model: EmbeddingModel) !void {
 
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try dve.VectorEngine(model).init(testing_allocator, tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const all_docs = [_]TextEntry{
@@ -391,7 +391,7 @@ fn distractorDensity(comptime model: EmbeddingModel) !void {
 
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try dve.VectorEngine(model).init(testing_allocator, tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     // Thirty near-misses on the same topic as the question, and one answer.
@@ -497,7 +497,7 @@ fn absentAnswer(comptime model: EmbeddingModel) !void {
 
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try dve.VectorEngine(model).init(testing_allocator, tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const all_docs = [_]TextEntry{

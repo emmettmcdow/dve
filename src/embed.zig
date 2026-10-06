@@ -147,7 +147,7 @@ fn sequentialEmbedBatch(comptime embedOne: EmbedFn) EmbedBatchFn {
 /// cheaper problem than that.
 const ModelCache = struct {
     /// Guards the tables below.
-    var mutex: Mutex = .{};
+    var mutex: Mutex = .init;
     var by_path: ?std.StringHashMap(Object) = null;
     /// Keys that were asked for and are not there: a batch function in a model converted
     /// without any. Remembered so that every `init` after the first does not ask again.
@@ -155,7 +155,7 @@ const ModelCache = struct {
     /// Parsed tokenizers, keyed and retained the same way as the models.
     var tokenizers: ?std.StringHashMap(*WordPieceTokenizer) = null;
     /// Held across `MLModel` prediction. Process-wide because the models are.
-    var predict_mutex: Mutex = .{};
+    var predict_mutex: Mutex = .init;
 };
 
 pub const MpnetEmbedder = struct {
@@ -170,6 +170,7 @@ pub const MpnetEmbedder = struct {
     tokenizer: *tokenizer_mod.WordPieceTokenizer,
     /// Owns the two paths below, and nothing else now that the tokenizer is shared.
     tokenizer_alloc: std.heap.ArenaAllocator,
+    io: std.Io,
     /// The files this embedder actually loaded, after option/bundle/exe-relative resolution.
     /// Owned by `tokenizer_alloc`.
     loaded_model_path: [:0]const u8,
@@ -272,7 +273,7 @@ pub const MpnetEmbedder = struct {
 
     // The calling Swift thread wraps this in an AutoreleasePool, so we do not need to release
     // anything here. We only need to retain the model and the rest will be cleaned up.
-    pub fn init(opts: InitOptions) !MpnetEmbedder {
+    pub fn init(io: std.Io, opts: InitOptions) !MpnetEmbedder {
         const init_zone = tracy.beginZone(@src(), .{ .name = "embed.zig:MpnetEmbedder.init" });
         defer init_zone.end();
         const pool = objc.AutoreleasePool.init();
@@ -281,13 +282,13 @@ pub const MpnetEmbedder = struct {
         errdefer tokenizer_alloc.deinit();
 
         const tokenizer_path: [:0]const u8 = if (opts.tokenizer_path) |p|
-            tokenizer_alloc.allocator().dupeZ(u8, p) catch return error.TokenizerLoadFailed
+            tokenizer_alloc.allocator().dupeSentinel(u8, p, 0) catch return error.TokenizerLoadFailed
         else
-            getModelPath(tokenizer_alloc.allocator(), TOKENIZER_PATH, BUNDLE_TOKENIZER_PATH) catch {
+            getModelPath(tokenizer_alloc.allocator(), io, TOKENIZER_PATH, BUNDLE_TOKENIZER_PATH) catch {
                 return error.TokenizerLoadFailed;
             };
 
-        const tok = try acquireTokenizer(tokenizer_path);
+        const tok = try acquireTokenizer(io, tokenizer_path);
 
         const NSString = objc.getClass("NSString") orelse {
             std.log.err("Failed to get NSString class\n", .{});
@@ -301,15 +302,16 @@ pub const MpnetEmbedder = struct {
         const fileURLWithPath = objc.Sel.registerName("fileURLWithPath:");
 
         const full_path: [:0]const u8 = if (opts.model_path) |p|
-            tokenizer_alloc.allocator().dupeZ(u8, p) catch return error.PathAllocFailed
+            tokenizer_alloc.allocator().dupeSentinel(u8, p, 0) catch return error.PathAllocFailed
         else
             preferPrecompiled(
                 tokenizer_alloc.allocator(),
-                getModelPath(tokenizer_alloc.allocator(), MODEL_PATH, BUNDLE_MODEL_PATH) catch {
+                io,
+                getModelPath(tokenizer_alloc.allocator(), io, MODEL_PATH, BUNDLE_MODEL_PATH) catch {
                     return error.PathAllocFailed;
                 },
             ) catch return error.PathAllocFailed;
-        std.fs.cwd().access(full_path, .{}) catch {
+        std.Io.Dir.cwd().access(io, full_path, .{}) catch {
             logModelNotFound("mpnet model", full_path, DOWNLOAD_CMD, "model_path");
             return error.ModelNotFound;
         };
@@ -330,6 +332,7 @@ pub const MpnetEmbedder = struct {
         const is_precompiled = std.mem.endsWith(u8, resolved, ".mlmodelc");
 
         const model = try acquireModel(
+            io,
             resolved,
             model_url,
             is_precompiled,
@@ -347,6 +350,7 @@ pub const MpnetEmbedder = struct {
             .compute_units = opts.compute_units,
             .tokenizer = tok,
             .tokenizer_alloc = tokenizer_alloc,
+            .io = io,
             .loaded_model_path = full_path,
             .loaded_tokenizer_path = tokenizer_path,
         };
@@ -355,9 +359,9 @@ pub const MpnetEmbedder = struct {
     /// Returns the tokenizer parsed from `path`. Reads and parses it on the first call for
     /// that path and never again: the vocabulary is read-only once built, so every embedder
     /// in the process can share one, and parsing it was most of what a second `init` cost.
-    fn acquireTokenizer(path: []const u8) !*WordPieceTokenizer {
-        ModelCache.mutex.lock();
-        defer ModelCache.mutex.unlock();
+    fn acquireTokenizer(io: std.Io, path: []const u8) !*WordPieceTokenizer {
+        ModelCache.mutex.lockUncancelable(io);
+        defer ModelCache.mutex.unlock(io);
 
         if (ModelCache.tokenizers == null) {
             ModelCache.tokenizers =
@@ -370,16 +374,16 @@ pub const MpnetEmbedder = struct {
         errdefer arena.deinit();
         const allocator = arena.allocator();
 
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
+        const json = std.Io.Dir.cwd().readFileAlloc(
+            io,
+            path,
+            allocator,
+            .limited(10 * 1024 * 1024),
+        ) catch |err| {
             if (err == error.FileNotFound) {
                 logModelNotFound("mpnet tokenizer", path, DOWNLOAD_CMD, "tokenizer_path");
                 return error.ModelNotFound;
             }
-            std.log.err("Failed to open tokenizer.json: {}\n", .{err});
-            return error.TokenizerLoadFailed;
-        };
-        defer file.close();
-        const json = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch |err| {
             std.log.err("Failed to read tokenizer.json: {}\n", .{err});
             return error.TokenizerLoadFailed;
         };
@@ -402,14 +406,15 @@ pub const MpnetEmbedder = struct {
     /// A function the model does not have is `error.ModelFunctionNotFound`, and is expected:
     /// it is how a model converted without batch shapes says so.
     fn acquireModel(
+        io: std.Io,
         path: []const u8,
         model_url: Object,
         is_precompiled: bool,
         compute_units: ComputeUnits,
         function: ?[:0]const u8,
     ) !Object {
-        ModelCache.mutex.lock();
-        defer ModelCache.mutex.unlock();
+        ModelCache.mutex.lockUncancelable(io);
+        defer ModelCache.mutex.unlock(io);
 
         if (ModelCache.by_path == null) {
             ModelCache.by_path = std.StringHashMap(Object).init(std.heap.page_allocator);
@@ -418,7 +423,7 @@ pub const MpnetEmbedder = struct {
         // Keyed by path and function: the first `compute_units` asked for wins for the life
         // of the process. Nothing here loads one model two ways, and adding it to the key
         // would invite doing it.
-        var key_buf: [std.fs.max_path_bytes + 64]u8 = undefined;
+        var key_buf: [std.Io.Dir.max_path_bytes + 64]u8 = undefined;
         const lookup_key = if (function) |f|
             std.fmt.bufPrint(&key_buf, "{s}#{s}", .{ path, f }) catch return error.PathAllocFailed
         else
@@ -457,7 +462,7 @@ pub const MpnetEmbedder = struct {
             .msgSend(Object, objc.Sel.registerName("init"), .{});
         defer config.release();
         config.msgSend(void, objc.Sel.registerName("setComputeUnits:"), .{
-            @intFromEnum(compute_units),
+            @backingInt(compute_units),
         });
         if (function) |f| {
             // macOS 15. An older system cannot load a multifunction model's other functions
@@ -508,8 +513,9 @@ pub const MpnetEmbedder = struct {
         return model.retain();
     }
 
-    pub fn init_self(self: *MpnetEmbedder, opts: InitOptions) !void {
-        const obj = try MpnetEmbedder.init(opts);
+    pub fn init_self(self: *MpnetEmbedder, io: std.Io, opts: InitOptions) !void {
+        const obj = try MpnetEmbedder.init(io, opts);
+        self.io = obj.io;
         self.model = obj.model;
         self.batch = obj.batch;
         self.compute_units = obj.compute_units;
@@ -581,8 +587,8 @@ pub const MpnetEmbedder = struct {
         // one. The lock lives with the model and not the instance because `ModelCache` hands
         // every MpnetEmbedder in a process the same MLModel -- a per-instance lock would
         // guard nothing.
-        ModelCache.predict_mutex.lock();
-        defer ModelCache.predict_mutex.unlock();
+        ModelCache.predict_mutex.lockUncancelable(self.io);
+        defer ModelCache.predict_mutex.unlock(self.io);
 
         try predictRows(
             self.model,
@@ -658,8 +664,8 @@ pub const MpnetEmbedder = struct {
 
                 // The lock is taken per prediction and not across the batch, so that a
                 // search embedding its query waits for one prediction, not for a document.
-                ModelCache.predict_mutex.lock();
-                defer ModelCache.predict_mutex.unlock();
+                ModelCache.predict_mutex.lockUncancelable(self.io);
+                defer ModelCache.predict_mutex.unlock(self.io);
                 const model = (try self.batchModels() orelse break)[shape_i];
                 try predictRows(model, shape, rows[0..row_n], row_vecs[0..row_n]);
                 for (row_items[0..row_n]) |filled| done[filled] = true;
@@ -669,8 +675,8 @@ pub const MpnetEmbedder = struct {
 
         for (tokens[0..n], vecs[0..n], done[0..n]) |row, vec, filled| {
             if (filled) continue;
-            ModelCache.predict_mutex.lock();
-            defer ModelCache.predict_mutex.unlock();
+            ModelCache.predict_mutex.lockUncancelable(self.io);
+            defer ModelCache.predict_mutex.unlock(self.io);
             try predictRows(self.model, SINGLE, &.{row}, &.{vec});
         }
         return outs;
@@ -706,6 +712,7 @@ pub const MpnetEmbedder = struct {
         var models: [BATCH_SHAPES.len]Object = undefined;
         for (BATCH_SHAPES, 0..) |shape, i| {
             models[i] = acquireModel(
+                self.io,
                 path,
                 model_url,
                 std.mem.endsWith(u8, path, ".mlmodelc"),
@@ -968,6 +975,7 @@ fn logModelNotFound(
 
 fn getModelPath(
     allocator: Allocator,
+    io: std.Io,
     exe_relative_path: []const u8,
     bundle_relative_path: []const u8,
 ) ![:0]const u8 {
@@ -988,15 +996,15 @@ fn getModelPath(
                 0,
             );
 
-            if (std.fs.accessAbsolute(bundle_path, .{})) |_| {
+            if (std.Io.Dir.accessAbsolute(io, bundle_path, .{})) |_| {
                 return bundle_path;
             } else |_| {
-                return try getExeRelativePath(allocator, exe_relative_path);
+                return try getExeRelativePath(allocator, io, exe_relative_path);
             }
         }
     }
 
-    return try getExeRelativePath(allocator, exe_relative_path);
+    return try getExeRelativePath(allocator, io, exe_relative_path);
 }
 
 /// Returns the `.mlmodelc` beside `path` when `path` is an `.mlpackage` and one is there,
@@ -1007,7 +1015,7 @@ fn getModelPath(
 /// it, because the OS caches its Neural Engine specialization by model path and a fresh
 /// path never hits. Measured: 2.8s to load from the package, 60ms from a compiled model
 /// that has been loaded from the same place before.
-fn preferPrecompiled(allocator: Allocator, path: [:0]const u8) ![:0]const u8 {
+fn preferPrecompiled(allocator: Allocator, io: std.Io, path: [:0]const u8) ![:0]const u8 {
     const package_ext = ".mlpackage";
     if (!std.mem.endsWith(u8, path, package_ext)) return path;
     const compiled = try std.fmt.allocPrintSentinel(
@@ -1016,16 +1024,17 @@ fn preferPrecompiled(allocator: Allocator, path: [:0]const u8) ![:0]const u8 {
         .{path[0 .. path.len - package_ext.len]},
         0,
     );
-    std.fs.accessAbsolute(compiled, .{}) catch return path;
+    std.Io.Dir.accessAbsolute(io, compiled, .{}) catch return path;
     return compiled;
 }
 
-fn getExeRelativePath(allocator: Allocator, relative_path: []const u8) ![:0]const u8 {
-    var exe_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const exe_path = std.fs.selfExeDirPath(&exe_path_buf) catch |err| {
+fn getExeRelativePath(allocator: Allocator, io: std.Io, relative_path: []const u8) ![:0]const u8 {
+    var exe_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const exe_path_len = std.process.executableDirPath(io, &exe_path_buf) catch |err| {
         std.log.err("Failed to get executable path: {}\n", .{err});
         return error.ExePathFailed;
     };
+    const exe_path = exe_path_buf[0..exe_path_len];
 
     // Try exe-relative path first
     const exe_relative = try std.fmt.allocPrintSentinel(
@@ -1034,10 +1043,10 @@ fn getExeRelativePath(allocator: Allocator, relative_path: []const u8) ![:0]cons
         .{ exe_path, relative_path },
         0,
     );
-    std.fs.accessAbsolute(exe_relative, .{}) catch {
+    std.Io.Dir.accessAbsolute(io, exe_relative, .{}) catch {
         // This is the case where we are testing, files are in a different place.
         allocator.free(exe_relative);
-        const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+        const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", allocator);
         defer allocator.free(cwd);
         return try std.fmt.allocPrintSentinel(
             allocator,
@@ -1052,6 +1061,7 @@ fn getExeRelativePath(allocator: Allocator, relative_path: []const u8) ![:0]cons
 pub const NLEmbedder = struct {
     embedder_obj: Object,
     mutex: Mutex,
+    io: std.Io,
 
     pub const VEC_SZ = 512;
     pub const VEC_TYPE = f32;
@@ -1063,7 +1073,7 @@ pub const NLEmbedder = struct {
     // build, so the two live side by side rather than one refusing the other's file.
     pub const PATH = @tagName(ID) ++ db_suffix ++ ".db";
 
-    pub fn init() !NLEmbedder {
+    pub fn init(io: std.Io) !NLEmbedder {
         const init_zone = tracy.beginZone(@src(), .{ .name = "embed.zig:init" });
         defer init_zone.end();
         const pool = objc.AutoreleasePool.init();
@@ -1086,14 +1096,16 @@ pub const NLEmbedder = struct {
 
         return .{
             .embedder_obj = embedder_obj.retain(),
-            .mutex = Mutex{},
+            .mutex = .init,
+            .io = io,
         };
     }
 
-    pub fn init_self(self: *NLEmbedder) !void {
-        const obj = try NLEmbedder.init();
+    pub fn init_self(self: *NLEmbedder, io: std.Io) !void {
+        const obj = try NLEmbedder.init(io);
         self.embedder_obj = obj.embedder_obj;
         self.mutex = obj.mutex;
+        self.io = obj.io;
     }
 
     pub fn embedder(self: *NLEmbedder) Embedder {
@@ -1158,8 +1170,8 @@ pub const NLEmbedder = struct {
             std.mem.Alignment.of(VecType),
             VEC_SZ,
         )).ptr);
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (!self.embedder_obj.msgSend(bool, getVectorForString, .{ vec_buf, objc_str })) {
             std.log.warn("Failed to embed '{s}'\n", .{str[0..@min(str.len, 10)]});
             return null;
@@ -1207,19 +1219,19 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
         model_path: ?[]const u8 = null,
     };
 
-    pub fn init(opts: InitOptions) !LlamaNomicEmbedTextV15F32 {
+    pub fn init(io: std.Io, opts: InitOptions) !LlamaNomicEmbedTextV15F32 {
         if (comptime !llama.enabled) return llama.Error.LlamaNotLinked;
 
         // Nothing here outlives init: the bridge keeps its own copy of the path.
-        var path_buf: [4 * std.fs.max_path_bytes]u8 = undefined;
+        var path_buf: [4 * std.Io.Dir.max_path_bytes]u8 = undefined;
         var path_alloc = std.heap.FixedBufferAllocator.init(&path_buf);
         const model_path_z: [:0]const u8 =
-            if (opts.model_path orelse std.posix.getenv("DVE_LLAMA_MODEL")) |p|
-                path_alloc.allocator().dupeZ(u8, p) catch return error.NameTooLong
+            if (opts.model_path orelse envVar("DVE_LLAMA_MODEL")) |p|
+                path_alloc.allocator().dupeSentinel(u8, p, 0) catch return error.NameTooLong
             else
-                getModelPath(path_alloc.allocator(), MODEL_PATH, BUNDLE_MODEL_PATH) catch
+                getModelPath(path_alloc.allocator(), io, MODEL_PATH, BUNDLE_MODEL_PATH) catch
                     return error.PathAllocFailed;
-        std.fs.cwd().access(model_path_z, .{}) catch {
+        std.Io.Dir.cwd().access(io, model_path_z, .{}) catch {
             logModelNotFound("llama model", model_path_z, DOWNLOAD_CMD, "model_path");
             return error.ModelNotFound;
         };
@@ -1231,8 +1243,8 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
         return .{};
     }
 
-    pub fn init_self(self: *LlamaNomicEmbedTextV15F32, opts: InitOptions) !void {
-        self.* = try LlamaNomicEmbedTextV15F32.init(opts);
+    pub fn init_self(self: *LlamaNomicEmbedTextV15F32, io: std.Io, opts: InitOptions) !void {
+        self.* = try LlamaNomicEmbedTextV15F32.init(io, opts);
     }
 
     pub fn deinit(self: *LlamaNomicEmbedTextV15F32) void {
@@ -1280,7 +1292,7 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
         }
 
         // The bridge takes a C string; anything past MAX_CTX is truncated there.
-        const c_str = try allocator.dupeZ(u8, str);
+        const c_str = try allocator.dupeSentinel(u8, str, 0);
         defer allocator.free(c_str);
 
         const VecType = @Vector(VEC_SZ, VEC_TYPE);
@@ -1343,7 +1355,7 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
                 std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'\n", .{str});
             }
             // The bridge takes a C string; anything past MAX_CTX is truncated there.
-            c_strs[n] = (try allocator.dupeZ(u8, str)).ptr;
+            c_strs[n] = (try allocator.dupeSentinel(u8, str, 0)).ptr;
             // Each vector is allocated on its own so it carries the alignment
             // @Vector(VEC_SZ, VEC_TYPE) needs. One slab with a VEC_SZ stride
             // would only be aligned at its start.
@@ -1499,7 +1511,7 @@ pub fn Spliterator(comptime delimiters: []const u8) type {
         }
 
         pub fn collectAll(self: *Self, allocator: Allocator) ![]Chunk {
-            var list: std.ArrayList(Chunk) = .{};
+            var list: std.ArrayList(Chunk) = .empty;
             errdefer list.deinit(allocator);
             while (self.next()) |chunk| {
                 try list.append(allocator, chunk);
@@ -1611,7 +1623,7 @@ test "embed - nlembed solo" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var nl = try NLEmbedder.init();
+    var nl = try NLEmbedder.init(std.testing.io);
     defer nl.deinit();
 
     var e = nl.embedder();
@@ -1635,7 +1647,7 @@ test "embed - mpnetembed init with autorelease pool (simulates Swift caller)" {
     // Swift has an autorelease pool on the calling thread. If init() over-releases
     // autoreleased objects, the pool drain will crash with EXC_BAD_ACCESS.
     const pool = objc.AutoreleasePool.init();
-    var mpnet = try MpnetEmbedder.init(.{});
+    var mpnet = try MpnetEmbedder.init(std.testing.io, .{});
     pool.deinit(); // drains the pool — crashes here if double-release
     defer mpnet.deinit();
 
@@ -1651,7 +1663,7 @@ test "embed - nlembedder init with autorelease pool (simulates Swift caller)" {
     // Swift has an autorelease pool on the calling thread. If init() over-releases
     // autoreleased objects, the pool drain will crash with EXC_BAD_ACCESS.
     const pool = objc.AutoreleasePool.init();
-    var nlembed = try NLEmbedder.init();
+    var nlembed = try NLEmbedder.init(std.testing.io);
     pool.deinit(); // drains the pool — crashes here if double-release
     defer nlembed.deinit();
 
@@ -1668,7 +1680,7 @@ test "embed - mpnetembed solo" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var mpnet = try MpnetEmbedder.init(.{});
+    var mpnet = try MpnetEmbedder.init(std.testing.io, .{});
     defer mpnet.deinit();
 
     var e = mpnet.embedder();
@@ -1710,7 +1722,7 @@ test "embed skip empty" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var nl = try NLEmbedder.init();
+    var nl = try NLEmbedder.init(std.testing.io);
     defer nl.deinit();
 
     var e = nl.embedder();
@@ -1723,7 +1735,7 @@ test "embed skip failures" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var nl = try NLEmbedder.init();
+    var nl = try NLEmbedder.init(std.testing.io);
     defer nl.deinit();
 
     var e = nl.embedder();
@@ -1732,14 +1744,14 @@ test "embed skip failures" {
 }
 
 test "embed - nlembed thread safety" {
-    var nl = try NLEmbedder.init();
+    var nl = try NLEmbedder.init(std.testing.io);
     defer nl.deinit();
     var e = nl.embedder();
     try threadSafetyTest(&e);
 }
 
 test "embed - mpnetembed thread safety" {
-    var mpnet = try MpnetEmbedder.init(.{});
+    var mpnet = try MpnetEmbedder.init(std.testing.io, .{});
     defer mpnet.deinit();
     var e = mpnet.embedder();
     try threadSafetyTest(&e);
@@ -1767,11 +1779,11 @@ test "embedding reference implementation" {
         var nlembed: NLEmbedder = undefined;
         var e: Embedder = switch (model) {
             .mpnet_embedding => blk: {
-                mpnet = try MpnetEmbedder.init(.{});
+                mpnet = try MpnetEmbedder.init(std.testing.io, .{});
                 break :blk mpnet.embedder();
             },
             .apple_nlembedding => blk: {
-                nlembed = try NLEmbedder.init();
+                nlembed = try NLEmbedder.init(std.testing.io);
                 break :blk nlembed.embedder();
             },
         };
@@ -1779,15 +1791,14 @@ test "embedding reference implementation" {
 
         for (phrases) |phrase| {
             // Get reference embedding from Python
-            const exec = try std.process.Child.run(.{
-                .allocator = std.testing.allocator,
+            const exec = try std.process.run(std.testing.allocator, std.testing.io, .{
                 .argv = &.{ python_path, script_path, model.referenceImplementationName(), phrase },
             });
             defer std.testing.allocator.free(exec.stdout);
             defer std.testing.allocator.free(exec.stderr);
 
-            if (exec.term.Exited != 0) {
-                std.debug.print("Python script failed (exit {d}):\n{s}\n", .{ exec.term.Exited, exec.stderr });
+            if (!exec.term.success()) {
+                std.debug.print("Python script failed ({any}):\n{s}\n", .{ exec.term, exec.stderr });
                 return error.PythonScriptFailed;
             }
 
@@ -1839,12 +1850,12 @@ fn threadSafetyTest(e: *Embedder) !void {
         "Zig is a systems programming language",
     };
 
-    var barrier = std.Thread.ResetEvent{};
+    var barrier: std.Io.Event = .unset;
     var threads: [n_threads]std.Thread = undefined;
     for (&threads, 0..) |*t, i| {
         t.* = try std.Thread.spawn(.{}, struct {
-            fn run(embedder: *Embedder, input: []const u8, b: *std.Thread.ResetEvent) void {
-                b.wait();
+            fn run(embedder: *Embedder, input: []const u8, b: *std.Io.Event) void {
+                b.waitUncancelable(std.testing.io);
                 for (0..n_iters) |_| {
                     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                     defer arena.deinit();
@@ -1856,7 +1867,7 @@ fn threadSafetyTest(e: *Embedder) !void {
             }
         }.run, .{ e, inputs[i], &barrier });
     }
-    barrier.set();
+    barrier.set(std.testing.io);
     for (&threads) |*t| t.join();
 }
 
@@ -1875,7 +1886,7 @@ fn threadSafetyTest(e: *Embedder) !void {
 // as an abort rather than a failure, so a flake here means that, not a bad assertion.
 test "embed - mpnetembed survives repeated reload" {
     for (0..40) |_| {
-        var mpnet = try MpnetEmbedder.init(.{});
+        var mpnet = try MpnetEmbedder.init(std.testing.io, .{});
         defer mpnet.deinit();
         var e = mpnet.embedder();
 
@@ -1890,7 +1901,7 @@ test "embed - output is L2-normalized (mpnet)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var mpnet = try MpnetEmbedder.init(.{});
+    var mpnet = try MpnetEmbedder.init(std.testing.io, .{});
     defer mpnet.deinit();
     var e = mpnet.embedder();
 
@@ -1911,7 +1922,7 @@ test "embed - output is L2-normalized (nlembed)" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
 
-    var nl = try NLEmbedder.init();
+    var nl = try NLEmbedder.init(std.testing.io);
     defer nl.deinit();
     var e = nl.embedder();
 
@@ -1934,9 +1945,9 @@ test "embed with punctuation" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var nl = try NLEmbedder.init();
+    var nl = try NLEmbedder.init(std.testing.io);
     defer nl.deinit();
-    var mpnet = try MpnetEmbedder.init(.{});
+    var mpnet = try MpnetEmbedder.init(std.testing.io, .{});
     defer mpnet.deinit();
     var e1 = nl.embedder();
     var e2 = nl.embedder();
@@ -1953,7 +1964,7 @@ test "embed - LlamaNomicEmbedTextV15F32 solo" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var nl = try LlamaNomicEmbedTextV15F32.init(.{});
+    var nl = try LlamaNomicEmbedTextV15F32.init(std.testing.io, .{});
     defer nl.deinit();
 
     var e = nl.embedder();
@@ -2024,7 +2035,7 @@ const batch_phrases = [_][]const u8{
 };
 
 test "embedBatch - nlembed matches embed" {
-    var nl = try NLEmbedder.init();
+    var nl = try NLEmbedder.init(std.testing.io);
     defer nl.deinit();
     var e = nl.embedder();
     try expectBatchMatchesSingles(&e, &batch_phrases, 0);
@@ -2035,7 +2046,7 @@ test "embedBatch - nlembed matches embed" {
 const mpnet_batch_tolerance = 2e-3;
 
 test "embedBatch - mpnetembed matches embed" {
-    var mpnet = try MpnetEmbedder.init(.{});
+    var mpnet = try MpnetEmbedder.init(std.testing.io, .{});
     defer mpnet.deinit();
     var e = mpnet.embedder();
     try expectBatchMatchesSingles(&e, &batch_phrases, mpnet_batch_tolerance);
@@ -2045,7 +2056,7 @@ test "embedBatch - mpnetembed matches embed" {
 // predictions of both batch shapes, a tail too short to be worth one, and a string too long
 // for either. A vector filed under the wrong string shows up as a cosine far below 1.
 test "embedBatch - mpnetembed spans every shape" {
-    var mpnet = try MpnetEmbedder.init(.{});
+    var mpnet = try MpnetEmbedder.init(std.testing.io, .{});
     defer mpnet.deinit();
     var e = mpnet.embedder();
 
@@ -2054,7 +2065,7 @@ test "embedBatch - mpnetembed spans every shape" {
     const allocator = arena.allocator();
 
     const subjects = [_][]const u8{ "river", "engine", "violin", "glacier", "market", "falcon", "harbor" };
-    var strs: std.ArrayList([]const u8) = .{};
+    var strs: std.ArrayList([]const u8) = .empty;
     // 70 short: two full predictions of the 16-token shape and a partial one.
     for (0..70) |i| {
         try strs.append(allocator, try std.fmt.allocPrint(
@@ -2080,7 +2091,7 @@ test "embedBatch - mpnetembed spans every shape" {
 }
 
 test "embedBatch - empty batch" {
-    var nl = try NLEmbedder.init();
+    var nl = try NLEmbedder.init(std.testing.io);
     defer nl.deinit();
     var e = nl.embedder();
     const out = try e.embedBatch(std.testing.allocator, &.{});
@@ -2088,7 +2099,7 @@ test "embedBatch - empty batch" {
     try expectEqual(0, out.len);
 
     if (!llama.enabled) return;
-    var ll = try LlamaNomicEmbedTextV15F32.init(.{});
+    var ll = try LlamaNomicEmbedTextV15F32.init(std.testing.io, .{});
     defer ll.deinit();
     var le = ll.embedder();
     const llama_out = try le.embedBatch(std.testing.allocator, &.{});
@@ -2104,7 +2115,7 @@ const LLAMA_BATCH_TOLERANCE: f32 = 2e-3;
 test "embedBatch - LlamaNomicEmbedTextV15F32 matches embed" {
     if (!llama.enabled) return error.SkipZigTest;
 
-    var ll = try LlamaNomicEmbedTextV15F32.init(.{});
+    var ll = try LlamaNomicEmbedTextV15F32.init(std.testing.io, .{});
     defer ll.deinit();
     var e = ll.embedder();
     try expectBatchMatchesSingles(&e, &batch_phrases, LLAMA_BATCH_TOLERANCE);
@@ -2113,7 +2124,7 @@ test "embedBatch - LlamaNomicEmbedTextV15F32 matches embed" {
 test "embedBatch - LlamaNomicEmbedTextV15F32 all empty" {
     if (!llama.enabled) return error.SkipZigTest;
 
-    var ll = try LlamaNomicEmbedTextV15F32.init(.{});
+    var ll = try LlamaNomicEmbedTextV15F32.init(std.testing.io, .{});
     defer ll.deinit();
     var e = ll.embedder();
     try expectBatchMatchesSingles(&e, &.{ "", "" }, LLAMA_BATCH_TOLERANCE);
@@ -2136,7 +2147,7 @@ test "embedBatch - LlamaNomicEmbedTextV15F32 spans several decodes" {
         str.* = try std.fmt.allocPrint(arena.allocator(), "sentence number {d} about badgers", .{i});
     }
 
-    var ll = try LlamaNomicEmbedTextV15F32.init(.{});
+    var ll = try LlamaNomicEmbedTextV15F32.init(std.testing.io, .{});
     defer ll.deinit();
     var e = ll.embedder();
     try expectBatchMatchesSingles(&e, strs, LLAMA_BATCH_TOLERANCE);
@@ -2152,7 +2163,9 @@ test "embedBatch - LlamaNomicEmbedTextV15F32 splits on the token budget" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    const long = "the quick brown fox jumps over the lazy dog " ** 40;
+    const phrase = "the quick brown fox jumps over the lazy dog ";
+    const repeated: [40][phrase.len]u8 = @splat(phrase.*);
+    const long: []const u8 = @ptrCast(&repeated);
     const strs = try allocator.alloc([]const u8, 40);
     for (strs, 0..) |*str, i| {
         // Trailing space trimmed: embed warns on non-alphanumeric ends, and 40
@@ -2160,7 +2173,7 @@ test "embedBatch - LlamaNomicEmbedTextV15F32 splits on the token budget" {
         str.* = try std.fmt.allocPrint(allocator, "{d} {s}", .{ i, long[0 .. long.len - 1] });
     }
 
-    var ll = try LlamaNomicEmbedTextV15F32.init(.{});
+    var ll = try LlamaNomicEmbedTextV15F32.init(std.testing.io, .{});
     defer ll.deinit();
     var e = ll.embedder();
     try expectBatchMatchesSingles(&e, strs, LLAMA_BATCH_TOLERANCE);
@@ -2179,7 +2192,14 @@ const tokenizer_mod = @import("tokenizer.zig");
 const db_suffix = @import("vec_util.zig").db_suffix;
 const validateL2 = @import("vec_util.zig").validateL2;
 const WordPieceTokenizer = tokenizer_mod.WordPieceTokenizer;
-const Mutex = std.Thread.Mutex;
+const Mutex = std.Io.Mutex;
+
+/// An environment variable of this process, or null. Read through libc, which is always
+/// linked here: std hands the environment to `main` now rather than keeping it global, and a
+/// library has no `main` to receive it.
+fn envVar(name: [*:0]const u8) ?[]const u8 {
+    return std.mem.span(std.c.getenv(name) orelse return null);
+}
 
 const llama = @import("llama.zig");
 

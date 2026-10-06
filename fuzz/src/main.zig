@@ -7,18 +7,17 @@ const DEFAULT_OPS_PER_WORKER: u32 = 1;
 const MAX_KEY_LEN: usize = 256;
 const MAX_CONTENT_LEN: usize = 8192;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     var is_worker = false;
     var stop_on_fail = false;
     var path_constraints = false;
-    var seed: u64 = std.crypto.random.int(u64);
+    var seed: u64 = undefined;
+    io.random(std.mem.asBytes(&seed));
     var max_iterations: ?u64 = null;
     var ops_per_worker: u32 = DEFAULT_OPS_PER_WORKER;
 
@@ -55,9 +54,9 @@ pub fn main() !void {
     }
 
     if (is_worker) {
-        try runWorker(allocator, seed, ops_per_worker, path_constraints);
+        try runWorker(allocator, io, seed, ops_per_worker, path_constraints);
     } else {
-        try runCoordinator(allocator, seed, max_iterations, stop_on_fail, ops_per_worker, path_constraints);
+        try runCoordinator(allocator, io, seed, max_iterations, stop_on_fail, ops_per_worker, path_constraints);
     }
 }
 
@@ -65,14 +64,15 @@ fn help() void {
     std.debug.print("usage: dve-fuzz [--worker] [--seed N] [--stop-on-fail] [--max-iterations N] [--ops-per-worker N] [--path-constraints]\n", .{});
 }
 
-fn writeOut(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+fn writeOut(allocator: std.mem.Allocator, io: std.Io, comptime fmt: []const u8, args: anytype) !void {
     const s = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(s);
-    try std.fs.File.stdout().writeAll(s);
+    try std.Io.File.stdout().writeStreamingAll(io, s);
 }
 
 fn runCoordinator(
     allocator: std.mem.Allocator,
+    io: std.Io,
     initial_seed: u64,
     max_iterations: ?u64,
     stop_on_fail: bool,
@@ -82,7 +82,7 @@ fn runCoordinator(
     var prng = std.Random.DefaultPrng.init(initial_seed);
     const rand = prng.random();
 
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    const exe_path = try std.process.executablePathAlloc(io, allocator);
     defer allocator.free(exe_path);
 
     var i: u64 = 0;
@@ -98,26 +98,29 @@ fn runCoordinator(
         try worker_args.appendSlice(allocator, &.{ exe_path, "--worker", "--seed", seed_str, "--ops-per-worker", ops_str });
         if (path_constraints) try worker_args.append(allocator, "--path-constraints");
 
-        var child = std.process.Child.init(worker_args.items, allocator);
-        child.stdout_behavior = .Pipe;
-        child.stderr_behavior = .Inherit;
-        try child.spawn();
+        var child = try std.process.spawn(io, .{
+            .argv = worker_args.items,
+            .stdout = .pipe,
+            .stderr = .inherit,
+        });
 
         var buf: [4096]u8 = undefined;
         while (true) {
-            const n = try child.stdout.?.read(&buf);
-            if (n == 0) break;
-            try std.fs.File.stdout().writeAll(buf[0..n]);
+            const n = child.stdout.?.readStreaming(io, &.{&buf}) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return err,
+            };
+            try std.Io.File.stdout().writeStreamingAll(io, buf[0..n]);
         }
 
-        const term = try child.wait();
+        const term = try child.wait(io);
         const crashed = switch (term) {
-            .Exited => |code| code != 0,
-            .Signal, .Stopped, .Unknown => true,
+            .exited => |code| code != 0,
+            .signal, .stopped, .unknown => true,
         };
 
         if (crashed) {
-            try writeOut(allocator, "{{\"event\":\"crash\",\"seed\":{d}}}\n", .{worker_seed});
+            try writeOut(allocator, io, "{{\"event\":\"crash\",\"seed\":{d}}}\n", .{worker_seed});
             if (stop_on_fail) break;
         }
         if (max_iterations != null and i >= max_iterations.?) break;
@@ -127,29 +130,30 @@ fn runCoordinator(
 
 const Op = enum { embed, embedAsync, search, uniqueSearch, populateHighlights, remove, rename };
 
-fn validate(allocator: std.mem.Allocator, engine: *VectorEngine) !void {
+fn validate(allocator: std.mem.Allocator, io: std.Io, engine: *VectorEngine) !void {
     engine.validate() catch |err| {
-        try writeOut(allocator, "{{\"event\":\"validate_fail\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+        try writeOut(allocator, io, "{{\"event\":\"validate_fail\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
         return err;
     };
 }
 
-fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_constraints: bool) !void {
+fn runWorker(allocator: std.mem.Allocator, io: std.Io, seed: u64, ops_per_worker: u32, path_constraints: bool) !void {
     var prng = std.Random.DefaultPrng.init(seed);
     const rand = prng.random();
 
     const tmp_path = try std.fmt.allocPrint(allocator, "/tmp/dve-fuzz-{d}", .{seed});
     defer allocator.free(tmp_path);
-    std.fs.deleteTreeAbsolute(tmp_path) catch {};
-    try std.fs.makeDirAbsolute(tmp_path);
-    defer std.fs.deleteTreeAbsolute(tmp_path) catch {};
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, tmp_path) catch {};
+    try std.Io.Dir.createDirAbsolute(io, tmp_path, .default_dir);
+    defer cwd.deleteTree(io, tmp_path) catch {};
 
-    var tmp_dir = try std.fs.openDirAbsolute(tmp_path, .{});
-    defer tmp_dir.close();
+    var tmp_dir = try std.Io.Dir.openDirAbsolute(io, tmp_path, .{});
+    defer tmp_dir.close(io);
 
-    try writeOut(allocator, "{{\"event\":\"start\",\"seed\":{d}}}\n", .{seed});
+    try writeOut(allocator, io, "{{\"event\":\"start\",\"seed\":{d}}}\n", .{seed});
 
-    const engine = try VectorEngine.init(allocator, tmp_dir, .{});
+    const engine = try VectorEngine.init(allocator, io, tmp_dir, .{});
     defer engine.deinit();
 
     // When path_constraints is enabled, tracks successfully embedded keys so
@@ -169,7 +173,7 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_
 
     var op_i: u32 = 0;
     while (op_i < ops_per_worker) : (op_i += 1) {
-        const op = @as(Op, @enumFromInt(rand.uintLessThan(u8, std.meta.fields(Op).len)));
+        const op = @as(Op, @fromBackingInt(@intCast(rand.uintLessThan(u8, @typeInfo(Op).@"enum".field_names.len))));
 
         switch (op) {
             .embed => {
@@ -181,16 +185,17 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_
                 defer allocator.free(content_json);
                 try writeOut(
                     allocator,
+                    io,
                     "{{\"event\":\"attempt\",\"op\":\"embed\",\"key\":\"{s}\",\"content\":\"{s}\"}}\n",
                     .{ key_json, content_json },
                 );
                 engine.embedText(key, content) catch |err| {
-                    try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"embed\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+                    try writeOut(allocator, io, "{{\"event\":\"error\",\"op\":\"embed\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
                     continue;
                 };
                 if (path_constraints) try known_keys.append(allocator, try allocator.dupe(u8, key));
-                try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"embed\"}}\n", .{});
-                try validate(allocator, engine);
+                try writeOut(allocator, io, "{{\"event\":\"ok\",\"op\":\"embed\"}}\n", .{});
+                try validate(allocator, io, engine);
             },
             .embedAsync => {
                 const key = randString(rand, &key_buf);
@@ -201,16 +206,17 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_
                 defer allocator.free(content_json);
                 try writeOut(
                     allocator,
+                    io,
                     "{{\"event\":\"attempt\",\"op\":\"embedAsync\",\"key\":\"{s}\",\"content\":\"{s}\"}}\n",
                     .{ key_json, content_json },
                 );
                 engine.embedTextAsync(key, content) catch |err| {
-                    try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"embedAsync\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+                    try writeOut(allocator, io, "{{\"event\":\"error\",\"op\":\"embedAsync\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
                     continue;
                 };
                 if (path_constraints) try known_keys.append(allocator, try allocator.dupe(u8, key));
-                try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"embedAsync\"}}\n", .{});
-                try validate(allocator, engine);
+                try writeOut(allocator, io, "{{\"event\":\"ok\",\"op\":\"embedAsync\"}}\n", .{});
+                try validate(allocator, io, engine);
             },
             .search => {
                 const query = randString(rand, &key_buf);
@@ -218,14 +224,15 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_
                 defer allocator.free(query_json);
                 try writeOut(
                     allocator,
+                    io,
                     "{{\"event\":\"attempt\",\"op\":\"search\",\"query\":\"{s}\"}}\n",
                     .{query_json},
                 );
                 const n = engine.search(query, &search_results) catch |err| {
-                    try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"search\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+                    try writeOut(allocator, io, "{{\"event\":\"error\",\"op\":\"search\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
                     continue;
                 };
-                try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"search\",\"n\":{d}}}\n", .{n});
+                try writeOut(allocator, io, "{{\"event\":\"ok\",\"op\":\"search\",\"n\":{d}}}\n", .{n});
             },
             .uniqueSearch => {
                 const query = randString(rand, &key_buf);
@@ -233,14 +240,15 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_
                 defer allocator.free(query_json);
                 try writeOut(
                     allocator,
+                    io,
                     "{{\"event\":\"attempt\",\"op\":\"uniqueSearch\",\"query\":\"{s}\"}}\n",
                     .{query_json},
                 );
                 const n = engine.uniqueSearch(query, &search_results) catch |err| {
-                    try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"uniqueSearch\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+                    try writeOut(allocator, io, "{{\"event\":\"error\",\"op\":\"uniqueSearch\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
                     continue;
                 };
-                try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"uniqueSearch\",\"n\":{d}}}\n", .{n});
+                try writeOut(allocator, io, "{{\"event\":\"ok\",\"op\":\"uniqueSearch\",\"n\":{d}}}\n", .{n});
             },
             .populateHighlights => {
                 const query = randString(rand, &key_buf);
@@ -251,14 +259,15 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_
                 defer allocator.free(content_json);
                 try writeOut(
                     allocator,
+                    io,
                     "{{\"event\":\"attempt\",\"op\":\"populateHighlights\",\"query\":\"{s}\",\"content\":\"{s}\"}}\n",
                     .{ query_json, content_json },
                 );
                 engine.populateHighlights(query, content, &highlights_buf) catch |err| {
-                    try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"populateHighlights\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+                    try writeOut(allocator, io, "{{\"event\":\"error\",\"op\":\"populateHighlights\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
                     continue;
                 };
-                try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"populateHighlights\"}}\n", .{});
+                try writeOut(allocator, io, "{{\"event\":\"ok\",\"op\":\"populateHighlights\"}}\n", .{});
             },
             .remove => {
                 if (path_constraints and known_keys.items.len == 0) continue;
@@ -268,16 +277,17 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_
                 defer allocator.free(key_json);
                 try writeOut(
                     allocator,
+                    io,
                     "{{\"event\":\"attempt\",\"op\":\"remove\",\"key\":\"{s}\"}}\n",
                     .{key_json},
                 );
                 engine.removePath(key) catch |err| {
-                    try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"remove\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+                    try writeOut(allocator, io, "{{\"event\":\"error\",\"op\":\"remove\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
                     continue;
                 };
                 if (key_idx) |idx| allocator.free(known_keys.swapRemove(idx));
-                try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"remove\"}}\n", .{});
-                try validate(allocator, engine);
+                try writeOut(allocator, io, "{{\"event\":\"ok\",\"op\":\"remove\"}}\n", .{});
+                try validate(allocator, io, engine);
             },
             .rename => {
                 if (path_constraints and known_keys.items.len == 0) continue;
@@ -290,24 +300,25 @@ fn runWorker(allocator: std.mem.Allocator, seed: u64, ops_per_worker: u32, path_
                 defer allocator.free(new_json);
                 try writeOut(
                     allocator,
+                    io,
                     "{{\"event\":\"attempt\",\"op\":\"rename\",\"old_key\":\"{s}\",\"new_key\":\"{s}\"}}\n",
                     .{ old_json, new_json },
                 );
                 engine.renamePath(old_key, new_key) catch |err| {
-                    try writeOut(allocator, "{{\"event\":\"error\",\"op\":\"rename\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
+                    try writeOut(allocator, io, "{{\"event\":\"error\",\"op\":\"rename\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
                     continue;
                 };
                 if (old_key_idx) |idx| {
                     allocator.free(known_keys.swapRemove(idx));
                     try known_keys.append(allocator, try allocator.dupe(u8, new_key));
                 }
-                try writeOut(allocator, "{{\"event\":\"ok\",\"op\":\"rename\"}}\n", .{});
-                try validate(allocator, engine);
+                try writeOut(allocator, io, "{{\"event\":\"ok\",\"op\":\"rename\"}}\n", .{});
+                try validate(allocator, io, engine);
             },
         }
     }
 
-    try writeOut(allocator, "{{\"event\":\"done\",\"ops\":{d}}}\n", .{op_i});
+    try writeOut(allocator, io, "{{\"event\":\"done\",\"ops\":{d}}}\n", .{op_i});
 }
 
 fn randString(rand: std.Random, buf: []u8) []u8 {

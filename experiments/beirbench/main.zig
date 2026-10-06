@@ -22,6 +22,8 @@
 
 const std = @import("std");
 const dve = @import("dve");
+const Timer = dve.util.Timer;
+const nanos = dve.util.nanos;
 
 pub const std_options: std.Options = .{ .log_level = .warn };
 
@@ -73,22 +75,20 @@ const Options = struct {
 const Doc = struct { id: []const u8, title: []const u8, text: []const u8 };
 const Query = struct { id: []const u8, text: []const u8 };
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const allocator = init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     const opts = try parseArgs(args);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
 
-    const corpus = try loadCorpus(a, opts.dataset);
-    const queries = try loadQueries(a, opts.dataset);
-    var qrels = try loadQrels(a, opts.dataset, opts.split);
+    const corpus = try loadCorpus(a, io, opts.dataset);
+    const queries = try loadQueries(a, io, opts.dataset);
+    var qrels = try loadQrels(a, io, opts.dataset, opts.split);
 
     std.debug.print(
         \\dataset    {s}
@@ -112,13 +112,14 @@ pub fn main() !void {
     });
 
     switch (opts.model) {
-        inline else => |m| try run(m.id(), allocator, opts, corpus, queries, &qrels),
+        inline else => |m| try run(m.id(), allocator, io, opts, corpus, queries, &qrels),
     }
 }
 
 fn run(
     comptime model: dve.embed.EmbeddingModel,
     allocator: std.mem.Allocator,
+    io: std.Io,
     opts: Options,
     corpus: []const Doc,
     queries: std.StringHashMap([]const u8),
@@ -126,13 +127,13 @@ fn run(
 ) !void {
     const Engine = dve.VectorEngine(model);
 
-    var db_dir = try std.fs.cwd().makeOpenPath(opts.db, .{ .iterate = true });
-    defer db_dir.close();
+    var db_dir = try std.Io.Dir.cwd().createDirPathOpen(io, opts.db, .{ .open_options = .{ .iterate = true } });
+    defer db_dir.close(io);
 
-    var load_timer = try std.time.Timer.start();
-    const db = try Engine.init(allocator, db_dir, .{ .candidates = opts.candidates });
+    var load_timer = Timer.start(io);
+    const db = try Engine.init(allocator, io, db_dir, .{ .candidates = opts.candidates });
     defer db.deinit();
-    std.debug.print("opened database in {D}\n", .{load_timer.read()});
+    std.debug.print("opened database in {f}\n", .{nanos(load_timer.read())});
     db.embedder.threshold = opts.threshold;
 
     if (db.vec_storage.vec_n != 0 and opts.reuse) {
@@ -142,7 +143,7 @@ fn run(
             "note: database holds {d} vectors; appending (pass --reuse to skip ingest)\n",
             .{db.vec_storage.vec_n},
         );
-        try ingest(Engine, db, allocator, opts, corpus);
+        try ingest(Engine, db, allocator, io, opts, corpus);
     }
 
     // *** score ***
@@ -155,11 +156,11 @@ fn run(
     defer allocator.free(buf);
 
     const Failure = struct { id: []const u8, ndcg: f64, rank: ?usize, top: []const u8 };
-    var failures: std.ArrayList(Failure) = .{};
+    var failures: std.ArrayList(Failure) = .empty;
     defer failures.deinit(allocator);
 
     var search_ns: u64 = 0;
-    var timer = try std.time.Timer.start();
+    var timer = Timer.start(io);
 
     var it = qrels.iterator();
     while (it.next()) |entry| {
@@ -241,11 +242,12 @@ fn ingest(
     comptime Engine: type,
     db: *Engine,
     allocator: std.mem.Allocator,
+    io: std.Io,
     opts: Options,
     corpus: []const Doc,
 ) !void {
     std.debug.print("\ningesting {d} documents...\n", .{corpus.len});
-    var timer = try std.time.Timer.start();
+    var timer = Timer.start(io);
 
     for (corpus, 1..) |doc, i| {
         // Title on its own line, which is how a note is actually shaped and which makes the
@@ -261,7 +263,7 @@ fn ingest(
         while (true) {
             db.embedTextAsync(doc.id, body) catch |err| switch (err) {
                 error.Full => {
-                    std.Thread.sleep(250 * std.time.ns_per_us);
+                    io.sleep(.fromNanoseconds(250 * std.time.ns_per_us), .awake) catch {};
                     continue;
                 },
                 else => {
@@ -273,15 +275,15 @@ fn ingest(
         }
 
         if (i % opts.progress == 0) std.debug.print(
-            "  {d}/{d} submitted, {d} vectors, {D}\n",
-            .{ i, corpus.len, db.vec_storage.vec_n, timer.read() },
+            "  {d}/{d} submitted, {d} vectors, {f}\n",
+            .{ i, corpus.len, db.vec_storage.vec_n, nanos(timer.read()) },
         );
     }
 
     db.shutdown();
     std.debug.print(
-        "ingested {d} documents -> {d} vectors in {D}\n",
-        .{ corpus.len, db.vec_storage.vec_n, timer.read() },
+        "ingested {d} documents -> {d} vectors in {f}\n",
+        .{ corpus.len, db.vec_storage.vec_n, nanos(timer.read()) },
     );
 }
 
@@ -340,14 +342,14 @@ fn contains(haystack: []const []const u8, needle: []const u8) bool {
 
 // ****************************************************************************************** Corpus
 
-fn loadCorpus(arena: std.mem.Allocator, dataset: []const u8) ![]Doc {
-    const path = try std.fs.path.join(arena, &.{ dataset, "corpus.jsonl" });
-    const bytes = std.fs.cwd().readFileAlloc(arena, path, MAX_JSONL_BYTES) catch |e| {
+fn loadCorpus(arena: std.mem.Allocator, io: std.Io, dataset: []const u8) ![]Doc {
+    const path = try std.Io.Dir.path.join(arena, &.{ dataset, "corpus.jsonl" });
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(MAX_JSONL_BYTES)) catch |e| {
         fatal("cannot read '{s}': {t}\n(run experiments/beirbench/download.sh first)", .{ path, e });
     };
 
     const Row = struct { _id: []const u8, title: []const u8 = "", text: []const u8 = "" };
-    var out: std.ArrayList(Doc) = .{};
+    var out: std.ArrayList(Doc) = .empty;
     var lines = std.mem.tokenizeScalar(u8, bytes, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
@@ -363,9 +365,9 @@ fn loadCorpus(arena: std.mem.Allocator, dataset: []const u8) ![]Doc {
     return out.items;
 }
 
-fn loadQueries(arena: std.mem.Allocator, dataset: []const u8) !std.StringHashMap([]const u8) {
-    const path = try std.fs.path.join(arena, &.{ dataset, "queries.jsonl" });
-    const bytes = try std.fs.cwd().readFileAlloc(arena, path, MAX_JSONL_BYTES);
+fn loadQueries(arena: std.mem.Allocator, io: std.Io, dataset: []const u8) !std.StringHashMap([]const u8) {
+    const path = try std.Io.Dir.path.join(arena, &.{ dataset, "queries.jsonl" });
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(MAX_JSONL_BYTES));
 
     const Row = struct { _id: []const u8, text: []const u8 = "" };
     var out = std.StringHashMap([]const u8).init(arena);
@@ -385,12 +387,13 @@ fn loadQueries(arena: std.mem.Allocator, dataset: []const u8) !std.StringHashMap
 /// but counts the same way here.
 fn loadQrels(
     arena: std.mem.Allocator,
+    io: std.Io,
     dataset: []const u8,
     split: []const u8,
 ) !std.StringHashMap(std.ArrayList([]const u8)) {
     const name = try std.fmt.allocPrint(arena, "{s}.tsv", .{split});
-    const path = try std.fs.path.join(arena, &.{ dataset, "qrels", name });
-    const bytes = std.fs.cwd().readFileAlloc(arena, path, MAX_JSONL_BYTES) catch |e| {
+    const path = try std.Io.Dir.path.join(arena, &.{ dataset, "qrels", name });
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(MAX_JSONL_BYTES)) catch |e| {
         fatal("cannot read '{s}': {t}", .{ path, e });
     };
 
@@ -405,7 +408,7 @@ fn loadQrels(
         if (rel <= 0) continue;
 
         const gop = try out.getOrPut(qid);
-        if (!gop.found_existing) gop.value_ptr.* = .{};
+        if (!gop.found_existing) gop.value_ptr.* = .empty;
         try gop.value_ptr.append(arena, did);
     }
     return out;

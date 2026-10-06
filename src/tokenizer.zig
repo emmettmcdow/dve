@@ -70,7 +70,7 @@ pub const WordPieceTokenizer = struct {
     }
 
     pub fn tokenize(self: *WordPieceTokenizer, allocator: Allocator, text: []const u8) ![]u32 {
-        var token_ids: std.ArrayList(u32) = .{};
+        var token_ids: std.ArrayList(u32) = .empty;
         errdefer token_ids.deinit(allocator);
 
         try token_ids.append(allocator, self.cls_token_id);
@@ -100,13 +100,13 @@ pub const WordPieceTokenizer = struct {
 
     fn basicTokenize(self: *WordPieceTokenizer, allocator: Allocator, text: []const u8) ![][]const u8 {
         _ = self;
-        var tokens: std.ArrayList([]const u8) = .{};
+        var tokens: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (tokens.items) |t| allocator.free(t);
             tokens.deinit(allocator);
         }
 
-        var current_token: std.ArrayList(u8) = .{};
+        var current_token: std.ArrayList(u8) = .empty;
         defer current_token.deinit(allocator);
 
         for (text) |c| {
@@ -143,7 +143,7 @@ pub const WordPieceTokenizer = struct {
             return result;
         }
 
-        var sub_tokens: std.ArrayList([]const u8) = .{};
+        var sub_tokens: std.ArrayList([]const u8) = .empty;
         errdefer {
             for (sub_tokens.items) |t| allocator.free(t);
             sub_tokens.deinit(allocator);
@@ -155,7 +155,7 @@ pub const WordPieceTokenizer = struct {
             var cur_substr: ?[]const u8 = null;
 
             while (start < end) {
-                var substr_buf: std.ArrayList(u8) = .{};
+                var substr_buf: std.ArrayList(u8) = .empty;
                 defer substr_buf.deinit(allocator);
 
                 if (start > 0) {

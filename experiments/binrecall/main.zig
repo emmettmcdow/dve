@@ -62,21 +62,19 @@ const TOP = 10;
 const DUP_COS: f32 = 0.99;
 const KS = [_]usize{ 10, 25, 50, 100, 200, 500, 1000, 2000 };
 
-pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
 
-    const args = try std.process.argsAlloc(gpa);
-    defer std.process.argsFree(gpa, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     const opts = parseArgs(args);
 
     // ------------------------------------------------------------------- load the corpus
-    var dir = std.fs.cwd().openDir(opts.dir, .{}) catch
+    var dir = std.Io.Dir.cwd().openDir(io, opts.dir, .{}) catch
         fatal("cannot open '{s}' (run from the repo root)", .{opts.dir});
-    defer dir.close();
+    defer dir.close(io);
 
-    var store = try Store.init(gpa, dir, .{});
+    var store = try Store.init(gpa, io, dir, .{});
     defer store.deinit();
     store.load(opts.file) catch |e|
         fatal("cannot load '{s}/{s}': {t}", .{ opts.dir, opts.file, e });
@@ -158,14 +156,14 @@ pub fn main() !void {
     const dup = try gpa.alloc(bool, opts.queries);
     defer gpa.free(dup);
     var dup_n: usize = 0;
-    var truth_timer = try std.time.Timer.start();
+    var truth_timer = Timer.start(io);
     for (queries, truth, dup) |q, *t, *d| {
         d.* = exactTop(vecs, n, q, t) > DUP_COS;
         if (d.*) dup_n += 1;
     }
     const truth_ns = truth_timer.read();
-    std.debug.print("exact top-{d}: {D} for {d} queries ({D} each)\n", .{
-        TOP, truth_ns, opts.queries, truth_ns / opts.queries,
+    std.debug.print("exact top-{d}: {f} for {d} queries ({f} each)\n", .{
+        TOP, nanos(truth_ns), opts.queries, nanos(truth_ns / opts.queries),
     });
     std.debug.print(
         "{d} of {d} queries have a near-duplicate (cosine > {d:.2}) in the corpus; " ++
@@ -179,7 +177,7 @@ pub fn main() !void {
         const codes = try gpa.alignedAlloc(u64, .@"8", n * words);
         defer gpa.free(codes);
         try encode(gpa, variant, vecs, n, opts.bits, mean, rot, codes);
-        const stats = try recallOf(gpa, codes, n, words, queries, truth, dup);
+        const stats = try recallOf(gpa, io, codes, n, words, queries, truth, dup);
         printRow(variant, stats, opts.verbose);
     }
 
@@ -266,8 +264,8 @@ fn dot(a: []const f32, b: []const f32) f32 {
 /// Exact cosine top-`TOP`, excluding the query itself. Every vector in the store is L2
 /// normalized -- `validate` enforces it -- so the dot product is the cosine.
 fn exactTop(vecs: []const f32, n: usize, q: u32, out: *[TOP]u32) f32 {
-    var best_sim = [_]f32{-2.0} ** TOP;
-    var best_id = [_]u32{0} ** TOP;
+    var best_sim: [TOP]f32 = @splat(-2.0);
+    var best_id: [TOP]u32 = @splat(0);
     const qv = vecs[@as(usize, q) * DIM ..][0..DIM];
 
     for (0..n) |i| {
@@ -304,6 +302,7 @@ const Stats = struct {
 
 fn recallOf(
     gpa: std.mem.Allocator,
+    io: std.Io,
     codes: []const u64,
     n: usize,
     words: usize,
@@ -322,7 +321,7 @@ fn recallOf(
     var clean_n: usize = 0;
     var nn_sum: f64 = 0;
     var scan_ns: u64 = 0;
-    var timer = try std.time.Timer.start();
+    var timer = Timer.start(io);
 
     for (queries, truth, dup) |q, t, is_dup| {
         if (!is_dup) clean_n += 1;
@@ -541,7 +540,7 @@ fn printRow(v: Variant, s: Stats, verbose: bool) void {
 }
 
 // ***************************************************************************** Argument parsing
-fn parseArgs(args: [][:0]u8) Options {
+fn parseArgs(args: []const [:0]const u8) Options {
     var o = Options{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -602,6 +601,8 @@ fn usage(code: u8) noreturn {
 
 const std = @import("std");
 const dve = @import("dve");
+const Timer = dve.util.Timer;
+const nanos = dve.util.nanos;
 /// The corpus lives in a `vec_storage.zig` database -- the pre-cutover format, which is why
 /// that store is still in the tree. Nothing here depends on it beyond reading the bytes.
 const Store = dve.vec_storage.Storage(DIM, f32);

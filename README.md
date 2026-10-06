@@ -21,12 +21,13 @@ dve aims to be the SQLite of search. It should run quickly on hardware large and
 ```zig
 const dve = @import("dve");
 
+// `io` is your program's `std.Io`, e.g. `init.io` in `pub fn main(init: std.process.Init)`.
 // Open a directory to store the vector database.
-const dir = try std.fs.cwd().makeOpenPath("my_vectors", .{});
+const dir = try std.Io.Dir.cwd().createDirPathOpen(io, "my_vectors", .{});
 
 // Select the model you want. See USAGE.md for available model options and tradeoffs.
 const VectorEngine = dve.VectorEngine(.mpnet_embedding);
-const vectors = try VectorEngine.init(allocator, dir, .{});
+const vectors = try VectorEngine.init(allocator, io, dir, .{});
 defer vectors.deinit();
 
 // Embed text. The key identifies the entry (typically a file path).

@@ -23,7 +23,7 @@ pub fn build(b: *std.Build) void {
         []const u8,
         "llama-path",
         "Path to a built llama.cpp checkout (default: $HOME/llama.cpp)",
-    ) orelse b.pathJoin(&.{ std.posix.getenv("HOME") orelse ".", "llama.cpp" });
+    ) orelse b.pathJoin(&.{ b.graph.environ_map.get("HOME") orelse ".", "llama.cpp" });
 
     const dve_dep = b.dependency("dve", .{
         .target = target,
@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run.addArgs(args);
+    run.addPassthruArgs();
     const run_step = b.step("run", "Run dve-repl");
     run_step.dependOn(&run.step);
 }

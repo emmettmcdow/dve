@@ -42,13 +42,11 @@ const Options = struct {
     seed: u64 = 3,
 };
 
-pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
 
-    const args = try std.process.argsAlloc(gpa);
-    defer std.process.argsFree(gpa, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     const opts = parseArgs(args);
 
     const cores = std.Thread.getCpuCount() catch 8;
@@ -114,7 +112,7 @@ pub fn main() !void {
             std.debug.print("{d:>12}{s:>11}", .{ n, btxt });
             var best_rate: f64 = 0;
             for (thread_counts[0..n_tc]) |t| {
-                const ns = try timeScan(gpa, codes, n, opts, impl, t);
+                const ns = try timeScan(gpa, io, codes, n, opts, impl, t);
                 const ms = @as(f64, @floatFromInt(ns)) / 1e6;
                 const rate = @as(f64, @floatFromInt(bytes)) / (@as(f64, @floatFromInt(ns)) / 1e9) / 1e9;
                 best_rate = @max(best_rate, rate);
@@ -270,6 +268,7 @@ const Job = struct {
 
 fn timeScan(
     gpa: std.mem.Allocator,
+    io: std.Io,
     codes: []const u64,
     n: usize,
     opts: Options,
@@ -299,11 +298,11 @@ fn timeScan(
             .impl = impl,
             .k = opts.k,
         };
-        var timer = try std.time.Timer.start();
+        const started: std.Io.Timestamp = .now(io, .awake);
         for (jobs) |*job| job.* = .{ .shared = &shared };
         for (handles, jobs) |*h, *job| h.* = try std.Thread.spawn(.{}, Job.run, .{job});
         for (handles) |h| h.join();
-        best = @min(best, timer.read());
+        best = @min(best, @as(u64, @intCast(started.untilNow(io, .awake).toNanoseconds())));
         for (jobs) |job| sink +%= job.out_best;
     }
     std.mem.doNotOptimizeAway(sink);
@@ -326,7 +325,7 @@ fn fmtBytes(b: u64) ByteSize {
     return .{ .bytes = b };
 }
 
-fn parseArgs(args: [][:0]u8) Options {
+fn parseArgs(args: []const [:0]const u8) Options {
     var o = Options{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {

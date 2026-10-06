@@ -34,20 +34,22 @@ pub const NoteIdMap = struct {
     /// caller has to reconcile rather than start handing out ids from 1 again.
     manifest_present: bool,
     allocator: std.mem.Allocator,
-    basedir: std.fs.Dir,
-    mutex: std.Thread.Mutex,
+    io: std.Io,
+    basedir: std.Io.Dir,
+    mutex: std.Io.Mutex,
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, basedir: std.fs.Dir) !Self {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, basedir: std.Io.Dir) !Self {
         var self = Self{
             .path_to_id = std.StringHashMap(NoteID).init(allocator),
             .id_to_path = std.AutoHashMap(NoteID, []u8).init(allocator),
             .next_id = 1,
             .manifest_present = true,
             .allocator = allocator,
+            .io = io,
             .basedir = basedir,
-            .mutex = .{},
+            .mutex = .init,
         };
 
         self.load() catch |err| switch (err) {
@@ -81,8 +83,8 @@ pub const NoteIdMap = struct {
     /// with it. That ordering is what makes `next_id` greater than every doc_id in the store,
     /// which is in turn what lets a caller treat "no path" as "no vectors".
     pub fn createId(self: *Self, path: []const u8) !NoteID {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         if (self.path_to_id.get(path)) |id| return id;
 
@@ -104,20 +106,20 @@ pub const NoteIdMap = struct {
     }
 
     pub fn getId(self: *Self, path: []const u8) ?NoteID {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.path_to_id.get(path);
     }
 
     pub fn getPath(self: *Self, id: NoteID) ?[]const u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.id_to_path.get(id);
     }
 
     pub fn removePath(self: *Self, path: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         try self.removePathLocked(path);
     }
 
@@ -139,8 +141,8 @@ pub const NoteIdMap = struct {
     }
 
     pub fn renamePath(self: *Self, old_path: []const u8, new_path: []const u8) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         const id = self.path_to_id.get(old_path) orelse return error.NotFound;
 
@@ -161,8 +163,8 @@ pub const NoteIdMap = struct {
     /// The caller learns `id` by walking the store, which is the only way to know it when the
     /// manifest has been lost or rolled back. Returns true if anything moved.
     pub fn ensureNextIdAbove(self: *Self, id: NoteID) !bool {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         if (self.next_id > id) return false;
         self.next_id = id + 1;
         try self.save();
@@ -180,8 +182,8 @@ pub const NoteIdMap = struct {
     /// The id the next `createId` will hand out. Greater than every doc_id in the store, as
     /// long as nothing has torn.
     pub fn nextId(self: *Self) NoteID {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.next_id;
     }
 
@@ -194,14 +196,14 @@ pub const NoteIdMap = struct {
     /// Ids the move puts outside the workspace are appended to `dropped` and removed from the
     /// map; their vectors are the caller's to delete, this layer having no reach into them.
     pub fn reroot(self: *Self, move: Reroot, dropped: *std.ArrayList(NoteID)) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
         // Every new path is built before a single old one is touched. A failure halfway through
         // an in-place rewrite would leave some entries relative to the old root and some to the
         // new, and nothing afterwards could tell which was which.
         const Pending = struct { id: NoteID, path: []u8 };
-        var pending: std.ArrayList(Pending) = .{};
+        var pending: std.ArrayList(Pending) = .empty;
         defer pending.deinit(self.allocator);
         errdefer for (pending.items) |item| self.allocator.free(item.path);
 
@@ -213,7 +215,7 @@ pub const NoteIdMap = struct {
             const id = entry.key_ptr.*;
             const old_path = entry.value_ptr.*;
             const new_path: []u8 = switch (move) {
-                .deeper => |prefix| try std.fs.path.join(self.allocator, &.{ prefix, old_path }),
+                .deeper => |prefix| try std.Io.Dir.path.join(self.allocator, &.{ prefix, old_path }),
                 .shallower => |prefix| blk: {
                     const rest = stripDir(old_path, prefix) orelse {
                         try dropped.append(self.allocator, id);
@@ -249,8 +251,8 @@ pub const NoteIdMap = struct {
     }
 
     pub fn count(self: *Self) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
         return self.path_to_id.count();
     }
 
@@ -270,11 +272,11 @@ pub const NoteIdMap = struct {
         const zone = tracy.beginZone(@src(), .{ .name = "note_id_map.zig:load" });
         defer zone.end();
 
-        const file = try self.basedir.openFile(MANIFEST_FILENAME, .{});
-        defer file.close();
+        const file = try self.basedir.openFile(self.io, MANIFEST_FILENAME, .{});
+        defer file.close(self.io);
 
         var rbuf: [4096]u8 = undefined;
-        var reader = file.reader(&rbuf);
+        var reader = file.reader(self.io, &rbuf);
 
         const version = try readIntLE(&reader, u32);
         if (version != MANIFEST_VERSION) return error.CorruptManifest;
@@ -302,11 +304,11 @@ pub const NoteIdMap = struct {
 
         const tmp_name = MANIFEST_FILENAME ++ ".tmp";
 
-        const file = try self.basedir.createFile(tmp_name, .{});
-        errdefer self.basedir.deleteFile(tmp_name) catch {}; // zlinter-disable-current-line
+        const file = try self.basedir.createFile(self.io, tmp_name, .{});
+        errdefer self.basedir.deleteFile(self.io, tmp_name) catch {}; // zlinter-disable-current-line
 
         var wbuf: [4096]u8 = undefined;
-        var writer = file.writer(&wbuf);
+        var writer = file.writer(self.io, &wbuf);
 
         try writeIntLE(&writer, u32, MANIFEST_VERSION);
         try writeIntLE(&writer, u64, self.next_id);
@@ -324,26 +326,26 @@ pub const NoteIdMap = struct {
         // it should not be less durable than the store it governs, which has always used
         // pfile.
         try pfile.syncFd(file.handle);
-        file.close();
+        file.close(self.io);
 
-        try self.basedir.rename(tmp_name, MANIFEST_FILENAME);
+        try self.basedir.rename(tmp_name, self.basedir, MANIFEST_FILENAME, self.io);
         // The rename itself has to be committed, or a crash can revert the manifest to its
         // previous contents while the store keeps the rows the newer version described --
         // which is the one direction of tearing that produces wrong answers rather than
         // missing ones, because `next_id` goes backwards with it.
-        try pfile.syncFd(self.basedir.fd);
+        try pfile.syncFd(self.basedir.handle);
     }
 
-    pub fn pruneOrphanedPaths(self: *Self, basedir: std.fs.Dir) !void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    pub fn pruneOrphanedPaths(self: *Self, basedir: std.Io.Dir) !void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
 
-        var to_remove: std.ArrayList(NoteID) = .{};
+        var to_remove: std.ArrayList(NoteID) = .empty;
         defer to_remove.deinit(self.allocator);
 
         var it = self.path_to_id.iterator();
         while (it.next()) |entry| {
-            basedir.access(entry.key_ptr.*, .{}) catch |err| switch (err) {
+            basedir.access(self.io, entry.key_ptr.*, .{}) catch |err| switch (err) {
                 error.FileNotFound => {
                     try to_remove.append(self.allocator, entry.value_ptr.*);
                 },
@@ -368,7 +370,7 @@ test "getOrCreateId creates new id" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
-    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer map.deinit();
 
     const id1 = try map.getOrCreateId("note1.md");
@@ -383,7 +385,7 @@ test "getOrCreateId returns existing id" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
-    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer map.deinit();
 
     const id1 = try map.getOrCreateId("note1.md");
@@ -396,7 +398,7 @@ test "getPath returns path for id" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
-    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer map.deinit();
 
     const id = try map.getOrCreateId("mypath.md");
@@ -409,7 +411,7 @@ test "removePath removes mapping" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
-    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer map.deinit();
 
     const id = try map.getOrCreateId("note.md");
@@ -424,12 +426,12 @@ test "persistence across restarts" {
     defer tmpD.cleanup();
 
     const id1: NoteID = blk: {
-        var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+        var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
         defer map.deinit();
         break :blk try map.getOrCreateId("persistent.md");
     };
 
-    var map2 = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var map2 = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer map2.deinit();
 
     try expectEqual(id1, map2.getId("persistent.md").?);
@@ -443,7 +445,7 @@ test "renamePath preserves id" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
-    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer map.deinit();
 
     const id = try map.getOrCreateId("old.md");
@@ -458,15 +460,15 @@ test "getOrCreateId does not double free when save fails" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
-    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer map.deinit();
 
     // Remove write permission on the tmpdir so save() cannot create the .tmp file.
     // path_copy is inserted into id_to_path before save() is called; the errdefer
     // then frees it, leaving a dangling value. deinit() frees it again — double free.
     // std.testing.allocator (GPA) will catch the second free.
-    try std.posix.fchmod(tmpD.dir.fd, 0o555);
-    defer std.posix.fchmod(tmpD.dir.fd, 0o755) catch {};
+    try tmpD.dir.setPermissions(std.testing.io, .fromMode(0o555));
+    defer tmpD.dir.setPermissions(std.testing.io, .fromMode(0o755)) catch {};
 
     const result = map.getOrCreateId("test.md");
     try std.testing.expectError(error.AccessDenied, result);
@@ -476,7 +478,7 @@ test "thread safety: concurrent access across full interface" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
-    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer map.deinit();
 
     // Pre-populate; create real files for every other entry so pruneOrphanedPaths has work to do.
@@ -485,7 +487,7 @@ test "thread safety: concurrent access across full interface" {
         var buf: [32]u8 = undefined;
         const path = try std.fmt.bufPrint(&buf, "pre{d}.md", .{i});
         _ = try map.getOrCreateId(path);
-        if (i % 2 == 0) (try tmpD.dir.createFile(path, .{})).close();
+        if (i % 2 == 0) (try tmpD.dir.createFile(std.testing.io, path, .{})).close(std.testing.io);
     }
 
     // getOrCreateId — 4 threads each insert 10 unique paths; collect IDs to assert uniqueness.
@@ -544,7 +546,7 @@ test "thread safety: concurrent access across full interface" {
     }.run;
 
     // pruneOrphanedPaths — scans and removes entries whose files are absent.
-    const PrunerCtx = struct { map: *NoteIdMap, dir: std.fs.Dir };
+    const PrunerCtx = struct { map: *NoteIdMap, dir: std.Io.Dir };
     const pruner_worker = struct {
         fn run(ctx: PrunerCtx) void {
             ctx.map.pruneOrphanedPaths(ctx.dir) catch {};
@@ -585,19 +587,19 @@ test "manifest_present distinguishes a fresh map from a lost one" {
     defer tmpD.cleanup();
 
     {
-        var fresh = try NoteIdMap.init(testing_allocator, tmpD.dir);
+        var fresh = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
         defer fresh.deinit();
         // Nothing on disk yet, which is a new database rather than a damaged one.
         try expect(!fresh.manifest_present);
         _ = try fresh.getOrCreateId("note.md");
     }
 
-    var reopened = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var reopened = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer reopened.deinit();
     try expect(reopened.manifest_present);
 
-    try tmpD.dir.deleteFile(MANIFEST_FILENAME);
-    var lost = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    try tmpD.dir.deleteFile(std.testing.io, MANIFEST_FILENAME);
+    var lost = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer lost.deinit();
     // Identical in-memory state to the fresh map above, and the caller cannot tell them
     // apart without this flag -- but one of them is sitting next to a store full of
@@ -610,7 +612,7 @@ test "ensureNextIdAbove stops ids being handed out twice" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
-    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer map.deinit();
 
     // The shape of a lost manifest: the counter starts over while the store still holds
@@ -631,13 +633,13 @@ test "ensureNextIdAbove survives a reopen" {
     defer tmpD.cleanup();
 
     {
-        var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+        var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
         defer map.deinit();
         _ = try map.ensureNextIdAbove(500);
     }
 
     // The raised counter has to be durable, or the next open reuses the ids all over again.
-    var reopened = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var reopened = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer reopened.deinit();
     try expectEqual(501, reopened.next_id);
 }
@@ -646,9 +648,9 @@ test "pruneOrphanedPaths removes missing files" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
-    (try tmpD.dir.createFile("exists.md", .{})).close();
+    (try tmpD.dir.createFile(std.testing.io, "exists.md", .{})).close(std.testing.io);
 
-    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer map.deinit();
 
     _ = try map.getOrCreateId("exists.md");
@@ -668,13 +670,13 @@ const std = @import("std");
 const pfile = @import("pfile.zig");
 const tracy = @import("tracy");
 
-fn readIntLE(reader: *std.fs.File.Reader, comptime T: type) !T {
+fn readIntLE(reader: *std.Io.File.Reader, comptime T: type) !T {
     var buf: [@sizeOf(T)]u8 = undefined;
     try reader.interface.readSliceAll(&buf);
     return std.mem.readInt(T, &buf, .little);
 }
 
-fn writeIntLE(writer: *std.fs.File.Writer, comptime T: type, value: T) !void {
+fn writeIntLE(writer: *std.Io.File.Writer, comptime T: type, value: T) !void {
     var buf: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, &buf, value, .little);
     try writer.interface.writeAll(&buf);
@@ -684,13 +686,13 @@ test "reroot deeper prefixes every path and keeps the ids" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
-    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer map.deinit();
 
     const one = try map.getOrCreateId("one.md");
     const two = try map.getOrCreateId("sub/two.md");
 
-    var dropped: std.ArrayList(NoteID) = .{};
+    var dropped: std.ArrayList(NoteID) = .empty;
     defer dropped.deinit(testing_allocator);
     try map.reroot(.{ .deeper = "md-src" }, &dropped);
 
@@ -707,7 +709,7 @@ test "reroot shallower strips the prefix and reports what fell outside" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
-    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer map.deinit();
 
     const inside = try map.getOrCreateId("md-src/one.md");
@@ -716,7 +718,7 @@ test "reroot shallower strips the prefix and reports what fell outside" {
     // A name that merely starts with the same letters is not inside the folder.
     const lookalike = try map.getOrCreateId("md-srcery/four.md");
 
-    var dropped: std.ArrayList(NoteID) = .{};
+    var dropped: std.ArrayList(NoteID) = .empty;
     defer dropped.deinit(testing_allocator);
     try map.reroot(.{ .shallower = "md-src" }, &dropped);
 
@@ -741,18 +743,18 @@ test "reroot survives a restart" {
 
     var id: NoteID = undefined;
     {
-        var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+        var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
         defer map.deinit();
         id = try map.getOrCreateId("one.md");
 
-        var dropped: std.ArrayList(NoteID) = .{};
+        var dropped: std.ArrayList(NoteID) = .empty;
         defer dropped.deinit(testing_allocator);
         try map.reroot(.{ .deeper = "md-src" }, &dropped);
     }
     {
         // The manifest on disk is what the next launch reads, so the rewrite has to be in it
         // and not just in the map that performed it.
-        var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+        var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
         defer map.deinit();
         try expectEqual(id, map.getId("md-src/one.md").?);
         try expectEqual(@as(usize, 1), map.count());
@@ -763,10 +765,10 @@ test "rerooting an empty map is not an error" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
-    var map = try NoteIdMap.init(testing_allocator, tmpD.dir);
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
     defer map.deinit();
 
-    var dropped: std.ArrayList(NoteID) = .{};
+    var dropped: std.ArrayList(NoteID) = .empty;
     defer dropped.deinit(testing_allocator);
     try map.reroot(.{ .deeper = "md-src" }, &dropped);
     try expectEqual(@as(usize, 0), map.count());

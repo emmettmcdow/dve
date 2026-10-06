@@ -38,7 +38,7 @@
 
 pub const DEFAULT_BITS: usize = 384;
 
-/// Slots below this are scanned on the calling thread. Dispatching to a pool and joining costs
+/// Slots below this are scanned on the calling thread. Dispatching to other threads and joining costs
 /// tens of microseconds; a single-threaded scan of 16k codes at 48 bytes is ~60 us, so below
 /// roughly this size the dispatch is most of the query.
 pub const MIN_PARALLEL_SLOTS: usize = 16384;
@@ -134,7 +134,7 @@ pub fn Codes(comptime vec_sz: usize, comptime vec_type: type, comptime code_bits
         };
 
         pub const Opts = struct {
-            /// Threads used for a scan. Null lets the pool size itself from the CPU count.
+            /// Threads used for a scan, the calling one included. Null is the CPU count.
             /// Measured on a 4-performance + 6-efficiency core machine, four threads saturate
             /// memory bandwidth and everything above that is wasted -- but where that line
             /// sits is a property of the machine, so this is a knob rather than a constant.
@@ -155,27 +155,23 @@ pub fn Codes(comptime vec_sz: usize, comptime vec_type: type, comptime code_bits
         /// High-water mark, matching the store's. Only grows.
         slot_n: usize = 0,
         live_n: usize = 0,
-        pool: ?*std.Thread.Pool = null,
+        io: std.Io,
+        /// How many threads a scan is split across, the calling one included.
+        threads: usize = 1,
 
         // ************************************************************************* Lifecycle
-        pub fn init(allocator: std.mem.Allocator, opts: Opts) !Self {
-            var self = Self{ .allocator = allocator };
+        pub fn init(allocator: std.mem.Allocator, io: std.Io, opts: Opts) !Self {
+            var self = Self{
+                .allocator = allocator,
+                .io = io,
+                .threads = @max(1, opts.threads orelse (std.Thread.getCpuCount() catch 1)),
+            };
             errdefer self.deinit();
             if (opts.capacity > 0) try self.reserve(opts.capacity);
-
-            const pool = try allocator.create(std.Thread.Pool);
-            errdefer allocator.destroy(pool);
-            try pool.init(.{ .allocator = allocator, .n_jobs = opts.threads });
-            self.pool = pool;
             return self;
         }
 
         pub fn deinit(self: *Self) void {
-            if (self.pool) |pool| {
-                pool.deinit();
-                self.allocator.destroy(pool);
-                self.pool = null;
-            }
             self.allocator.free(self.words);
             self.allocator.free(self.live);
             self.words = &.{};
@@ -303,11 +299,11 @@ pub fn Codes(comptime vec_sz: usize, comptime vec_type: type, comptime code_bits
         /// one cannot crash anything or return wrong data -- stage two re-reads the real
         /// vector and scores it exactly. A flipped bit costs a little recall and nothing else.
         /// A *truncated* file is caught, by length.
-        pub fn save(self: *const Self, dir: std.fs.Dir, path: []const u8, stamp: Stamp) !void {
+        pub fn save(self: *const Self, dir: std.Io.Dir, path: []const u8, stamp: Stamp) !void {
             const live_words = (self.slot_n + 63) / 64;
             const code_words = self.slot_n * CODE_WORDS;
 
-            const file = try pfile.File.openAt(@intCast(dir.fd), path, .{ .truncate = true });
+            const file = try pfile.File.openAt(@intCast(dir.handle), path, .{ .truncate = true });
             defer file.close();
 
             const h = FileHeader{
@@ -344,17 +340,18 @@ pub fn Codes(comptime vec_sz: usize, comptime vec_type: type, comptime code_bits
         /// the cost of being conservative is one rebuild, so it is not a close call.
         pub fn load(
             allocator: std.mem.Allocator,
-            dir: std.fs.Dir,
+            io: std.Io,
+            dir: std.Io.Dir,
             path: []const u8,
             stamp: Stamp,
             opts: Opts,
         ) !?Self {
-            const file = pfile.File.openAt(@intCast(dir.fd), path, .{ .create = false }) catch
+            const file = pfile.File.openAt(@intCast(dir.handle), path, .{ .create = false }) catch
                 return null;
             var keep_file = true;
             defer {
                 file.close();
-                if (!keep_file) dir.deleteFile(path) catch {};
+                if (!keep_file) dir.deleteFile(io, path) catch {};
             }
 
             var h: FileHeader = undefined;
@@ -387,7 +384,7 @@ pub fn Codes(comptime vec_sz: usize, comptime vec_type: type, comptime code_bits
                 return null;
             }
 
-            var self = try Self.init(allocator, .{ .capacity = slot_n, .threads = opts.threads });
+            var self = try Self.init(allocator, io, .{ .capacity = slot_n, .threads = opts.threads });
             errdefer self.deinit();
 
             if (slot_n > 0) {
@@ -419,7 +416,7 @@ pub fn Codes(comptime vec_sz: usize, comptime vec_type: type, comptime code_bits
             var q: Word = undefined;
             encode(query, &q);
 
-            const threads = if (self.pool) |p| p.threads.len else 1;
+            const threads = self.threads;
             if (threads <= 1 or self.slot_n < MIN_PARALLEL_SLOTS) {
                 var top = TopK.init(out);
                 self.scanRange(&q, 0, self.slot_n, &top);
@@ -435,12 +432,20 @@ pub fn Codes(comptime vec_sz: usize, comptime vec_type: type, comptime code_bits
             defer self.allocator.free(tops);
 
             var next = std.atomic.Value(usize).init(0);
-            var wg: std.Thread.WaitGroup = .{};
-            for (tops, 0..) |*top, t| {
-                top.* = TopK.init(shard[t * out.len ..][0..out.len]);
-                self.pool.?.spawnWg(&wg, workerRun, .{ self, q, &next, top });
+            for (tops, 0..) |*top, t| top.* = TopK.init(shard[t * out.len ..][0..out.len]);
+
+            // One shard is scanned here and the rest are handed to `io`. The workers all pull
+            // chunks off the same counter, so an `io` that cannot run a task concurrently
+            // costs speed and nothing else: whoever does run drains the whole range.
+            var group: std.Io.Group = .init;
+            for (tops[1..]) |*top| {
+                group.concurrent(self.io, workerRun, .{ self, q, &next, top }) catch break;
             }
-            self.pool.?.waitAndWork(&wg);
+            workerRun(self, q, &next, &tops[0]);
+            group.await(self.io) catch |err| {
+                group.cancel(self.io);
+                return err;
+            };
 
             // A real k-way merge, because the shards are already sorted and the obvious
             // alternative is quadratic. Pushing every shard entry into one more `TopK` costs
@@ -640,7 +645,7 @@ test "hamming: 16-byte lanes and the u64 tail agree" {
 }
 
 test "put and rm track liveness and the slot high-water mark" {
-    var c = try Tiny.init(talloc, .{});
+    var c = try Tiny.init(talloc, testing.io, .{});
     defer c.deinit();
 
     const v = tinyVec(0b1010);
@@ -668,7 +673,7 @@ test "put and rm track liveness and the slot high-water mark" {
 }
 
 test "put overwrites a reused slot rather than appending" {
-    var c = try Tiny.init(talloc, .{});
+    var c = try Tiny.init(talloc, testing.io, .{});
     defer c.deinit();
 
     const a = tinyVec(0b00000000);
@@ -689,7 +694,7 @@ test "put overwrites a reused slot rather than appending" {
 }
 
 test "search: exact match first, results sorted, dead slots excluded" {
-    var c = try Tiny.init(talloc, .{});
+    var c = try Tiny.init(talloc, testing.io, .{});
     defer c.deinit();
 
     // Distances from 0b00000000: slot 0 is 0 bits away, slot 1 is 1, slot 2 is 2, slot 3 is 3.
@@ -716,7 +721,7 @@ test "search: exact match first, results sorted, dead slots excluded" {
 }
 
 test "search: K bounds the result, keeping the nearest" {
-    var c = try Tiny.init(talloc, .{});
+    var c = try Tiny.init(talloc, testing.io, .{});
     defer c.deinit();
     for (0..8) |i| {
         const bits = (@as(u64, 1) << @intCast(i)) - 1; // i bits set -> distance i
@@ -733,7 +738,7 @@ test "search: K bounds the result, keeping the nearest" {
 }
 
 test "search: an empty buffer is an error, an empty index is not" {
-    var c = try Tiny.init(talloc, .{});
+    var c = try Tiny.init(talloc, testing.io, .{});
     defer c.deinit();
     const q = tinyVec(0);
 
@@ -760,9 +765,9 @@ test "search: threaded and single-threaded agree exactly" {
     var prng = std.Random.DefaultPrng.init(99);
     const rng = prng.random();
 
-    var par = try C.init(talloc, .{ .threads = 4, .capacity = N });
+    var par = try C.init(talloc, testing.io, .{ .threads = 4, .capacity = N });
     defer par.deinit();
-    var seq = try C.init(talloc, .{ .threads = 1, .capacity = N });
+    var seq = try C.init(talloc, testing.io, .{ .threads = 1, .capacity = N });
     defer seq.deinit();
 
     var v: [64]f32 = undefined;
@@ -801,7 +806,7 @@ test "search: parallel merge keeps the true nearest across shard boundaries" {
     const N = MIN_PARALLEL_SLOTS + CHUNK_SLOTS + 500;
     const C = Tiny;
 
-    var c = try C.init(talloc, .{ .threads = 4, .capacity = N });
+    var c = try C.init(talloc, testing.io, .{ .threads = 4, .capacity = N });
     defer c.deinit();
 
     var v: [64]f32 = @splat(1.0);
@@ -819,7 +824,7 @@ test "search: parallel merge keeps the true nearest across shard boundaries" {
 }
 
 test "reserve: growth preserves codes and liveness" {
-    var c = try Tiny.init(talloc, .{});
+    var c = try Tiny.init(talloc, testing.io, .{});
     defer c.deinit();
 
     // Put sparsely so the array reallocates several times, then check nothing moved.
@@ -842,7 +847,7 @@ test "reserve: growth preserves codes and liveness" {
 
 test "bytes: the resident cost is the code array plus one bit per slot" {
     const C = Codes(768, f32, 384);
-    var c = try C.init(talloc, .{ .capacity = 1024 });
+    var c = try C.init(talloc, testing.io, .{ .capacity = 1024 });
     defer c.deinit();
     // 1024 slots x 48 bytes, plus 1024 bits of liveness.
     try expectEqual(@as(usize, 1024 * 48 + 1024 / 8), c.bytes());
@@ -862,7 +867,7 @@ test "the production configuration is 48 bytes a vector" {
 // -- where the shard merge has to choose among equals -- was never exercised.
 test "search: recall cannot fall as K grows, even when everything ties" {
     const N = MIN_PARALLEL_SLOTS + CHUNK_SLOTS + 777;
-    var c = try Tiny.init(talloc, .{ .threads = 4, .capacity = N });
+    var c = try Tiny.init(talloc, testing.io, .{ .threads = 4, .capacity = N });
     defer c.deinit();
 
     // Two thirds of the corpus is an exact duplicate of the query; the rest is far away.
@@ -891,7 +896,7 @@ test "search: recall cannot fall as K grows, even when everything ties" {
 
 test "search: a tied corpus returns each slot at most once" {
     const N = MIN_PARALLEL_SLOTS + CHUNK_SLOTS + 33;
-    var c = try Tiny.init(talloc, .{ .threads = 4, .capacity = N });
+    var c = try Tiny.init(talloc, testing.io, .{ .threads = 4, .capacity = N });
     defer c.deinit();
     const q = tinyVec(0);
     for (0..N) |slot| try c.put(slot, &q); // every code identical
@@ -915,7 +920,7 @@ test "search: a tied corpus returns each slot at most once" {
 // binrecall.md stops holding.
 test "search: a larger K extends the smaller one rather than replacing it" {
     const N = MIN_PARALLEL_SLOTS + CHUNK_SLOTS + 555;
-    var c = try Tiny.init(talloc, .{ .threads = 4, .capacity = N });
+    var c = try Tiny.init(talloc, testing.io, .{ .threads = 4, .capacity = N });
     defer c.deinit();
 
     var prng = std.Random.DefaultPrng.init(4242);
@@ -959,7 +964,7 @@ test "search: a larger K extends the smaller one rather than replacing it" {
 // something intrinsic to the data. These two tests are what hold that down.
 test "search: a tied corpus returns the same answer every time" {
     const N = MIN_PARALLEL_SLOTS + CHUNK_SLOTS + 91;
-    var c = try Tiny.init(talloc, .{ .threads = 4, .capacity = N });
+    var c = try Tiny.init(talloc, testing.io, .{ .threads = 4, .capacity = N });
     defer c.deinit();
 
     const q = tinyVec(0);
@@ -982,9 +987,9 @@ test "search: a tied corpus returns the same answer every time" {
 
 test "search: threading does not change the answer, ties included" {
     const N = MIN_PARALLEL_SLOTS + CHUNK_SLOTS + 404;
-    var par = try Tiny.init(talloc, .{ .threads = 4, .capacity = N });
+    var par = try Tiny.init(talloc, testing.io, .{ .threads = 4, .capacity = N });
     defer par.deinit();
-    var seq = try Tiny.init(talloc, .{ .threads = 1, .capacity = N });
+    var seq = try Tiny.init(talloc, testing.io, .{ .threads = 1, .capacity = N });
     defer seq.deinit();
 
     // Deliberately few distinct codes, so almost every comparison is a tie.
@@ -1022,7 +1027,7 @@ test "save then load reproduces the index exactly" {
     const stamp = Stamp{ .store_bytes = 4096 * 300, .slot_n = 300, .vec_n = 280 };
 
     var v: [768]f32 = undefined;
-    var saved = try Prod.init(talloc, .{ .capacity = 300 });
+    var saved = try Prod.init(talloc, testing.io, .{ .capacity = 300 });
     defer saved.deinit();
     for (0..300) |slot| {
         randVec(768, rng, &v);
@@ -1031,7 +1036,7 @@ test "save then load reproduces the index exactly" {
     }
     try saved.save(tmp.dir, "c.bin", stamp);
 
-    var loaded = (try Prod.load(talloc, tmp.dir, "c.bin", stamp, .{})).?;
+    var loaded = (try Prod.load(talloc, testing.io, tmp.dir, "c.bin", stamp, .{})).?;
     defer loaded.deinit();
 
     try expectEqual(saved.slotCount(), loaded.slotCount());
@@ -1058,18 +1063,18 @@ test "load consumes the file, so a second open has nothing to read" {
     const stamp = Stamp{ .store_bytes = 4096, .slot_n = 1, .vec_n = 1 };
 
     var v: [768]f32 = @splat(0.5);
-    var c = try Prod.init(talloc, .{ .capacity = 1 });
+    var c = try Prod.init(talloc, testing.io, .{ .capacity = 1 });
     defer c.deinit();
     try c.put(0, &v);
     try c.save(tmp.dir, "c.bin", stamp);
 
-    var first = (try Prod.load(talloc, tmp.dir, "c.bin", stamp, .{})).?;
+    var first = (try Prod.load(talloc, testing.io, tmp.dir, "c.bin", stamp, .{})).?;
     first.deinit();
 
     // Gone. A saved index is only valid while nobody holds it, which is what stops a crashed
     // process leaving a stale one behind -- see the comment on `load`.
-    try expectEqual(@as(?Prod, null), try Prod.load(talloc, tmp.dir, "c.bin", stamp, .{}));
-    try testing.expectError(error.FileNotFound, tmp.dir.access("c.bin", .{}));
+    try expectEqual(@as(?Prod, null), try Prod.load(talloc, testing.io, tmp.dir, "c.bin", stamp, .{}));
+    try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "c.bin", .{}));
 }
 
 test "load refuses a file from a different store, and does not leave it behind" {
@@ -1078,7 +1083,7 @@ test "load refuses a file from a different store, and does not leave it behind" 
     const written = Stamp{ .store_bytes = 4096 * 10, .slot_n = 10, .vec_n = 10 };
 
     var v: [768]f32 = @splat(0.25);
-    var c = try Prod.init(talloc, .{ .capacity = 10 });
+    var c = try Prod.init(talloc, testing.io, .{ .capacity = 10 });
     defer c.deinit();
     for (0..10) |slot| try c.put(slot, &v);
 
@@ -1089,8 +1094,8 @@ test "load refuses a file from a different store, and does not leave it behind" 
         .{ .store_bytes = 4096 * 10, .slot_n = 10, .vec_n = 9 },
     }) |wrong| {
         try c.save(tmp.dir, "c.bin", written);
-        try expectEqual(@as(?Prod, null), try Prod.load(talloc, tmp.dir, "c.bin", wrong, .{}));
-        try testing.expectError(error.FileNotFound, tmp.dir.access("c.bin", .{}));
+        try expectEqual(@as(?Prod, null), try Prod.load(talloc, testing.io, tmp.dir, "c.bin", wrong, .{}));
+        try testing.expectError(error.FileNotFound, tmp.dir.access(testing.io, "c.bin", .{}));
     }
 }
 
@@ -1101,14 +1106,14 @@ test "load refuses a file written for a different code width" {
 
     const Narrow = Codes(768, f32, 128);
     var v: [768]f32 = @splat(1.0);
-    var c = try Narrow.init(talloc, .{ .capacity = 4 });
+    var c = try Narrow.init(talloc, testing.io, .{ .capacity = 4 });
     defer c.deinit();
     for (0..4) |slot| try c.put(slot, &v);
     try c.save(tmp.dir, "c.bin", stamp);
 
     // Same store, same vectors, a build that quantizes differently. Loading it would be
     // reading 48-byte codes out of 16-byte ones.
-    try expectEqual(@as(?Prod, null), try Prod.load(talloc, tmp.dir, "c.bin", stamp, .{}));
+    try expectEqual(@as(?Prod, null), try Prod.load(talloc, testing.io, tmp.dir, "c.bin", stamp, .{}));
 }
 
 test "load refuses a truncated file" {
@@ -1118,7 +1123,7 @@ test "load refuses a truncated file" {
 
     var prng = std.Random.DefaultPrng.init(3);
     var v: [768]f32 = undefined;
-    var c = try Prod.init(talloc, .{ .capacity = 50 });
+    var c = try Prod.init(talloc, testing.io, .{ .capacity = 50 });
     defer c.deinit();
     for (0..50) |slot| {
         randVec(768, prng.random(), &v);
@@ -1128,19 +1133,19 @@ test "load refuses a truncated file" {
 
     // Lop off the last few codes, which is what a crash mid-write looks like. There is no
     // checksum over the payload -- see `save` for why -- so length is the whole defence.
-    const f = try tmp.dir.openFile("c.bin", .{ .mode = .read_write });
-    const full = (try f.stat()).size;
-    try f.setEndPos(full - 200);
-    f.close();
+    const f = try tmp.dir.openFile(testing.io, "c.bin", .{ .mode = .read_write });
+    const full = try f.length(testing.io);
+    try f.setLength(testing.io, full - 200);
+    f.close(testing.io);
 
-    try expectEqual(@as(?Prod, null), try Prod.load(talloc, tmp.dir, "c.bin", stamp, .{}));
+    try expectEqual(@as(?Prod, null), try Prod.load(talloc, testing.io, tmp.dir, "c.bin", stamp, .{}));
 }
 
 test "load of a missing file is null, not an error" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const stamp = Stamp{ .store_bytes = 0, .slot_n = 0, .vec_n = 0 };
-    try expectEqual(@as(?Prod, null), try Prod.load(talloc, tmp.dir, "nope.bin", stamp, .{}));
+    try expectEqual(@as(?Prod, null), try Prod.load(talloc, testing.io, tmp.dir, "nope.bin", stamp, .{}));
 }
 
 test "an empty index round-trips" {
@@ -1148,11 +1153,11 @@ test "an empty index round-trips" {
     defer tmp.cleanup();
     const stamp = Stamp{ .store_bytes = 4096, .slot_n = 0, .vec_n = 0 };
 
-    var c = try Prod.init(talloc, .{});
+    var c = try Prod.init(talloc, testing.io, .{});
     defer c.deinit();
     try c.save(tmp.dir, "c.bin", stamp);
 
-    var loaded = (try Prod.load(talloc, tmp.dir, "c.bin", stamp, .{})).?;
+    var loaded = (try Prod.load(talloc, testing.io, tmp.dir, "c.bin", stamp, .{})).?;
     defer loaded.deinit();
     try expectEqual(@as(usize, 0), loaded.slotCount());
     try expectEqual(@as(usize, 0), loaded.len());

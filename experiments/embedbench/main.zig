@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const dve = @import("dve");
+const Timer = dve.util.Timer;
 const embed = dve.embed;
 
 pub const std_options: std.Options = .{ .log_level = .err };
@@ -72,19 +73,17 @@ const Doc = struct {
     sentences: [][]const u8,
 };
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const allocator = init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     const opts = try parseArgs(args);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    const docs = try loadDocs(arena.allocator(), opts);
+    const docs = try loadDocs(arena.allocator(), io, opts);
     if (docs.len == 0) fatal("no usable documents in '{s}'", .{opts.corpus});
 
     var sentence_n: usize = 0;
@@ -113,45 +112,46 @@ pub fn main() !void {
     });
 
     if (opts.dump) |path| {
-        try dumpSentences(path, docs);
+        try dumpSentences(io, path, docs);
         std.debug.print("wrote {d} sentences to {s}\n", .{ sentence_n, path });
         return;
     }
 
     switch (opts.model) {
         .mpnet => {
-            var m = try embed.MpnetEmbedder.init(.{
+            var m = try embed.MpnetEmbedder.init(io, .{
                 .compute_units = opts.compute_units,
                 .model_path = opts.model_path,
             });
             defer m.deinit();
             var e = m.embedder();
-            try run(allocator, &e, docs, opts, byte_n);
+            try run(allocator, io, &e, docs, opts, byte_n);
         },
         .nl => {
-            var m = try embed.NLEmbedder.init();
+            var m = try embed.NLEmbedder.init(io);
             defer m.deinit();
             var e = m.embedder();
-            try run(allocator, &e, docs, opts, byte_n);
+            try run(allocator, io, &e, docs, opts, byte_n);
         },
         .llama => {
             if (!dve.llama.enabled) fatal("built without -Dllama", .{});
-            var m = try embed.LlamaNomicEmbedTextV15F32.init(.{});
+            var m = try embed.LlamaNomicEmbedTextV15F32.init(io, .{});
             defer m.deinit();
             var e = m.embedder();
-            try run(allocator, &e, docs, opts, byte_n);
+            try run(allocator, io, &e, docs, opts, byte_n);
         },
     }
 }
 
 fn run(
     allocator: std.mem.Allocator,
+    io: std.Io,
     e: *embed.Embedder,
     docs: []const Doc,
     opts: Options,
     byte_n: usize,
 ) !void {
-    try warmup(allocator, e, docs, opts.warmup);
+    try warmup(allocator, io, e, docs, opts.warmup);
 
     if (opts.verify) return verify(allocator, e, docs);
 
@@ -164,11 +164,11 @@ fn run(
     var batch_rate: ?f64 = null;
 
     if (opts.reverse) {
-        if (opts.mode != .single) batch_rate = try timeOne(allocator, e, docs, byte_n, .batch);
-        if (opts.mode != .batch) single_rate = try timeOne(allocator, e, docs, byte_n, .single);
+        if (opts.mode != .single) batch_rate = try timeOne(allocator, io, e, docs, byte_n, .batch);
+        if (opts.mode != .batch) single_rate = try timeOne(allocator, io, e, docs, byte_n, .single);
     } else {
-        if (opts.mode != .batch) single_rate = try timeOne(allocator, e, docs, byte_n, .single);
-        if (opts.mode != .single) batch_rate = try timeOne(allocator, e, docs, byte_n, .batch);
+        if (opts.mode != .batch) single_rate = try timeOne(allocator, io, e, docs, byte_n, .single);
+        if (opts.mode != .single) batch_rate = try timeOne(allocator, io, e, docs, byte_n, .batch);
     }
 
     if (single_rate != null and batch_rate != null) {
@@ -239,6 +239,7 @@ const Shape = enum { single, batch };
 /// Embeds every document once and returns the achieved sentences/second.
 fn timeOne(
     allocator: std.mem.Allocator,
+    io: std.Io,
     e: *embed.Embedder,
     docs: []const Doc,
     byte_n: usize,
@@ -247,7 +248,7 @@ fn timeOne(
     var sentence_n: usize = 0;
     var vec_checksum: f64 = 0;
 
-    var timer = try std.time.Timer.start();
+    var timer = Timer.start(io);
     for (docs) |doc| {
         // One arena per document, mirroring embedTextInternal: the embedder's output
         // lives exactly as long as the document being ingested.
@@ -294,6 +295,7 @@ fn timeOne(
 /// land inside the first timed mode and make it look slow.
 fn warmup(
     allocator: std.mem.Allocator,
+    io: std.Io,
     e: *embed.Embedder,
     docs: []const Doc,
     n: usize,
@@ -303,7 +305,7 @@ fn warmup(
     defer arena.deinit();
 
     var done: usize = 0;
-    var timer = try std.time.Timer.start();
+    var timer = Timer.start(io);
     outer: for (docs) |doc| {
         for (doc.sentences) |s| {
             _ = try e.embed(arena.allocator(), s);
@@ -319,11 +321,11 @@ fn warmup(
 
 /// One sentence per line. Newlines are sentence delimiters upstream, so no sentence can
 /// contain one and the line count is exactly the sentence count.
-fn dumpSentences(path: []const u8, docs: []const Doc) !void {
-    var file = try std.fs.cwd().createFile(path, .{});
-    defer file.close();
+fn dumpSentences(io: std.Io, path: []const u8, docs: []const Doc) !void {
+    var file = try std.Io.Dir.cwd().createFile(io, path, .{});
+    defer file.close(io);
     var buf: [64 * 1024]u8 = undefined;
-    var w = file.writer(&buf);
+    var w = file.writer(io, &buf);
     for (docs) |doc| {
         for (doc.sentences) |s| {
             try w.interface.writeAll(s);
@@ -335,18 +337,18 @@ fn dumpSentences(path: []const u8, docs: []const Doc) !void {
 
 // ***************************************************************************************** Corpus
 
-fn loadDocs(arena: std.mem.Allocator, opts: Options) ![]Doc {
-    var dir = std.fs.cwd().openDir(opts.corpus, .{ .iterate = true }) catch |err| {
+fn loadDocs(arena: std.mem.Allocator, io: std.Io, opts: Options) ![]Doc {
+    var dir = std.Io.Dir.cwd().openDir(io, opts.corpus, .{ .iterate = true }) catch |err| {
         fatal("cannot open corpus dir '{s}': {t}", .{ opts.corpus, err });
     };
-    defer dir.close();
+    defer dir.close(io);
 
     // The corpus directory holds hundreds of thousands of files; stop walking once there
     // are enough candidates to sample from rather than listing the whole thing.
     const pool_target = @max(opts.docs * 4, 4096);
-    var names: std.ArrayList([]const u8) = .{};
+    var names: std.ArrayList([]const u8) = .empty;
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         try names.append(arena, try arena.dupe(u8, entry.name));
         if (names.items.len >= pool_target) break;
@@ -355,13 +357,13 @@ fn loadDocs(arena: std.mem.Allocator, opts: Options) ![]Doc {
     var prng = std.Random.DefaultPrng.init(opts.seed);
     prng.random().shuffle([]const u8, names.items);
 
-    var docs: std.ArrayList(Doc) = .{};
+    var docs: std.ArrayList(Doc) = .empty;
     for (names.items) |name| {
         if (docs.items.len >= opts.docs) break;
 
-        const contents = dir.readFileAlloc(arena, name, MAX_ARTICLE_BYTES) catch continue;
+        const contents = dir.readFileAlloc(io, name, arena, .limited(MAX_ARTICLE_BYTES)) catch continue;
 
-        var sentences: std.ArrayList([]const u8) = .{};
+        var sentences: std.ArrayList([]const u8) = .empty;
         var spliterator = embed.SentenceSpliterator.init(contents);
         while (spliterator.next()) |sentence| {
             if (whitespaceOnly(sentence.contents) or !wordlike(sentence.contents)) continue;

@@ -18,22 +18,23 @@ const DOCUMENTS = [_]struct { key: []const u8, text: []const u8 }{
     .{ .key = "quantum-mechanics", .text = "Quantum mechanics is a fundamental theory in physics that describes the behavior of nature at the smallest scales, where particles can exist in multiple states simultaneously." },
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    // The engine needs a thread-safe allocator and an `Io`; `init` supplies both.
+    const allocator = init.gpa;
+    const io = init.io;
 
     // Use a temp directory for the database, cleaned up on exit.
     const tmp_path = "/tmp/dve-repl";
-    std.fs.deleteTreeAbsolute(tmp_path) catch {};
-    var tmp_dir = try std.fs.cwd().makeOpenPath(tmp_path, .{});
+    const cwd = std.Io.Dir.cwd();
+    cwd.deleteTree(io, tmp_path) catch {};
+    var tmp_dir = try cwd.createDirPathOpen(io, tmp_path, .{});
     defer {
-        tmp_dir.close();
-        std.fs.deleteTreeAbsolute(tmp_path) catch {};
+        tmp_dir.close(io);
+        cwd.deleteTree(io, tmp_path) catch {};
     }
 
     // The engine owns its embedder; pass .{} to use the build's default model files.
-    const vectors = try VectorEngine.init(allocator, tmp_dir, .{});
+    const vectors = try VectorEngine.init(allocator, io, tmp_dir, .{});
     defer vectors.deinit();
 
     // Embed all documents.
@@ -45,7 +46,7 @@ pub fn main() !void {
 
     // Query loop.
     var stdin_rbuf: [4096]u8 = undefined;
-    var stdin_reader = std.fs.File.stdin().reader(&stdin_rbuf);
+    var stdin_reader = std.Io.File.stdin().reader(io, &stdin_rbuf);
 
     while (true) {
         std.debug.print("Query (or 'quit'): ", .{});
@@ -53,7 +54,7 @@ pub fn main() !void {
             error.EndOfStream => break,
             else => return err,
         };
-        const query = std.mem.trimRight(u8, line, "\r\n");
+        const query = std.mem.trimEnd(u8, line, "\r\n");
         if (std.mem.eql(u8, query, "quit")) break;
         if (query.len == 0) continue;
 

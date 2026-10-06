@@ -72,13 +72,15 @@ fn generateNote(buf: []u8, rng: std.Random, term_idx: *usize) usize {
 
 fn randomUnitVector(comptime VEC_SZ: usize, rng: std.Random) @Vector(VEC_SZ, VEC_TYPE) {
     const Vector = @Vector(VEC_SZ, VEC_TYPE);
-    var v: Vector = @splat(0.0);
+    // Filled as an array: a vector cannot be indexed at runtime.
+    var elems: [VEC_SZ]VEC_TYPE = undefined;
     var sum_sq: f32 = 0.0;
-    for (0..VEC_SZ) |i| {
+    for (&elems) |*elem| {
         const val = rng.float(f32) * 2.0 - 1.0;
-        v[i] = val;
+        elem.* = val;
         sum_sq += val * val;
     }
+    const v: Vector = elems;
     const norm: Vector = @splat(@sqrt(sum_sq));
     return v / norm;
 }
@@ -96,7 +98,7 @@ fn profileEmbedding(comptime model: EmbeddingModel) !void {
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
 
-    var db = try dve.VectorEngine(model).init(arena.allocator(), tmpD.dir, .{});
+    var db = try dve.VectorEngine(model).init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     var path_buf: [32]u8 = undefined;
@@ -113,9 +115,9 @@ fn profileEmbedding(comptime model: EmbeddingModel) !void {
             if (c == '.' or c == '!' or c == '?') total_sentences += 1;
         }
         const path = std.fmt.bufPrint(&path_buf, "note_{d}", .{i}) catch unreachable;
-        const t0: i128 = std.time.nanoTimestamp();
+        const t0 = std.Io.Timestamp.now(std.testing.io, .awake).toNanoseconds();
         try db.embedText(path, note);
-        const t1: i128 = std.time.nanoTimestamp();
+        const t1 = std.Io.Timestamp.now(std.testing.io, .awake).toNanoseconds();
         embed_ns += @intCast(t1 - t0);
     }
 
@@ -147,9 +149,9 @@ fn profileEmbedding(comptime model: EmbeddingModel) !void {
     for (0..SEARCH_QUERIES) |qi| {
         const query_word = words[rng.intRangeLessThan(usize, 0, words.len)];
         _ = qi;
-        const t0: i128 = std.time.nanoTimestamp();
+        const t0 = std.Io.Timestamp.now(std.testing.io, .awake).toNanoseconds();
         _ = try db.uniqueSearch(query_word, &search_buf);
-        const t1: i128 = std.time.nanoTimestamp();
+        const t1 = std.Io.Timestamp.now(std.testing.io, .awake).toNanoseconds();
         search_ns += @intCast(t1 - t0);
     }
 
@@ -182,7 +184,7 @@ fn profileSearchLargeCorpus(comptime model: EmbeddingModel) !void {
         var tmpD = std.testing.tmpDir(.{ .iterate = true });
         defer tmpD.cleanup();
 
-        var storage = try VecStorage.init(testing_allocator, tmpD.dir, .{ .sz = N });
+        var storage = try VecStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{ .sz = N });
         defer storage.deinit();
 
         // Fill with random unit vectors (no CoreML)
@@ -196,9 +198,9 @@ fn profileSearchLargeCorpus(comptime model: EmbeddingModel) !void {
 
         for (0..SEARCH_QUERIES) |_| {
             const query = randomUnitVector(VEC_SZ, rng);
-            const t0: i128 = std.time.nanoTimestamp();
+            const t0 = std.Io.Timestamp.now(std.testing.io, .awake).toNanoseconds();
             _ = try storage.search(query, &search_buf, 0.5);
-            const t1: i128 = std.time.nanoTimestamp();
+            const t1 = std.Io.Timestamp.now(std.testing.io, .awake).toNanoseconds();
             search_ns += @intCast(t1 - t0);
         }
 

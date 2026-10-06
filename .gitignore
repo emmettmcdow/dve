@@ -13,3 +13,4 @@ wikitest-db*/
 wikidata/
 experiments/beirbench/data/
 __pycache__/
+zig-pkg/

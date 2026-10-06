@@ -3,7 +3,19 @@ const dve = @import("dve");
 const embed = dve.embed;
 
 const LOG_PATH = "/tmp/dve.log";
-var log_fd: ?std.fs.File = null;
+var log_fd: ?std.Io.File = null;
+
+/// The `Io` for what this shim does itself: its lock and its log file. Blocking and without a
+/// thread pool, which is all either needs, and usable before `dve_init` has run.
+const shim_io: std.Io = std.Io.Threaded.global_single_threaded.io();
+
+/// The `Io` the engine runs on, created by `dve_init` and torn down by `dve_deinit`. A C
+/// caller has no `Io` to hand over, so this is where one is chosen. It is a real thread pool
+/// rather than `shim_io` because the engine splits its code scan across threads.
+///
+/// For as long as it is live, std keeps no-op handlers installed for SIGIO and SIGPIPE, and
+/// puts back whatever was there before on `deinit`.
+var engine_threaded: std.Io.Threaded = undefined;
 
 fn logFn(
     comptime message_level: std.log.Level,
@@ -12,12 +24,12 @@ fn logFn(
     args: anytype,
 ) void {
     if (log_fd == null) {
-        log_fd = std.fs.createFileAbsolute(LOG_PATH, .{}) catch return;
+        log_fd = std.Io.Dir.createFileAbsolute(shim_io, LOG_PATH, .{}) catch return;
     }
     var buf: [1024]u8 = undefined;
     const prefix = "[" ++ @tagName(message_level) ++ "] (" ++ @tagName(scope) ++ ") ";
     const msg = std.fmt.bufPrint(&buf, prefix ++ format ++ "\n", args) catch return;
-    _ = log_fd.?.write(msg) catch return;
+    log_fd.?.writeStreamingAll(shim_io, msg) catch return;
 }
 
 pub const std_options: std.Options = .{
@@ -37,8 +49,8 @@ const MpnetVDB = dve.VectorEngine(.mpnet_embedding);
 const ActiveModel = enum { apple_nl, mpnet };
 
 // Global singleton state
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-var mutex = std.Thread.Mutex{};
+var gpa: std.heap.DebugAllocator(.{}) = .init;
+var mutex: std.Io.Mutex = .init;
 var active_model: ActiveModel = undefined;
 var apple_db: ?*AppleVDB = null;
 var mpnet_db: ?*MpnetVDB = null;
@@ -56,48 +68,55 @@ export fn dve_init(
     model_path: [*:0]const u8,
     tokenizer_path: [*:0]const u8,
 ) c_int {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(shim_io);
+    defer mutex.unlock(shim_io);
 
-    if (initialized) return @intFromEnum(CError.DoubleInit);
+    if (initialized) return @backingInt(CError.DoubleInit);
 
     const allocator = gpa.allocator();
     const basedir_slice = std.mem.sliceTo(basedir, 0);
 
-    const dir = std.fs.openDirAbsolute(basedir_slice, .{ .iterate = true }) catch |err| {
+    engine_threaded = .init(allocator, .{});
+    const io = engine_threaded.io();
+    // Undone on every failure below, so a failed init leaves nothing behind.
+    var ok = false;
+    defer if (!ok) engine_threaded.deinit();
+
+    const dir = std.Io.Dir.openDirAbsolute(io, basedir_slice, .{ .iterate = true }) catch |err| {
         std.log.err("dve_init: failed to open basedir '{s}': {}\n", .{ basedir_slice, err });
-        return @intFromEnum(CError.GenericFail);
+        return @backingInt(CError.GenericFail);
     };
 
     // Non-empty model_path → mpnet; empty → Apple NL (no model files required).
     const model_slice = std.mem.sliceTo(model_path, 0);
     if (model_slice.len > 0) {
         const tokenizer_slice = std.mem.sliceTo(tokenizer_path, 0);
-        mpnet_db = MpnetVDB.init(allocator, dir, .{
+        mpnet_db = MpnetVDB.init(allocator, io, dir, .{
             .model_path = model_slice,
             .tokenizer_path = if (tokenizer_slice.len > 0) tokenizer_slice else null,
         }) catch |err| {
             std.log.err("dve_init: failed to init VectorEngine: {}\n", .{err});
-            return @intFromEnum(CError.GenericFail);
+            return @backingInt(CError.GenericFail);
         };
         active_model = .mpnet;
     } else {
-        apple_db = AppleVDB.init(allocator, dir, .{}) catch |err| {
+        apple_db = AppleVDB.init(allocator, io, dir, .{}) catch |err| {
             std.log.err("dve_init: failed to init VectorEngine: {}\n", .{err});
-            return @intFromEnum(CError.GenericFail);
+            return @backingInt(CError.GenericFail);
         };
         active_model = .apple_nl;
     }
 
+    ok = true;
     initialized = true;
-    return @intFromEnum(CError.Success);
+    return @backingInt(CError.Success);
 }
 
 export fn dve_deinit() c_int {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(shim_io);
+    defer mutex.unlock(shim_io);
 
-    if (!initialized) return @intFromEnum(CError.NotInit);
+    if (!initialized) return @backingInt(CError.NotInit);
     switch (active_model) {
         .apple_nl => {
             apple_db.?.deinit();
@@ -108,48 +127,49 @@ export fn dve_deinit() c_int {
             mpnet_db = null;
         },
     }
+    engine_threaded.deinit();
     initialized = false;
-    return @intFromEnum(CError.Success);
+    return @backingInt(CError.Success);
 }
 
 export fn dve_embed(key: [*:0]const u8, content: [*:0]const u8) c_int {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(shim_io);
+    defer mutex.unlock(shim_io);
 
-    if (!initialized) return @intFromEnum(CError.NotInit);
+    if (!initialized) return @backingInt(CError.NotInit);
     const key_s = std.mem.sliceTo(key, 0);
     const content_s = std.mem.sliceTo(content, 0);
     switch (active_model) {
         .apple_nl => apple_db.?.embedText(key_s, content_s) catch |err| {
             std.log.err("dve_embed: {}\n", .{err});
-            return @intFromEnum(CError.GenericFail);
+            return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.embedText(key_s, content_s) catch |err| {
             std.log.err("dve_embed: {}\n", .{err});
-            return @intFromEnum(CError.GenericFail);
+            return @backingInt(CError.GenericFail);
         },
     }
-    return @intFromEnum(CError.Success);
+    return @backingInt(CError.Success);
 }
 
 export fn dve_embed_async(key: [*:0]const u8, content: [*:0]const u8) c_int {
     // No mutex: embedTextAsync enqueues work and returns immediately.
     // The work queue is thread-safe internally.
     // active_model is set before initialized=true, so reading it here is safe.
-    if (!initialized) return @intFromEnum(CError.NotInit);
+    if (!initialized) return @backingInt(CError.NotInit);
     const key_s = std.mem.sliceTo(key, 0);
     const content_s = std.mem.sliceTo(content, 0);
     switch (active_model) {
         .apple_nl => apple_db.?.embedTextAsync(key_s, content_s) catch |err| {
             std.log.err("dve_embed_async: {}\n", .{err});
-            return @intFromEnum(CError.GenericFail);
+            return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.embedTextAsync(key_s, content_s) catch |err| {
             std.log.err("dve_embed_async: {}\n", .{err});
-            return @intFromEnum(CError.GenericFail);
+            return @backingInt(CError.GenericFail);
         },
     }
-    return @intFromEnum(CError.Success);
+    return @backingInt(CError.Success);
 }
 
 export fn dve_search(
@@ -157,27 +177,27 @@ export fn dve_search(
     outbuf: [*c]CDVESearchResult,
     n: u32,
 ) c_int {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(shim_io);
+    defer mutex.unlock(shim_io);
 
-    if (!initialized) return @intFromEnum(CError.NotInit);
+    if (!initialized) return @backingInt(CError.NotInit);
 
     var arena = std.heap.ArenaAllocator.init(gpa.allocator());
     defer arena.deinit();
 
     const query_s = std.mem.sliceTo(query, 0);
     const tmp = arena.allocator().alloc(dve.SearchResult, n) catch {
-        return @intFromEnum(CError.GenericFail);
+        return @backingInt(CError.GenericFail);
     };
 
     const written: usize = switch (active_model) {
         .apple_nl => apple_db.?.search(query_s, tmp) catch |err| {
             std.log.err("dve_search: {}\n", .{err});
-            return @intFromEnum(CError.GenericFail);
+            return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.search(query_s, tmp) catch |err| {
             std.log.err("dve_search: {}\n", .{err});
-            return @intFromEnum(CError.GenericFail);
+            return @backingInt(CError.GenericFail);
         },
     };
 
@@ -188,42 +208,42 @@ export fn dve_search(
 }
 
 export fn dve_remove(key: [*:0]const u8) c_int {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(shim_io);
+    defer mutex.unlock(shim_io);
 
-    if (!initialized) return @intFromEnum(CError.NotInit);
+    if (!initialized) return @backingInt(CError.NotInit);
     const key_s = std.mem.sliceTo(key, 0);
     switch (active_model) {
         .apple_nl => apple_db.?.removePath(key_s) catch |err| {
             std.log.err("dve_remove: {}\n", .{err});
-            return @intFromEnum(CError.GenericFail);
+            return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.removePath(key_s) catch |err| {
             std.log.err("dve_remove: {}\n", .{err});
-            return @intFromEnum(CError.GenericFail);
+            return @backingInt(CError.GenericFail);
         },
     }
-    return @intFromEnum(CError.Success);
+    return @backingInt(CError.Success);
 }
 
 export fn dve_rename(old_key: [*:0]const u8, new_key: [*:0]const u8) c_int {
-    mutex.lock();
-    defer mutex.unlock();
+    mutex.lockUncancelable(shim_io);
+    defer mutex.unlock(shim_io);
 
-    if (!initialized) return @intFromEnum(CError.NotInit);
+    if (!initialized) return @backingInt(CError.NotInit);
     const old_s = std.mem.sliceTo(old_key, 0);
     const new_s = std.mem.sliceTo(new_key, 0);
     switch (active_model) {
         .apple_nl => apple_db.?.renamePath(old_s, new_s) catch |err| {
             std.log.err("dve_rename: {}\n", .{err});
-            return @intFromEnum(CError.GenericFail);
+            return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.renamePath(old_s, new_s) catch |err| {
             std.log.err("dve_rename: {}\n", .{err});
-            return @intFromEnum(CError.GenericFail);
+            return @backingInt(CError.GenericFail);
         },
     }
-    return @intFromEnum(CError.Success);
+    return @backingInt(CError.Success);
 }
 
 // Internal C-compatible result type

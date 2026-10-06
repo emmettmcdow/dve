@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) !void {
         []const u8,
         "llama-path",
         "Path to a built llama.cpp checkout (default: $HOME/llama.cpp)",
-    ) orelse b.pathJoin(&.{ std.posix.getenv("HOME") orelse ".", "llama.cpp" });
+    ) orelse b.pathJoin(&.{ b.graph.environ_map.get("HOME") orelse ".", "llama.cpp" });
     const bench_report = b.option(
         bool,
         "bench-report",
@@ -63,10 +63,7 @@ pub fn build(b: *std.Build) !void {
     const precompiled_model: *Step = if (precompile_model)
         addPrecompiledModelInstall(b, coreml_models)
     else
-        &b.addRemoveDirTree(.{ .cwd_relative = b.getInstallPath(
-            .{ .custom = "share" },
-            "all_mpnet_base_v2.mlmodelc",
-        ) }).step;
+        addRemovePrecompiledModel(b);
 
     ////////////////////
     // Dependencies   //
@@ -75,7 +72,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
-    const tracy_enable = optimize == .Debug;
+    const tracy_enable = optimize == .debug;
     const tracy_dep = b.dependency("tracy", .{
         .target = target,
         .optimize = optimize,
@@ -552,7 +549,7 @@ pub fn build(b: *std.Build) !void {
     {
         const arm_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos });
         const x86_target = b.resolveTargetQuery(.{ .cpu_arch = .x86_64, .os_tag = .macos });
-        const xcfw_optimize: std.builtin.OptimizeMode = .ReleaseFast;
+        const xcfw_optimize: std.lang.Optimize = .fast;
 
         const xcfw_options = b.addOptions();
         xcfw_options.addOption(bool, "debug", false);
@@ -595,7 +592,7 @@ pub fn build(b: *std.Build) !void {
             lib.root_module.addOptions("config", xcfw_options);
             lib.root_module.addImport("objc", objc_dep.module("objc"));
             lib.root_module.addImport("tracy", xcfw_tracy.module("tracy"));
-            lib.root_module.addImport("dve", b.addModule("dve_xcfw", .{
+            lib.root_module.addImport("dve", b.createModule(.{
                 .root_source_file = b.path("src/root.zig"),
                 .imports = &.{
                     .{ .name = "config", .module = xcfw_options.createModule() },
@@ -730,13 +727,23 @@ fn addPrecompiledModelInstall(b: *std.Build, coreml_models: *std.Build.Dependenc
     compile.addDirectoryArg(coreml_models.path("all_mpnet_base_v2/all_mpnet_base_v2.mlpackage"));
     const out = compile.addOutputDirectoryArg("mlmodelc");
     // coremlcompiler reports the output path on stdout; capturing it keeps it quiet.
-    _ = compile.captureStdOut();
+    _ = compile.captureStdOut(.{});
     const install = b.addInstallDirectory(.{
         .source_dir = out.path(b, "all_mpnet_base_v2.mlmodelc"),
         .install_dir = .{ .custom = "share" },
         .install_subdir = "all_mpnet_base_v2.mlmodelc",
     });
     return &install.step;
+}
+
+/// Removes any precompiled model an earlier build installed. The build system has no step
+/// for deleting a directory any more, so this shells out.
+fn addRemovePrecompiledModel(b: *std.Build) *Step {
+    const rm = b.addSystemCommand(&.{ "rm", "-rf" });
+    rm.addDirectoryArg2(b.graph.path(.install_prefix, "share/all_mpnet_base_v2.mlmodelc"), .{});
+    rm.setName("remove all_mpnet_base_v2.mlmodelc");
+    rm.has_side_effects = true;
+    return &rm.step;
 }
 
 /// src/llama_bridge.c as a static library of its own, linked against a prebuilt
@@ -749,7 +756,7 @@ fn addPrecompiledModelInstall(b: *std.Build, coreml_models: *std.Build.Dependenc
 fn llamaBridgeLib(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.Optimize,
     llama_root: []const u8,
 ) LlamaBridge {
     const lib_dir = b.pathJoin(&.{ llama_root, "build", "bin" });

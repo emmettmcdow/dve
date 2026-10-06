@@ -303,8 +303,8 @@ pub const File = struct {
     }
 };
 
-/// `File.sync` for a descriptor this module does not own, so a caller holding a `std.fs.File`
-/// or a `std.fs.Dir` can get the same durability without handing over the fd's lifetime.
+/// `File.sync` for a descriptor this module does not own, so a caller holding a `std.Io.File`
+/// or a `std.Io.Dir` can get the same durability without handing over the fd's lifetime.
 ///
 /// Directories are the reason this is public. A rename is only as durable as the directory
 /// that records it: the renamed file's own `sync` says nothing about whether the new name
@@ -341,8 +341,8 @@ const tmpDir = std.testing.tmpDir;
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 
-fn openTmp(dir: std.fs.Dir, name: []const u8, opts: File.Opts) !File {
-    return File.openAt(@intCast(dir.fd), name, opts);
+fn openTmp(dir: std.Io.Dir, name: []const u8, opts: File.Opts) !File {
+    return File.openAt(@intCast(dir.handle), name, opts);
 }
 
 test "create, write, read back" {
@@ -498,8 +498,8 @@ test "truncate opens an existing file at zero length" {
 test "an over-long path is rejected before it reaches libc" {
     var tmpD = tmpDir(.{});
     defer tmpD.cleanup();
-    const long = "x" ** 5000;
-    try std.testing.expectError(error.NameTooLong, openTmp(tmpD.dir, long, .{}));
+    const long: [5000]u8 = @splat('x');
+    try std.testing.expectError(error.NameTooLong, openTmp(tmpD.dir, &long, .{}));
 }
 
 test "a large transfer completes in full" {

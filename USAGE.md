@@ -2,7 +2,7 @@
 The main interface for this library is defined in [vector.zig](src/vector.zig).
 
 ## Requirements
-- Zig 0.15.1
+- Zig 0.17.0
 - `curl`, only if `installModels` fetches the llama model
 
 ## Install
@@ -30,14 +30,16 @@ exe.root_module.addImport("dve", dve_module);
 ```zig
 const dve = @import("dve");
 
+// `io` is your program's `std.Io`, e.g. `init.io` in `pub fn main(init: std.process.Init)`.
+// The engine keeps it for every file operation and lock, on both of its threads.
 // Open a directory to store the vector database.
-const dir = try std.fs.cwd().makeOpenPath("my_vectors", .{});
+const dir = try std.Io.Dir.cwd().createDirPathOpen(io, "my_vectors", .{});
 
 // Name the model you want; see "Model selection" above.
 const VectorEngine = dve.VectorEngine(.mpnet_embedding);
 // Model files can be changed from their defaults using:
-//    VectorEngine.init(..., ..., .{ .model_path = "...", .tokenizer_path = "..." });
-const vectors = try VectorEngine.init(allocator, dir, .{});
+//    VectorEngine.init(..., ..., ..., .{ .model_path = "...", .tokenizer_path = "..." });
+const vectors = try VectorEngine.init(allocator, io, dir, .{});
 defer vectors.deinit();
 
 // Embed text. The key identifies the entry (typically a file path).
@@ -78,7 +80,7 @@ If you are not building with Zig, or want the files somewhere else, each model b
 passed to `init`:
 
 ```zig
-const vectors = try VectorEngine.init(allocator, dir, .{ .model_path = "path/to/model" });
+const vectors = try VectorEngine.init(allocator, io, dir, .{ .model_path = "path/to/model" });
 ```
 
 If a model file is not found, `init` fails with `error.ModelNotFound` and logs where it looked
@@ -95,7 +97,7 @@ and the command to fetch it.
 Fallback download, which unpacks both files into `./all_mpnet_base_v2/`:
 
 ```sh
-URL=https://github.com/emmettmcdow/dve/releases/download/coreml-models-v6/coreml_models_v6.tar.gz
+URL=https://github.com/emmettmcdow/dve/releases/download/coreml-models-v7/coreml_models_v7.tar.gz
 curl -L "$URL" | tar -xz all_mpnet_base_v2
 ```
 

@@ -38,7 +38,7 @@ pub const InitOptions = struct {
     /// `codes.zig` is an insertion sort, so it is quadratic in K: a pure in-memory scan is
     /// 10 ms at K=500 and 150 ms at K=4,000. The disk reads are the smaller half.
     candidates: usize = 500,
-    /// Threads for the code scan. Null lets the pool size itself. Four saturate memory
+    /// Threads for the code scan. Null is the CPU count. Four saturate memory
     /// bandwidth on the machine this was measured on; see `experiments/results/hamscan.md`.
     scan_threads: ?usize = null,
 };
@@ -113,12 +113,13 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         /// How many candidates stage one produces per query.
         candidates: usize,
         note_id_map: *NoteIdMap,
-        basedir: std.fs.Dir,
+        basedir: std.Io.Dir,
         allocator: std.mem.Allocator,
+        io: std.Io,
         work_queue: *WorkQueue,
         work_queue_thread: Thread,
-        work_queue_mutex: Thread.Mutex = .{},
-        work_queue_condition: Thread.Condition = .{},
+        work_queue_mutex: std.Io.Mutex = .init,
+        work_queue_condition: std.Io.Condition = .init,
         work_queue_running: bool,
 
         /// **`allocator` must be thread-safe.** The engine runs a background embedding thread
@@ -128,22 +129,27 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         /// fine; an `ArenaAllocator` is not, and passing one corrupts its free list under
         /// concurrent use rather than failing cleanly. This was implicit for as long as the
         /// work queue has existed and is written down because the tests got it wrong.
+        ///
+        /// `io` is kept for the life of the engine and used from both threads, for every file
+        /// operation and every lock. The code scan also hands its shards to it, so an `io`
+        /// that cannot run tasks concurrently scans on the calling thread alone.
         pub fn init(
             allocator: std.mem.Allocator,
-            basedir: std.fs.Dir,
+            io: std.Io,
+            basedir: std.Io.Dir,
             opts: InitOptions,
         ) !*Self {
             const base_embedder = o: switch (embedding_model) {
                 .apple_nlembedding => {
                     var e = try allocator.create(NLEmbedder);
                     errdefer allocator.destroy(e);
-                    try e.init_self();
+                    try e.init_self(io);
                     break :o BaseEmbedder{ .apple_nlembedding = e };
                 },
                 .mpnet_embedding => {
                     var e = try allocator.create(MpnetEmbedder);
                     errdefer allocator.destroy(e);
-                    try e.init_self(.{
+                    try e.init_self(io, .{
                         .model_path = opts.model_path,
                         .tokenizer_path = opts.tokenizer_path,
                     });
@@ -152,7 +158,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 .llama_nomic_embed_text_v1_5_f32 => {
                     const e = try allocator.create(LlamaNomicEmbedTextV15F32);
                     errdefer allocator.destroy(e);
-                    try e.init_self(.{ .model_path = opts.model_path });
+                    try e.init_self(io, .{ .model_path = opts.model_path });
                     break :o BaseEmbedder{ .llama_nomic_embed_text_v1_5_f32 = e };
                 },
             };
@@ -162,7 +168,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 .llama_nomic_embed_text_v1_5_f32 => base_embedder.llama_nomic_embed_text_v1_5_f32.embedder(),
             };
 
-            var vecs = try VecStorage.init(allocator, basedir, .{ .path = embedder.path });
+            var vecs = try VecStorage.init(allocator, io, basedir, .{ .path = embedder.path });
             errdefer vecs.deinit();
 
             // Loaded if a usable file is sitting there, rebuilt from the store if not.
@@ -171,7 +177,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             // sequential read at every launch against ~0.3 s to read the codes back.
             const note_id_map = try allocator.create(NoteIdMap);
             errdefer allocator.destroy(note_id_map);
-            note_id_map.* = try NoteIdMap.init(allocator, basedir);
+            note_id_map.* = try NoteIdMap.init(allocator, io, basedir);
             errdefer note_id_map.deinit();
 
             var codes_name_buf: [256]u8 = undefined;
@@ -179,12 +185,13 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             var rebuilt = false;
             var vcodes = (try VecCodes.load(
                 allocator,
+                io,
                 basedir,
                 codes_name,
                 stampOf(&vecs),
                 .{ .threads = opts.scan_threads },
             )) orelse blk: {
-                var c = try VecCodes.init(allocator, .{
+                var c = try VecCodes.init(allocator, io, .{
                     .capacity = vecs.slot_n,
                     .threads = opts.scan_threads,
                 });
@@ -203,7 +210,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 try reconcile(allocator, &vecs, &vcodes, note_id_map);
             }
 
-            const wq = try WorkQueue.init(allocator, 1024);
+            const wq = try WorkQueue.init(allocator, io, 1024);
 
             const self = try allocator.create(Self);
             self.* = .{
@@ -215,6 +222,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 .note_id_map = note_id_map,
                 .basedir = basedir,
                 .allocator = allocator,
+                .io = io,
                 .work_queue = wq,
                 .work_queue_thread = undefined,
                 .work_queue_running = true,
@@ -255,11 +263,11 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         /// Stops the background work queue from running without de-initializing memory.
         pub fn shutdown(self: *Self) void {
             {
-                self.work_queue_mutex.lock();
-                defer self.work_queue_mutex.unlock();
+                self.work_queue_mutex.lockUncancelable(self.io);
+                defer self.work_queue_mutex.unlock(self.io);
                 self.work_queue_running = false;
             }
-            self.work_queue_condition.signal();
+            self.work_queue_condition.signal(self.io);
             self.work_queue_thread.join();
         }
 
@@ -352,8 +360,8 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         fn census(allocator: std.mem.Allocator, store: *VecStorage, map: *NoteIdMap) !Census {
             var out = Census{
                 .allocator = allocator,
-                .orphans = .{},
-                .hollow = .{},
+                .orphans = .empty,
+                .hollow = .empty,
                 .max_doc_id = 0,
             };
             errdefer out.deinit();
@@ -421,7 +429,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             defer allocator.free(cands);
             const n_cand = try self.codes.search(query, cands);
 
-            var out: std.ArrayList(Scored) = .{};
+            var out: std.ArrayList(Scored) = .empty;
             errdefer out.deinit(allocator);
             try out.ensureTotalCapacity(allocator, @min(want, n_cand));
 
@@ -585,18 +593,18 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             var n_embedded: usize = 0;
             const unflushed_limit = 100;
             while (true) {
-                self.work_queue_mutex.lock();
+                self.work_queue_mutex.lockUncancelable(self.io);
                 const job = while (true) {
                     if (self.work_queue.pop()) |j| {
-                        self.work_queue_mutex.unlock();
+                        self.work_queue_mutex.unlock(self.io);
                         break j;
                     }
                     if (!self.work_queue_running) {
-                        self.work_queue_mutex.unlock();
+                        self.work_queue_mutex.unlock(self.io);
                         try self.save();
                         return;
                     }
-                    self.work_queue_condition.wait(&self.work_queue_mutex);
+                    self.work_queue_condition.waitUncancelable(self.io, &self.work_queue_mutex);
                 };
                 defer self.allocator.free(job.contents);
                 defer self.allocator.free(job.path);
@@ -639,8 +647,8 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             assert(contents.len < MAX_NOTE_LEN);
 
             // Filter first, then embed every surviving sentence in one batch.
-            var sentences: std.ArrayList(embed.Chunk) = .{};
-            var sentence_strs: std.ArrayList([]const u8) = .{};
+            var sentences: std.ArrayList(embed.Chunk) = .empty;
+            var sentence_strs: std.ArrayList([]const u8) = .empty;
             var spliterator = embed.SentenceSpliterator.init(contents);
             while (spliterator.next()) |sentence| {
                 if (whitespaceOnly(sentence.contents) or !wordlike(sentence.contents)) continue;
@@ -649,7 +657,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             }
             const outputs = try self.embedder.embedBatch(allocator, sentence_strs.items);
 
-            var embedded_sentence_list: std.ArrayList(EmbeddedSentence) = .{};
+            var embedded_sentence_list: std.ArrayList(EmbeddedSentence) = .empty;
             errdefer embedded_sentence_list.deinit(allocator);
             for (sentences.items, outputs) |sentence, output| {
                 if (output) |v| {
@@ -725,8 +733,8 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             // The push and the signal both have to happen under work_queue_mutex. The
             // consumer holds that mutex from the pop that comes up empty until it waits on
             // the condition, so a push that lands in between would not wake it.
-            self.work_queue_mutex.lock();
-            defer self.work_queue_mutex.unlock();
+            self.work_queue_mutex.lockUncancelable(self.io);
+            defer self.work_queue_mutex.unlock(self.io);
             if (!self.work_queue_running) return Error.NotQueuedShuttingDown;
 
             // Re-queuing a path replaces the job still sitting in the queue. That job's
@@ -739,7 +747,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 self.allocator.free(old.path);
                 self.allocator.free(old.contents);
             }
-            self.work_queue_condition.signal();
+            self.work_queue_condition.signal(self.io);
         }
 
         /// `may_have_old` is false when the caller knows `note_id` was minted for this call,
@@ -889,7 +897,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         /// layout: a vector is keyed by note id and carries no path at all, so a root that moves
         /// costs one rewrite of the id manifest. Nothing here re-reads or re-embeds a note.
         pub fn reroot(self: *Self, move: note_id_map_mod.Reroot) !usize {
-            var dropped: std.ArrayList(NoteID) = .{};
+            var dropped: std.ArrayList(NoteID) = .empty;
             defer dropped.deinit(self.allocator);
 
             try self.note_id_map.reroot(move, &dropped);
@@ -919,7 +927,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         /// a manifest that disagrees with the store -- `reconcile` is, at open, and
         /// `validate` is what reports it. This is for documents the user deleted out from
         /// under us.
-        pub fn pruneOrphanedPaths(self: *Self, basedir: std.fs.Dir) !void {
+        pub fn pruneOrphanedPaths(self: *Self, basedir: std.Io.Dir) !void {
             try self.note_id_map.pruneOrphanedPaths(basedir);
         }
 
@@ -1068,7 +1076,7 @@ fn getVectorsForPath(db: *TestVecDB, path: []const u8, buf: []TestVector) !usize
 test "embedText hello" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1088,7 +1096,7 @@ test "embedText hello" {
 test "embedText skip empties" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1101,7 +1109,7 @@ test "embedText skip empties" {
 test "embedText clear previous" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1118,14 +1126,15 @@ test "embedText clear previous" {
 test "embedText re-embedding a document reuses its slots" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     // `replaceVectors` removes the old rows before putting the new ones, so every re-embed
     // refills the slots it just freed and the high-water mark never moves. Putting first would
     // hold both generations live at once, settling at two slots per sentence forever.
     const sentences = 20;
-    const text = "pizza. " ** sentences;
+    const repeated: [sentences][7]u8 = @splat("pizza. ".*);
+    const text: []const u8 = @ptrCast(&repeated);
     const path = "test.md";
 
     try db.embedText(path, text);
@@ -1143,7 +1152,7 @@ test "embedText re-embedding a document reuses its slots" {
 test "search" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1163,7 +1172,7 @@ test "search" {
 test "search mpnet" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try VectorEngine(.mpnet_embedding).init(testing_allocator, tmpD.dir, .{});
+    var db = try VectorEngine(.mpnet_embedding).init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1192,28 +1201,29 @@ test "init opts model paths" {
     // Under test the default model files live in <cwd>/zig-out/share. The build installs a
     // compiled copy of the model there too, and naming that one keeps this test off the
     // slow load of the package -- an explicit path is used as given, never swapped.
-    const cwd = try std.fs.cwd().realpathAlloc(alloc, ".");
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(std.testing.io, ".", alloc);
     const compiled_path = try std.fmt.allocPrint(
         alloc,
         "{s}/zig-out/share/{s}",
         .{ cwd, MpnetEmbedder.BUNDLE_MODEL_PATH },
     );
-    const model_path = if (std.fs.accessAbsolute(compiled_path, .{}))
+    const model_path = if (std.Io.Dir.accessAbsolute(std.testing.io, compiled_path, .{}))
         compiled_path
     else |_|
         try std.fmt.allocPrint(alloc, "{s}/zig-out/{s}", .{ cwd, MpnetEmbedder.MODEL_PATH });
 
     // A copy of the tokenizer somewhere the default resolution would never look, so the
     // assertion below fails if opts is dropped on the way to the embedder.
-    try std.fs.cwd().copyFile(
+    try std.Io.Dir.cwd().copyFile(
         try std.fmt.allocPrint(alloc, "{s}/zig-out/{s}", .{ cwd, MpnetEmbedder.TOKENIZER_PATH }),
         tmpD.dir,
         "custom_tokenizer.json",
+        std.testing.io,
         .{},
     );
-    const tokenizer_path = try tmpD.dir.realpathAlloc(alloc, "custom_tokenizer.json");
+    const tokenizer_path = try tmpD.dir.realPathFileAlloc(std.testing.io, "custom_tokenizer.json", alloc);
 
-    var db = try VectorEngine(.mpnet_embedding).init(alloc, tmpD.dir, .{
+    var db = try VectorEngine(.mpnet_embedding).init(alloc, std.testing.io, tmpD.dir, .{
         .model_path = model_path,
         .tokenizer_path = tokenizer_path,
     });
@@ -1234,7 +1244,7 @@ test "init opts model paths" {
 test "uniqueSearch" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1252,7 +1262,7 @@ test "uniqueSearch" {
 test "search returns results with similarity" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1280,7 +1290,7 @@ test "search returns results with similarity" {
 test "uniqueSearch returns results with similarity" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path1 = "test1.md";
@@ -1337,7 +1347,7 @@ test "rawVectorSearch hello" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1359,7 +1369,7 @@ test "rawVectorSearch matches search" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1385,7 +1395,7 @@ test "rawVectorSearch returns results with similarity" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1412,7 +1422,7 @@ test "rawVectorSearch returns results with similarity" {
 test "rawVectorSearch no matches" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     try db.embedText("test.md", "pizza");
@@ -1430,7 +1440,7 @@ test "rawVectorSearch empty database" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const query = try rawQueryVec(.apple_nlembedding, &db.embedder, arena.allocator(), "pizza");
@@ -1443,7 +1453,7 @@ test "rawVectorSearch cap results" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     for (0..5) |i| {
@@ -1464,7 +1474,7 @@ test "rawVectorSearch skips removed paths" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1483,7 +1493,7 @@ test "rawVectorSearch skips removed paths" {
 test "rawVectorSearch mpnet" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try VectorEngine(.mpnet_embedding).init(testing_allocator, tmpD.dir, .{});
+    var db = try VectorEngine(.mpnet_embedding).init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     // Scratch for the query vector only. The engine gets `testing_allocator`, because it
@@ -1509,7 +1519,7 @@ test "rawVectorSearch mpnet" {
 test "embed chunk cleanup" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     // Make the threshold strict, results should be exact matches.
@@ -1561,7 +1571,7 @@ fn expectEqualCase(a: anytype, b: anytype, case: []const u8) !void {
 test "search cap results" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     for (0..150) |i| {
@@ -1576,7 +1586,7 @@ test "search cap results" {
 test "search strip queries" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     var results: [1]SearchResult = undefined;
@@ -1605,14 +1615,14 @@ fn expectSearchResultsIgnoresimilarity(expected: []const SearchResult, actual: [
 
 pub fn testEmbedder(allocator: std.mem.Allocator) !struct { e: *NLEmbedder, iface: embed.Embedder } {
     const e = try allocator.create(NLEmbedder);
-    e.* = try NLEmbedder.init();
+    e.* = try NLEmbedder.init(std.testing.io);
     return .{ .e = e, .iface = e.embedder() };
 }
 
 test "embedText same input same result" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1632,7 +1642,7 @@ test "embedText same input same result" {
 test "embedText different input different result" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1653,7 +1663,7 @@ test "embedText different input different result" {
 test "embedText updates only changed sentences" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1681,7 +1691,7 @@ test "embedText updates only changed sentences" {
 test "embedText handle multiple remove gracefully" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1697,20 +1707,20 @@ test "embedText handle multiple remove gracefully" {
 test "populateHighlights" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     {
         const query = "hello";
         const contents = "bah hello";
-        var highlights: [10]usize = .{0} ** 10;
+        var highlights: [10]usize = @splat(0);
         try db.populateHighlights(query, contents, &highlights);
         try expectEqualSlices(usize, &[10]usize{ 4, 9, 0, 0, 0, 0, 0, 0, 0, 0 }, &highlights);
     }
     { // Multiple hits
         const query = "hello";
         const contents = "hello; hello ";
-        var highlights: [10]usize = .{0} ** 10;
+        var highlights: [10]usize = @splat(0);
         try db.populateHighlights(query, contents, &highlights);
         try expectEqualSlices(usize, &[10]usize{ 0, 5, 7, 12, 0, 0, 0, 0, 0, 0 }, &highlights);
     }
@@ -1721,7 +1731,7 @@ test "populateHighlights" {
 test "embed skip low-value" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try VectorEngine(.mpnet_embedding).init(testing_allocator, tmpD.dir, .{});
+    var db = try VectorEngine(.mpnet_embedding).init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
     db.embedder.threshold = 0;
 
@@ -1763,7 +1773,7 @@ test "embed skip low-value" {
 test "embedTextAsync" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path1 = "test1.md";
@@ -1778,11 +1788,12 @@ test "embedTextAsync" {
     // soon as all three jobs have landed rather than sleeping the whole allowance.
     var buffer: [10]SearchResult = undefined;
     var found: usize = 0;
-    var timer = try std.time.Timer.start();
-    while (timer.read() < 2 * std.time.ns_per_s) {
+    const io = std.testing.io;
+    const start = std.Io.Timestamp.now(io, .awake);
+    while (start.untilNow(io, .awake).toSeconds() < 2) {
         found = try db.search("pizza", &buffer);
         if (found == 3) break;
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        try io.sleep(.fromMilliseconds(5), .awake);
     }
     try expectEqual(3, found);
 
@@ -1792,7 +1803,7 @@ test "embedTextAsync" {
 test "embedTextAsync drains queue on shutdown" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const N = 60;
@@ -1817,7 +1828,7 @@ test "embedTextAsync drains queue on shutdown" {
 test "embedTextAsync frees jobs it replaces in the queue" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const N = 60;
@@ -1849,7 +1860,7 @@ test "embedTextAsync frees jobs it replaces in the queue" {
 test "embedTextAsync rejects after shutdown" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1868,13 +1879,13 @@ const Reopened = struct {
     db: *TestVecDB,
     embedder: *NLEmbedder,
 
-    fn open(dir: std.fs.Dir) !*Reopened {
+    fn open(dir: std.Io.Dir) !*Reopened {
         const self = try testing_allocator.create(Reopened);
         errdefer testing_allocator.destroy(self);
         const te = try testEmbedder(testing_allocator);
         errdefer testing_allocator.destroy(te.e);
         self.embedder = te.e;
-        self.db = try TestVecDB.init(testing_allocator, dir, .{});
+        self.db = try TestVecDB.init(testing_allocator, std.testing.io, dir, .{});
         return self;
     }
 
@@ -1895,7 +1906,7 @@ fn expectSearchResultsUnordered(expected: []const SearchResult, actual: []const 
         );
         return error.TestExpectedEqual;
     }
-    var matched: [128]bool = .{false} ** 128;
+    var matched: [128]bool = @splat(false);
     assert(actual.len <= matched.len);
     outer: for (expected) |e| {
         for (actual, 0..) |a, i| {
@@ -1916,7 +1927,7 @@ fn expectSearchResultsUnordered(expected: []const SearchResult, actual: []const 
 test "embedText persists to disk" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1940,7 +1951,7 @@ test "embedText persists to disk" {
 test "embedText persists multiple sentences and paths to disk" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     try db.embedText("test1.md", "pizza. pizza. pizza.");
@@ -1965,7 +1976,7 @@ test "embedText persists multiple sentences and paths to disk" {
 test "embedText persists removals to disk" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -1990,7 +2001,7 @@ test "embedText persists removals to disk" {
 test "embedTextAsync persists to disk after shutdown" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const path = "test.md";
@@ -2016,7 +2027,7 @@ test "embedTextAsync persists to disk after shutdown" {
 test "embedTextAsync persists every queued job after shutdown" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     const N = 10;
@@ -2048,7 +2059,7 @@ test "embedTextAsync persists every queued job after shutdown" {
 test "empty inputs" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     var res: [1]SearchResult = undefined;
@@ -2124,7 +2135,7 @@ const codes = @import("codes.zig");
 test "the code index stays in step with the store across re-embeds and removals" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     // Two documents, re-embedded with different content, then one removed. Every one of those
@@ -2167,7 +2178,7 @@ test "the index is rebuilt on reopen and finds what it found before" {
     var before: [4]SearchResult = undefined;
     var n_before: usize = 0;
     {
-        var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+        var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
         defer db.deinit();
         try db.embedText("a.md", text);
         n_before = try db.search("trains are fast", &before);
@@ -2177,7 +2188,7 @@ test "the index is rebuilt on reopen and finds what it found before" {
     }
 
     // Nothing persists the codes yet, so this exercises the rebuild path in `init`.
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
     try db.validate();
     try expectEqual(db.vec_storage.len(), db.codes.len());
@@ -2198,7 +2209,7 @@ test "the code index is saved on close and loaded on reopen" {
 
     const text = "pizza is delicious. trains are fast. the sky is blue. cats sleep often.";
     {
-        var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+        var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
         defer db.deinit();
         try db.embedText("a.md", text);
     }
@@ -2206,15 +2217,15 @@ test "the code index is saved on close and loaded on reopen" {
     // The file exists only because deinit wrote it, and it is named after the database.
     var name_buf: [256]u8 = undefined;
     const name = try codesPath(&name_buf, TestVecDB.embedderPathForTest());
-    try tmpD.dir.access(name, .{});
+    try tmpD.dir.access(std.testing.io, name, .{});
 
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
     try db.validate();
     try expectEqual(db.vec_storage.len(), db.codes.len());
 
     // Loading consumed the file: an index on disk is only valid while no process holds it.
-    try std.testing.expectError(error.FileNotFound, tmpD.dir.access(name, .{}));
+    try std.testing.expectError(error.FileNotFound, tmpD.dir.access(std.testing.io, name, .{}));
 
     var buf: [4]SearchResult = undefined;
     try std.testing.expect(try db.search("trains are fast", &buf) > 0);
@@ -2230,23 +2241,23 @@ test "a stale index is rejected rather than trusted" {
     const name = try codesPath(&name_buf, TestVecDB.embedderPathForTest());
 
     {
-        var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+        var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
         defer db.deinit();
         try db.embedText("a.md", "pizza is delicious.");
     }
     // An index written for a one-document store.
-    try tmpD.dir.access(name, .{});
-    const stale = try tmpD.dir.readFileAlloc(arena.allocator(), name, 1 << 24);
+    try tmpD.dir.access(std.testing.io, name, .{});
+    const stale = try tmpD.dir.readFileAlloc(std.testing.io, name, arena.allocator(), .limited(1 << 24));
 
     {
-        var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+        var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
         defer db.deinit();
         try db.embedText("b.md", "trains are fast. the sky is blue.");
     }
     // Put the one-document index back over the two-document one.
-    try tmpD.dir.writeFile(.{ .sub_path = name, .data = stale });
+    try tmpD.dir.writeFile(std.testing.io, .{ .sub_path = name, .data = stale });
 
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
     // Rejected on the stamp, so the index was rebuilt and covers both documents.
     try db.validate();
@@ -2268,7 +2279,7 @@ test "a missing index is rebuilt, and answers the same as a loaded one" {
     const text = "pizza is delicious. trains are fast. the sky is blue. cats sleep often.";
 
     {
-        var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+        var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
         defer db.deinit();
         try db.embedText("a.md", text);
     }
@@ -2276,7 +2287,7 @@ test "a missing index is rebuilt, and answers the same as a loaded one" {
     var loaded_buf: [4]SearchResult = undefined;
     var n_loaded: usize = 0;
     {
-        var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+        var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
         defer db.deinit();
         n_loaded = try db.search("trains are fast", &loaded_buf);
         for (loaded_buf[0..n_loaded]) |*r| r.path = try arena.allocator().dupe(u8, r.path);
@@ -2284,9 +2295,9 @@ test "a missing index is rebuilt, and answers the same as a loaded one" {
 
     // That reopen consumed the index, and this deinit wrote a fresh one -- delete it so the
     // next open takes the rebuild path instead.
-    tmpD.dir.deleteFile(name) catch {};
+    tmpD.dir.deleteFile(std.testing.io, name) catch {};
 
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
     var rebuilt: [4]SearchResult = undefined;
     const n_rebuilt = try db.search("trains are fast", &rebuilt);
@@ -2330,16 +2341,16 @@ test "tear: a lost manifest does not let a new document inherit old vectors" {
     defer tmpD.cleanup();
 
     {
-        var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+        var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
         defer db.deinit();
         try db.embedText("old.md", "the kangaroo hops across the outback");
     }
 
     // A clean shutdown, and then the manifest goes missing: a restored backup, a botched
     // sync, a stray rm. The store still holds old.md's vectors under doc_id 1.
-    try tmpD.dir.deleteFile(note_id_map_mod.MANIFEST_FILENAME);
+    try tmpD.dir.deleteFile(std.testing.io, note_id_map_mod.MANIFEST_FILENAME);
 
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
     try db.embedText("new.md", "a completely unrelated sentence about tax law");
 
@@ -2367,22 +2378,22 @@ test "tear: a rolled back manifest does not let a new document inherit old vecto
     const stale = "stale-manifest";
 
     {
-        var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+        var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
         defer db.deinit();
         try db.embedText("first.md", "penguins huddle together for warmth");
         // The manifest as it stood when only first.md existed: next_id is 2 here.
-        try tmpD.dir.copyFile(manifest, tmpD.dir, stale, .{});
+        try tmpD.dir.copyFile(manifest, tmpD.dir, stale, std.testing.io, .{});
         try db.embedText("second.md", "the printing press changed europe");
     }
 
     // Power loss: the manifest's rename never reached the disk, so it reverts to the copy
     // above, while second.md's rows survive in the store. The code index is gone too,
     // because `saveIndex` only runs from a clean `deinit` -- the two always travel together.
-    try tmpD.dir.copyFile(stale, tmpD.dir, manifest, .{});
+    try tmpD.dir.copyFile(stale, tmpD.dir, manifest, std.testing.io, .{});
     var codes_buf: [256]u8 = undefined;
-    tmpD.dir.deleteFile(try testCodesName(&codes_buf)) catch {};
+    tmpD.dir.deleteFile(std.testing.io, try testCodesName(&codes_buf)) catch {};
 
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
     try db.embedText("third.md", "sourdough needs a starter culture");
 
@@ -2403,7 +2414,7 @@ test "tear: a rolled back manifest does not let a new document inherit old vecto
 test "tear: rows whose doc_id names nothing are invisible" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     try db.embedText("gone.md", "the lighthouse keeper polished the lens");
@@ -2426,7 +2437,7 @@ test "tear: a path with no vectors does not survive an open" {
     defer tmpD.cleanup();
 
     {
-        var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+        var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
         defer db.deinit();
         try db.embedText("hollow.md", "mountains are tall");
         try db.embedText("solid.md", "rivers run downhill");
@@ -2441,9 +2452,9 @@ test "tear: a path with no vectors does not survive an open" {
     }
 
     var codes_buf: [256]u8 = undefined;
-    tmpD.dir.deleteFile(try testCodesName(&codes_buf)) catch {};
+    tmpD.dir.deleteFile(std.testing.io, try testCodesName(&codes_buf)) catch {};
 
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     // The document is not indexed, so it must not claim to be: leaving the name behind makes
@@ -2456,7 +2467,7 @@ test "tear: a path with no vectors does not survive an open" {
 test "tear: validate reports a manifest that disagrees with the store" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     try db.embedText("a.md", "the tide comes in twice a day");
@@ -2472,7 +2483,7 @@ test "tear: validate reports a manifest that disagrees with the store" {
 test "tear: validate reports a next_id that trails the store" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     try db.embedText("a.md", "copper conducts electricity");
@@ -2488,7 +2499,7 @@ test "tear: validate reports a next_id that trails the store" {
 test "a document with nothing embeddable gets no path" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     try db.embedText("blank.md", " \n\t ");
@@ -2507,7 +2518,7 @@ test "a document with nothing embeddable gets no path" {
 test "a path created for a write that fails does not outlive it" {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var db = try TestVecDB.init(testing_allocator, tmpD.dir, .{});
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     try db.embedText("kept.md", "owls hunt at night");
@@ -2526,7 +2537,7 @@ test "reroot re-expresses paths without re-embedding" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    var db = try TestVecDB.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     try db.embedText("one.md", "hello");
@@ -2555,7 +2566,7 @@ test "reroot drops the notes the new root no longer contains" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    var db = try TestVecDB.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     try db.embedText("md-src/kept.md", "hello");
@@ -2578,7 +2589,7 @@ test "search counts only the results it wrote" {
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
     defer arena.deinit();
-    var db = try TestVecDB.init(arena.allocator(), tmpD.dir, .{});
+    var db = try TestVecDB.init(arena.allocator(), std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
     try db.embedText("gone.md", "hello");

@@ -276,12 +276,13 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         };
 
         allocator: std.mem.Allocator,
-        dir: std.fs.Dir,
+        io: std.Io,
+        dir: std.Io.Dir,
         file: pfile.File,
         /// Held across every public method. Callers store a VStore by value, so it is copied
         /// once out of `init` -- before any thread can contend for it -- and must not be
         /// copied again afterwards.
-        mutex: std.Thread.Mutex = .{},
+        mutex: std.Io.Mutex = .init,
         /// Live vectors. Derived at open, maintained thereafter.
         vec_n: usize = 0,
         /// High-water mark: slots ever allocated, live or not. Only grows, because it is what
@@ -296,7 +297,7 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         /// corpus -- but the worst case is not small: deleting half a 20M-vector store costs
         /// ~80 MB. See "Coalescing the free list" in `vec_storage2.md` for the extent-based
         /// version and the reason it is not a drop-in.
-        free: std.ArrayList(VectorID) = .{},
+        free: std.ArrayList(VectorID) = .empty,
         /// Chunks the file is currently sized for. Only `put` grows the file, so the store
         /// already knows this; tracking it keeps `put` off `lseek`, which it was calling on
         /// every single insert to ask a question it could answer itself.
@@ -371,11 +372,11 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         }
 
         // ************************************************************************* Lifecycle
-        pub fn init(allocator: std.mem.Allocator, dir: std.fs.Dir, opts: Opts) !Self {
-            const file = try pfile.File.openAt(@intCast(dir.fd), opts.path, .{});
+        pub fn init(allocator: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, opts: Opts) !Self {
+            const file = try pfile.File.openAt(@intCast(dir.handle), opts.path, .{});
             errdefer file.close();
 
-            var self = Self{ .allocator = allocator, .dir = dir, .file = file };
+            var self = Self{ .allocator = allocator, .io = io, .dir = dir, .file = file };
             errdefer self.free.deinit(allocator);
 
             const size = try file.size();
@@ -394,9 +395,9 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         }
 
         fn writeHeader(self: *Self) !void {
-            var page = [_]u8{0} ** PAGE_SZ;
+            var page: [PAGE_SZ]u8 = @splat(0);
             var h = Header{
-                .vec_type = @intFromEnum(BinaryTypeRepresentation.to_binary(vec_type)),
+                .vec_type = @backingInt(BinaryTypeRepresentation.to_binary(vec_type)),
                 .page_sz = PAGE_SZ,
                 .vec_sz = vec_sz,
                 .stride = @intCast(L.stride),
@@ -420,7 +421,7 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             const ok = std.mem.eql(u8, &h.magic, &MAGIC) and
                 h.fmt_v == FMT_V and
                 h.big_endian == @intFromBool(native_endian == .big) and
-                h.vec_type == @intFromEnum(BinaryTypeRepresentation.to_binary(vec_type)) and
+                h.vec_type == @backingInt(BinaryTypeRepresentation.to_binary(vec_type)) and
                 h.page_sz == PAGE_SZ and
                 h.vec_sz == vec_sz and
                 h.stride == L.stride and
@@ -497,21 +498,21 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         /// Barrier, not a save: there is no in-memory copy to write back, so this only asks
         /// the OS to make already-written bytes durable. Real transactions are a later want.
         pub fn flush(self: *Self) !void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             try self.file.sync();
         }
 
         pub fn len(self: *Self) usize {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.vec_n;
         }
 
         // ************************************************************************* Core ops
         pub fn put(self: *Self, meta: PutMeta, vec: *const Array) !VectorID {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.putLocked(meta, vec);
         }
 
@@ -588,8 +589,8 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         /// Null for an id that was never handed out, or whose vector has been removed --
         /// including the case where the slot behind it has since been refilled under a new id.
         pub fn get(self: *Self, id: VectorID) !?Row {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.getLocked(id);
         }
 
@@ -615,8 +616,8 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         /// Reads into the caller's buffer and verifies the checksum. `search` deliberately
         /// skips verification on its inner loop; `validate` checks everything.
         pub fn getVec(self: *Self, id: VectorID, out: *Array) !void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.getVecLocked(id, out);
         }
 
@@ -632,8 +633,8 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         }
 
         pub fn rm(self: *Self, id: VectorID) !void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.rmLocked(id);
         }
 
@@ -681,8 +682,8 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         /// loop for the same reason -- this *is* that inner loop now. `validate` checks
         /// everything.
         pub fn getSlot(self: *Self, slot: usize, out: *Array) !?Row {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             if (slot >= self.slot_n) return null;
 
             var chunk: [L.chunk_bytes]u8 align(VEC_ALIGN) = undefined;
@@ -720,7 +721,7 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
 
             pub fn deinit(self: *Iterator) void {
                 self.walker.deinit();
-                self.store.mutex.unlock();
+                self.store.mutex.unlock(self.store.io);
             }
 
             pub fn next(self: *Iterator) !?Entry {
@@ -748,8 +749,8 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         };
 
         pub fn iterate(self: *Self) !Iterator {
-            self.mutex.lock();
-            errdefer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            errdefer self.mutex.unlock(self.io);
             return .{
                 .store = self,
                 .walker = try ChunkWalker.init(self, chunkCount(self.slot_n)),
@@ -758,8 +759,8 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
 
         /// Generates a new ID for an existing VectorRow.
         pub fn copy(self: *Self, id: VectorID) !VectorID {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             const row = (try self.getLocked(id)) orelse return Error.NoSuchVector;
             var vec: Array = undefined;
@@ -854,8 +855,8 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             const zone = tracy.beginZone(@src(), .{ .name = "vstore.zig:search" });
             defer zone.end();
 
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
@@ -870,7 +871,7 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
                     return std.math.order(b.sim, a.sim);
                 }
             };
-            var pq = std.PriorityQueue(Cand, void, Cand.order).init(arena.allocator(), undefined);
+            var pq: std.PriorityQueue(Cand, void, Cand.order) = .empty;
 
             var walker = try ChunkWalker.init(self, chunkCount(self.slot_n));
             defer walker.deinit();
@@ -884,12 +885,12 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
                     const sim = storedDotAt(vec_sz, vec_type, vecAt(chunk.bytes, i), query);
                     // The row is already in hand from the trailer we just read; re-reading it
                     // per result would cost a syscall each.
-                    if (sim > threshold) try pq.add(.{ .row = rowOf(m.*), .sim = sim });
+                    if (sim > threshold) try pq.push(arena.allocator(), .{ .row = rowOf(m.*), .sim = sim });
                 }
             }
 
             var n: usize = 0;
-            while (pq.removeOrNull()) |cand| : (n += 1) {
+            while (pq.pop()) |cand| : (n += 1) {
                 if (n >= buf.len) {
                     std.log.debug("Results capped", .{});
                     break;
@@ -901,13 +902,13 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
 
         /// Returns all vectors for a given doc_id, sorted by start_i.
         pub fn vecsForDoc(self: *Self, allocator: std.mem.Allocator, doc_id: DocID) ![]Row {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             return self.vecsForDocLocked(allocator, doc_id);
         }
 
         fn vecsForDocLocked(self: *Self, allocator: std.mem.Allocator, doc_id: DocID) ![]Row {
-            var results: std.ArrayList(Row) = .{};
+            var results: std.ArrayList(Row) = .empty;
             errdefer results.deinit(allocator);
 
             var walker = try ChunkWalker.init(self, chunkCount(self.slot_n));
@@ -934,8 +935,8 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
 
         /// Removes all vectors for a given doc_id.
         pub fn rmByDocId(self: *Self, doc_id: DocID) !void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             const rows = try self.vecsForDocLocked(self.allocator, doc_id);
             defer self.allocator.free(rows);
@@ -948,8 +949,8 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         /// - checking every DocID is initialized
         /// - per-doc checking that no two ranges collide
         pub fn validate(self: *Self) !void {
-            self.mutex.lock();
-            defer self.mutex.unlock();
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
 
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
@@ -1028,8 +1029,8 @@ const TestStorage = VStore(TestN, TestT);
 
 const DB = "test.db";
 
-fn open(dir: std.fs.Dir) !TestStorage {
-    return TestStorage.init(testing_allocator, dir, .{ .path = DB });
+fn open(dir: std.Io.Dir) !TestStorage {
+    return TestStorage.init(testing_allocator, std.testing.io, dir, .{ .path = DB });
 }
 
 /// Ids are opaque to callers, but the reuse tests need to talk about the slot and generation
@@ -1553,7 +1554,7 @@ test "opening a non-existent db creates an empty one" {
     var tmpD = tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
-    var inst = try TestStorage.init(testing_allocator, tmpD.dir, .{ .path = "does-not-exist.db" });
+    var inst = try TestStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{ .path = "does-not-exist.db" });
     defer inst.deinit();
     try expectEqual(@as(usize, 0), inst.len());
     try inst.validate();
@@ -1575,7 +1576,7 @@ test "a db written for a different vector type is rejected" {
     const Other = VStore(4, f32);
     try std.testing.expectError(
         Error.IncompatibleDatabase,
-        Other.init(testing_allocator, tmpD.dir, .{ .path = DB }),
+        Other.init(testing_allocator, std.testing.io, tmpD.dir, .{ .path = DB }),
     );
 }
 
@@ -1622,7 +1623,7 @@ test "format: a flipped byte in the vector region is caught by the checksum" {
     }
 
     {
-        const f = try pfile.File.openAt(@intCast(tmpD.dir.fd), DB, .{ .create = false });
+        const f = try pfile.File.openAt(@intCast(tmpD.dir.handle), DB, .{ .create = false });
         defer f.close();
         var byte: [1]u8 = undefined;
         _ = try f.readAt(&byte, PAGE_SZ);
@@ -1650,7 +1651,7 @@ test "format: a truncated tail does not take the whole store down" {
 
     // Lop off the second chunk entirely, as an interrupted extend would.
     {
-        const f = try pfile.File.openAt(@intCast(tmpD.dir.fd), DB, .{ .create = false });
+        const f = try pfile.File.openAt(@intCast(tmpD.dir.handle), DB, .{ .create = false });
         defer f.close();
         try f.setSize(PAGE_SZ + TestStorage.CHUNK_BYTES);
     }
@@ -1670,7 +1671,7 @@ test "multi-page vectors: one vector spanning two pages" {
 
     var tmpD = tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var inst = try Multi.init(testing_allocator, tmpD.dir, .{ .path = DB });
+    var inst = try Multi.init(testing_allocator, std.testing.io, tmpD.dir, .{ .path = DB });
     defer inst.deinit();
 
     var vec: [N]f32 = @splat(1.0 / @sqrt(@as(f32, N)));
@@ -1693,7 +1694,7 @@ test "zero-slack layout: vector plus metadata exactly fills a page" {
 
     var tmpD = tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var inst = try Exact.init(testing_allocator, tmpD.dir, .{ .path = DB });
+    var inst = try Exact.init(testing_allocator, std.testing.io, tmpD.dir, .{ .path = DB });
     defer inst.deinit();
 
     const vec: [N]f32 = @splat(1.0 / @sqrt(@as(f32, N)));
@@ -1746,7 +1747,7 @@ test "scan: the open scan spans several read batches" {
     const ids = try testing_allocator.alloc(VectorID, n);
     defer testing_allocator.free(ids);
     {
-        var inst = try Multi.init(testing_allocator, tmpD.dir, .{ .path = DB });
+        var inst = try Multi.init(testing_allocator, std.testing.io, tmpD.dir, .{ .path = DB });
         defer inst.deinit();
         for (0..n) |i| {
             ids[i] = try inst.put(.{ .doc_id = @intCast(i + 1), .start_i = i, .end_i = i + 1 }, vec);
@@ -1758,7 +1759,7 @@ test "scan: the open scan spans several read batches" {
         try inst.flush();
     }
 
-    var inst2 = try Multi.init(testing_allocator, tmpD.dir, .{ .path = DB });
+    var inst2 = try Multi.init(testing_allocator, std.testing.io, tmpD.dir, .{ .path = DB });
     defer inst2.deinit();
     try expectEqual(n - 2, inst2.len());
     try expectEqual(n, inst2.slot_n);
@@ -1814,7 +1815,7 @@ test "search hugebuf" {
 
     var tmpD = tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
-    var inst = try HugeStorage.init(testing_allocator, tmpD.dir, .{ .path = DB });
+    var inst = try HugeStorage.init(testing_allocator, std.testing.io, tmpD.dir, .{ .path = DB });
     defer inst.deinit();
 
     for (0..1000) |i| {
@@ -2173,7 +2174,7 @@ pub const DocID = @import("note_id_map.zig").NoteID;
 test "getSlot: reads row and vector in one read, and refuses a freed slot" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var inst = try TestStorage.init(testing_allocator, tmp.dir, .{});
+    var inst = try TestStorage.init(testing_allocator, std.testing.io, tmp.dir, .{});
     defer inst.deinit();
 
     const a = TestStorage.Array{ 1.0, 0.0, 0.0 };
@@ -2200,7 +2201,7 @@ test "getSlot: reads row and vector in one read, and refuses a freed slot" {
 test "iterate: every live vector once, in slot order, across batch boundaries" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    var inst = try TestStorage.init(testing_allocator, tmp.dir, .{});
+    var inst = try TestStorage.init(testing_allocator, std.testing.io, tmp.dir, .{});
     defer inst.deinit();
 
     // More chunks than fit one scan batch, so the iterator has to cross the seam that the

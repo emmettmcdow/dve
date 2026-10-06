@@ -26,20 +26,18 @@ const Options = struct {
     seed: u64 = 1,
 };
 
-pub fn main() !void {
-    var gpa_state = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa_state.deinit();
-    const gpa = gpa_state.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
 
-    const args = try std.process.argsAlloc(gpa);
-    defer std.process.argsFree(gpa, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
     const opts = parseArgs(args);
 
-    var dir = std.fs.cwd().openDir(opts.dir, .{}) catch
+    var dir = std.Io.Dir.cwd().openDir(io, opts.dir, .{}) catch
         fatal("cannot open '{s}' (run from the repo root)", .{opts.dir});
-    defer dir.close();
+    defer dir.close(io);
 
-    var store = try Store.init(gpa, dir, .{});
+    var store = try Store.init(gpa, io, dir, .{});
     defer store.deinit();
     store.load(opts.file) catch |e| fatal("cannot load: {t}", .{e});
 
@@ -67,10 +65,10 @@ pub fn main() !void {
     }
 
     // ---------------------------------------------------------------------------- build
-    var c = try C.init(gpa, .{ .threads = opts.threads, .capacity = n });
+    var c = try C.init(gpa, io, .{ .threads = opts.threads, .capacity = n });
     defer c.deinit();
 
-    var build_timer = try std.time.Timer.start();
+    var build_timer = Timer.start(io);
     for (0..n) |i| try c.put(i, @ptrCast(vecs[i * DIM ..][0..DIM]));
     const build_ns = build_timer.read();
 
@@ -81,7 +79,7 @@ pub fn main() !void {
         \\vectors    {d} live, {d} dims
         \\code       {d} bits ({d} bytes)  [module default is {d}]
         \\resident   {f} for {d} vectors -> {f} projected to 35M
-        \\build      {D} ({D} per vector)
+        \\build      {f} ({f} per vector)
         \\queries    {d}, threads {?d}
         \\
         \\
@@ -92,7 +90,7 @@ pub fn main() !void {
         dve.codes.DEFAULT_BITS,
         fmtBytes(c.bytes()), n,
         fmtBytes(C.CODE_BYTES * 35_000_000),
-        build_ns,    build_ns / n,
+        nanos(build_ns), nanos(build_ns / n),
         opts.queries, opts.threads,
     });
 
@@ -130,7 +128,7 @@ pub fn main() !void {
         var best_ns: u64 = std.math.maxInt(u64);
 
         for (queries, truth, dup) |q, t, is_dup| {
-            var timer = try std.time.Timer.start();
+            var timer = Timer.start(io);
             const found = try c.search(@ptrCast(vecs[@as(usize, q) * DIM ..][0..DIM]), buf[0..k]);
             best_ns = @min(best_ns, timer.read());
 
@@ -173,8 +171,8 @@ pub fn main() !void {
 /// Exact cosine top-`TOP`, excluding the query. Stored vectors are L2 normalized, so the dot
 /// product is the cosine. Returns the best similarity, which is how a duplicate is spotted.
 fn exactTop(vecs: []const f32, n: usize, q: u32, out: *[TOP]u32) f32 {
-    var best_sim = [_]f32{-2.0} ** TOP;
-    var best_id = [_]u32{0} ** TOP;
+    var best_sim: [TOP]f32 = @splat(-2.0);
+    var best_id: [TOP]u32 = @splat(0);
     const qv = vecs[@as(usize, q) * DIM ..][0..DIM];
     for (0..n) |i| {
         if (i == q) continue;
@@ -219,7 +217,7 @@ fn fmtBytes(b: u64) ByteSize {
     return .{ .bytes = b };
 }
 
-fn parseArgs(args: [][:0]u8) Options {
+fn parseArgs(args: []const [:0]const u8) Options {
     var o = Options{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -263,5 +261,7 @@ fn usage(code: u8) noreturn {
 
 const std = @import("std");
 const dve = @import("dve");
+const Timer = dve.util.Timer;
+const nanos = dve.util.nanos;
 const Store = dve.vec_storage.Storage(DIM, f32);
 const C = dve.codes.Codes(DIM, f32, 384);

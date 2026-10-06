@@ -17,6 +17,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dve = @import("dve");
+const Timer = dve.util.Timer;
+const nanos = dve.util.nanos;
+const Nanos = dve.util.Nanos;
 
 /// dve logs one line per embedded document at info level. At corpus scale that
 /// output dwarfs the harness's own, so raise the threshold.
@@ -78,13 +81,11 @@ const Options = struct {
     queries: []const []const u8 = &default_queries,
 };
 
-pub fn main() !void {
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const allocator = init.gpa;
 
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     const opts = try parseArgs(allocator, args);
     defer if (opts.queries.ptr != &default_queries) allocator.free(opts.queries);
@@ -95,9 +96,9 @@ pub fn main() !void {
         inline else => |m| {
             const R = Runner(m.id());
             switch (opts.mode) {
-                .embed => try R.runEmbed(allocator, opts),
-                .search => try R.runSearch(allocator, opts),
-                .stat => try R.runStat(allocator, opts),
+                .embed => try R.runEmbed(allocator, io, opts),
+                .search => try R.runSearch(allocator, io, opts),
+                .stat => try R.runStat(allocator, io, opts),
             }
         },
     }
@@ -112,34 +113,34 @@ fn Runner(comptime embedding_model: dve.embed.EmbeddingModel) type {
         const model = embedding_model;
         const VectorEngine = dve.VectorEngine(embedding_model);
 
-fn runEmbed(allocator: std.mem.Allocator, opts: Options) !void {
-    var corpus = std.fs.cwd().openDir(opts.corpus, .{ .iterate = true }) catch |err| {
+fn runEmbed(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
+    var corpus = std.Io.Dir.cwd().openDir(io, opts.corpus, .{ .iterate = true }) catch |err| {
         fatal("cannot open corpus dir '{s}': {t}\n" ++
             "(run ./download.sh first, or pass --corpus <dir>)", .{ opts.corpus, err });
     };
-    defer corpus.close();
+    defer corpus.close(io);
 
-    const names = try collectArticles(allocator, corpus, opts.limit, opts.sample);
+    const names = try collectArticles(allocator, io, corpus, opts.limit, opts.sample);
     defer {
         for (names) |n| allocator.free(n);
         allocator.free(names);
     }
     if (names.len == 0) fatal("no files found in '{s}'", .{opts.corpus});
 
-    var db_dir = try std.fs.cwd().makeOpenPath(opts.db, .{ .iterate = true });
-    defer db_dir.close();
+    var db_dir = try std.Io.Dir.cwd().createDirPathOpen(io, opts.db, .{ .open_options = .{ .iterate = true } });
+    defer db_dir.close(io);
 
     var csv: Csv = undefined;
-    try csv.init(opts.csv);
-    defer csv.close();
+    try csv.init(io, opts.csv);
+    defer csv.close(io);
 
     std.debug.print(
         "model      {s} ({d} dims)\ncorpus     {s} ({d} articles selected)\ndatabase   {s}\n\n",
         .{ @tagName(model), model.vecSize(), opts.corpus, names.len, opts.db },
     );
 
-    var load_timer = try std.time.Timer.start();
-    const db = try VectorEngine.init(allocator, db_dir, .{});
+    var load_timer = Timer.start(io);
+    const db = try VectorEngine.init(allocator, io, db_dir, .{});
     defer db.deinit();
     const load_ns = load_timer.read();
 
@@ -149,18 +150,18 @@ fn runEmbed(allocator: std.mem.Allocator, opts: Options) !void {
             .{db.vec_storage.vec_n},
         );
     }
-    std.debug.print("opened existing database in {D}\n\n", .{load_ns});
+    std.debug.print("opened existing database in {f}\n\n", .{nanos(load_ns)});
 
     printHeader();
 
-    var total_timer = try std.time.Timer.start();
-    var interval_timer = try std.time.Timer.start();
+    var total_timer = Timer.start(io);
+    var interval_timer = Timer.start(io);
     var interval_start_vecs = db.vec_storage.vec_n;
     var done: usize = 0;
     var skipped: usize = 0;
 
     outer: for (names) |name| {
-        const contents = corpus.readFileAlloc(allocator, name, MAX_ARTICLE_BYTES) catch |err| {
+        const contents = corpus.readFileAlloc(io, name, allocator, .limited(MAX_ARTICLE_BYTES)) catch |err| {
             std.debug.print("skip {s}: {t}\n", .{ name, err });
             skipped += 1;
             continue;
@@ -174,7 +175,7 @@ fn runEmbed(allocator: std.mem.Allocator, opts: Options) !void {
         inner: while (true) {
             db.embedTextAsync(name, contents) catch |err| switch (err) {
                 error.Full => {
-                    std.Thread.sleep(250 * std.time.ns_per_us);
+                    io.sleep(.fromNanoseconds(250 * std.time.ns_per_us), .awake) catch {};
                     continue :inner;
                 },
                 else => {
@@ -196,7 +197,7 @@ fn runEmbed(allocator: std.mem.Allocator, opts: Options) !void {
                 .interval_ns = interval_timer.lap(),
                 .total_ns = total_timer.read(),
                 .rss_bytes = rssBytes(),
-                .db_bytes = dirSize(db_dir) catch 0,
+                .db_bytes = dirSize(io, db_dir) catch 0,
             };
             printSample(sample);
             try csv.write(sample);
@@ -208,41 +209,41 @@ fn runEmbed(allocator: std.mem.Allocator, opts: Options) !void {
 
     const elapsed = total_timer.read();
     std.debug.print(
-        "\nembedded {d} articles ({d} skipped) -> {d} vectors in {D}\n" ++
+        "\nembedded {d} articles ({d} skipped) -> {d} vectors in {f}\n" ++
             "{d} slots allocated, {d} paths, {f} on disk, {f} peak rss\n",
         .{
             done,
             skipped,
             db.vec_storage.vec_n,
-            elapsed,
+            nanos(elapsed),
             db.vec_storage.slot_n,
             db.note_id_map.count(),
-            fmtBytes(dirSize(db_dir) catch 0),
+            fmtBytes(dirSize(io, db_dir) catch 0),
             fmtBytes(rssBytes()),
         },
     );
 }
 
-fn runSearch(allocator: std.mem.Allocator, opts: Options) !void {
-    var db_dir = std.fs.cwd().openDir(opts.db, .{ .iterate = true }) catch |err| {
+fn runSearch(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
+    var db_dir = std.Io.Dir.cwd().openDir(io, opts.db, .{ .iterate = true }) catch |err| {
         fatal("cannot open database '{s}': {t}\n(run the embed mode first)", .{ opts.db, err });
     };
-    defer db_dir.close();
+    defer db_dir.close(io);
 
-    var load_timer = try std.time.Timer.start();
-    const db = try VectorEngine.init(allocator, db_dir, .{});
+    var load_timer = Timer.start(io);
+    const db = try VectorEngine.init(allocator, io, db_dir, .{});
     defer db.deinit();
     const load_ns = load_timer.read();
 
     std.debug.print(
-        "database   {s} ({d} vectors, {d} paths, {f} on disk)\nload       {D}\n" ++
+        "database   {s} ({d} vectors, {d} paths, {f} on disk)\nload       {f}\n" ++
             "search     {s}, k={d}, {d} repeats per query\n\n",
         .{
             opts.db,
             db.vec_storage.vec_n,
             db.note_id_map.count(),
-            fmtBytes(dirSize(db_dir) catch 0),
-            load_ns,
+            fmtBytes(dirSize(io, db_dir) catch 0),
+            nanos(load_ns),
             if (opts.unique) "uniqueSearch" else "search",
             opts.k,
             opts.repeat,
@@ -270,32 +271,32 @@ fn runSearch(allocator: std.mem.Allocator, opts: Options) !void {
         // Embedded once and timed on its own. Folding it into the repeats would report ~20 ms
         // of CoreML as though it were search, which is most of the number and none of the
         // thing being measured.
-        var embed_timer = try std.time.Timer.start();
+        var embed_timer = Timer.start(io);
         const query_vec = try db.embedQuery(query);
         const embed_ns = embed_timer.read();
 
         var found: usize = 0;
         for (samples) |*sample| {
-            var timer = try std.time.Timer.start();
+            var timer = Timer.start(io);
             found = if (query_vec) |v| try db.rawVectorSearch(v, buf) else 0;
             sample.* = timer.read();
         }
         std.mem.sort(u64, samples, {}, std.sort.asc(u64));
 
         std.debug.print(
-            "\"{s}\"\n  {d} results | embed {D} | search min {D} | median {D} | max {D}\n",
+            "\"{s}\"\n  {d} results | embed {f} | search min {f} | median {f} | max {f}\n",
             .{
                 query,
                 found,
-                embed_ns,
-                samples[0],
-                samples[samples.len / 2],
-                samples[samples.len - 1],
+                nanos(embed_ns),
+                nanos(samples[0]),
+                nanos(samples[samples.len / 2]),
+                nanos(samples[samples.len - 1]),
             },
         );
 
         if (opts.verify) if (query_vec) |v| {
-            var exact_timer = try std.time.Timer.start();
+            var exact_timer = Timer.start(io);
             const n_exact = try db.exactVectorSearch(v, exact);
             const exact_ns = exact_timer.read();
             exact_ns_sum += exact_ns;
@@ -315,8 +316,8 @@ fn runSearch(allocator: std.mem.Allocator, opts: Options) !void {
                 @as(f64, @floatFromInt(hit)) / @as(f64, @floatFromInt(n_exact));
             recall_sum += r;
             recall_n += 1;
-            std.debug.print("  exact {D} ({d} results) | recall {d:.3} | speedup {d:.1}x\n", .{
-                exact_ns, n_exact, r,
+            std.debug.print("  exact {f} ({d} results) | recall {d:.3} | speedup {d:.1}x\n", .{
+                nanos(exact_ns), n_exact, r,
                 @as(f64, @floatFromInt(exact_ns)) / @as(f64, @floatFromInt(@max(samples[0], 1))),
             });
         };
@@ -333,42 +334,42 @@ fn runSearch(allocator: std.mem.Allocator, opts: Options) !void {
 
     if (recall_n > 0) {
         std.debug.print(
-            "recall {d:.3} over {d} queries, against an exhaustive scan averaging {D}\n",
-            .{ recall_sum / @as(f64, @floatFromInt(recall_n)), recall_n, exact_ns_sum / recall_n },
+            "recall {d:.3} over {d} queries, against an exhaustive scan averaging {f}\n",
+            .{ recall_sum / @as(f64, @floatFromInt(recall_n)), recall_n, nanos(exact_ns_sum / recall_n) },
         );
     }
 }
 
-fn runStat(allocator: std.mem.Allocator, opts: Options) !void {
-    var db_dir = std.fs.cwd().openDir(opts.db, .{ .iterate = true }) catch |err| {
+fn runStat(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
+    var db_dir = std.Io.Dir.cwd().openDir(io, opts.db, .{ .iterate = true }) catch |err| {
         fatal("cannot open database '{s}': {t}", .{ opts.db, err });
     };
-    defer db_dir.close();
+    defer db_dir.close(io);
 
-    var load_timer = try std.time.Timer.start();
-    const db = try VectorEngine.init(allocator, db_dir, .{});
+    var load_timer = Timer.start(io);
+    const db = try VectorEngine.init(allocator, io, db_dir, .{});
     defer db.deinit();
     const load_ns = load_timer.read();
 
     std.debug.print(
         "model      {s} ({d} dims)\nvectors    {d} live / {d} slots\npaths      {d}\n" ++
-            "load       {D}\npeak rss   {f}\n\nfiles:\n",
+            "load       {f}\npeak rss   {f}\n\nfiles:\n",
         .{
             @tagName(model),
             model.vecSize(),
             db.vec_storage.vec_n,
             db.vec_storage.slot_n,
             db.note_id_map.count(),
-            load_ns,
+            nanos(load_ns),
             fmtBytes(rssBytes()),
         },
     );
 
     var total: u64 = 0;
     var it = db_dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        const st = try db_dir.statFile(entry.name);
+        const st = try db_dir.statFile(io, entry.name, .{});
         total += st.size;
         std.debug.print("  {s:<28} {f}\n", .{ entry.name, fmtBytes(st.size) });
     }
@@ -384,18 +385,19 @@ fn runStat(allocator: std.mem.Allocator, opts: Options) !void {
 /// always yields a prefix of a larger one.
 fn collectArticles(
     allocator: std.mem.Allocator,
-    dir: std.fs.Dir,
+    io: std.Io,
+    dir: std.Io.Dir,
     limit: usize,
     sample: ?u64,
 ) ![][]u8 {
-    var names: std.ArrayList([]u8) = .{};
+    var names: std.ArrayList([]u8) = .empty;
     errdefer {
         for (names.items) |n| allocator.free(n);
         names.deinit(allocator);
     }
 
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         try names.append(allocator, try allocator.dupe(u8, entry.name));
     }
@@ -444,10 +446,10 @@ fn printHeader() void {
 }
 
 fn printSample(s: Sample) void {
-    std.debug.print("{d:>10} {d:>10} {D:>10} {d:>12.1} {d:>12.1} {f:>10} {f:>10}\n", .{
+    std.debug.print("{d:>10} {d:>10} {f} {d:>12.1} {d:>12.1} {f:>10} {f:>10}\n", .{
         s.articles,
         s.vectors,
-        s.total_ns,
+        Nanos{ .ns = s.total_ns, .width = 10 },
         perSecond(s.interval_articles, s.interval_ns),
         perSecond(s.articles, s.total_ns),
         fmtBytes(s.rss_bytes),
@@ -457,8 +459,8 @@ fn printSample(s: Sample) void {
 
 /// Optional CSV sink so interval samples can be plotted.
 const Csv = struct {
-    file: ?std.fs.File = null,
-    writer: std.fs.File.Writer = undefined,
+    file: ?std.Io.File = null,
+    writer: std.Io.File.Writer = undefined,
     buf: [4096]u8 = undefined,
 
     /// Initializes in place, and must: `writer` holds a pointer into `self.buf`, so a
@@ -466,11 +468,11 @@ const Csv = struct {
     /// back by value -- which this did -- leaves the writer addressing the dead local's
     /// buffer. Every row then lands in reclaimed stack, which is why the file came out
     /// empty and why a long run eventually took a SIGSEGV inside float formatting.
-    fn init(self: *Csv, path: ?[]const u8) !void {
+    fn init(self: *Csv, io: std.Io, path: ?[]const u8) !void {
         self.* = .{};
         const p = path orelse return;
-        self.file = try std.fs.cwd().createFile(p, .{});
-        self.writer = self.file.?.writer(&self.buf);
+        self.file = try std.Io.Dir.cwd().createFile(io, p, .{});
+        self.writer = self.file.?.writer(io, &self.buf);
         try self.writer.interface.writeAll(
             "articles,vectors,total_ns,interval_ns,interval_articles," ++
                 "interval_vectors,docs_per_s_interval,docs_per_s_avg,rss_bytes,db_bytes\n",
@@ -493,10 +495,10 @@ const Csv = struct {
         });
     }
 
-    fn close(self: *Csv) void {
+    fn close(self: *Csv, io: std.Io) void {
         if (self.file) |f| {
             self.writer.interface.flush() catch {};
-            f.close();
+            f.close(io);
         }
     }
 };
@@ -511,12 +513,12 @@ fn rssBytes() u64 {
     };
 }
 
-fn dirSize(dir: std.fs.Dir) !u64 {
+fn dirSize(io: std.Io, dir: std.Io.Dir) !u64 {
     var total: u64 = 0;
     var it = dir.iterate();
-    while (try it.next()) |entry| {
+    while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
-        const st = dir.statFile(entry.name) catch continue;
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
         total += st.size;
     }
     return total;
@@ -541,7 +543,7 @@ fn fmtBytes(bytes: u64) ByteSize {
 
 // ********************************************************************************** Argument parsing
 
-fn parseArgs(allocator: std.mem.Allocator, args: [][:0]u8) !Options {
+fn parseArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Options {
     if (args.len < 2) usage(1);
 
     const mode = std.meta.stringToEnum(Mode, args[1]) orelse {
@@ -550,7 +552,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: [][:0]u8) !Options {
     };
 
     var opts = Options{ .mode = mode };
-    var queries: std.ArrayList([]const u8) = .{};
+    var queries: std.ArrayList([]const u8) = .empty;
     errdefer queries.deinit(allocator);
 
     var i: usize = 2;
@@ -599,7 +601,7 @@ fn parseArgs(allocator: std.mem.Allocator, args: [][:0]u8) !Options {
     return opts;
 }
 
-fn nextArg(args: [][:0]u8, i: *usize) []const u8 {
+fn nextArg(args: []const [:0]const u8, i: *usize) []const u8 {
     i.* += 1;
     if (i.* >= args.len) fatal("'{s}' requires a value", .{args[i.* - 1]});
     return args[i.*];
