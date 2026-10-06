@@ -1,0 +1,19 @@
+.{
+    .name = .tracy,
+    .version = "0.0.10",
+    .fingerprint = 0x255a89ee9b3d7e0e, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.14.0",
+    .dependencies = .{
+        .tracy_lib = .{
+            .url = "https://github.com/wolfpld/tracy/archive/refs/tags/v0.12.0.zip",
+            .hash = "N-V-__8AABI9PwGkEDxc-gkF60lgvJ3cKJv44jVYIWomN7dW",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
