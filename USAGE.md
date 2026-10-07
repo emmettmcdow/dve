@@ -35,7 +35,7 @@ const dve = @import("dve");
 // Open a directory to store the vector database.
 const dir = try std.Io.Dir.cwd().createDirPathOpen(io, "my_vectors", .{});
 
-// Name the model you want; see "Model selection" above.
+// Name the model you want; see "Model selection" below.
 const VectorEngine = dve.VectorEngine(.mpnet_embedding);
 // Model files can be changed from their defaults using:
 //    VectorEngine.init(..., ..., ..., .{ .model_path = "...", .tokenizer_path = "..." });
