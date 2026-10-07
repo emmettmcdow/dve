@@ -83,7 +83,7 @@ export fn dve_init(
     defer if (!ok) engine_threaded.deinit();
 
     const dir = std.Io.Dir.openDirAbsolute(io, basedir_slice, .{ .iterate = true }) catch |err| {
-        std.log.err("dve_init: failed to open basedir '{s}': {}\n", .{ basedir_slice, err });
+        std.log.err("dve_init: failed to open basedir '{s}': {}", .{ basedir_slice, err });
         return @backingInt(CError.GenericFail);
     };
 
@@ -95,13 +95,13 @@ export fn dve_init(
             .model_path = model_slice,
             .tokenizer_path = if (tokenizer_slice.len > 0) tokenizer_slice else null,
         }) catch |err| {
-            std.log.err("dve_init: failed to init VectorEngine: {}\n", .{err});
+            std.log.err("dve_init: failed to init VectorEngine: {}", .{err});
             return @backingInt(CError.GenericFail);
         };
         active_model = .mpnet;
     } else {
         apple_db = AppleVDB.init(allocator, io, dir, .{}) catch |err| {
-            std.log.err("dve_init: failed to init VectorEngine: {}\n", .{err});
+            std.log.err("dve_init: failed to init VectorEngine: {}", .{err});
             return @backingInt(CError.GenericFail);
         };
         active_model = .apple_nl;
@@ -141,11 +141,11 @@ export fn dve_embed(key: [*:0]const u8, content: [*:0]const u8) c_int {
     const content_s = std.mem.sliceTo(content, 0);
     switch (active_model) {
         .apple_nl => apple_db.?.embedText(key_s, content_s) catch |err| {
-            std.log.err("dve_embed: {}\n", .{err});
+            std.log.err("dve_embed: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.embedText(key_s, content_s) catch |err| {
-            std.log.err("dve_embed: {}\n", .{err});
+            std.log.err("dve_embed: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
     }
@@ -161,11 +161,11 @@ export fn dve_embed_async(key: [*:0]const u8, content: [*:0]const u8) c_int {
     const content_s = std.mem.sliceTo(content, 0);
     switch (active_model) {
         .apple_nl => apple_db.?.embedTextAsync(key_s, content_s) catch |err| {
-            std.log.err("dve_embed_async: {}\n", .{err});
+            std.log.err("dve_embed_async: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.embedTextAsync(key_s, content_s) catch |err| {
-            std.log.err("dve_embed_async: {}\n", .{err});
+            std.log.err("dve_embed_async: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
     }
@@ -192,11 +192,11 @@ export fn dve_search(
 
     const written: usize = switch (active_model) {
         .apple_nl => apple_db.?.search(query_s, tmp) catch |err| {
-            std.log.err("dve_search: {}\n", .{err});
+            std.log.err("dve_search: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.search(query_s, tmp) catch |err| {
-            std.log.err("dve_search: {}\n", .{err});
+            std.log.err("dve_search: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
     };
@@ -215,11 +215,11 @@ export fn dve_remove(key: [*:0]const u8) c_int {
     const key_s = std.mem.sliceTo(key, 0);
     switch (active_model) {
         .apple_nl => apple_db.?.removePath(key_s) catch |err| {
-            std.log.err("dve_remove: {}\n", .{err});
+            std.log.err("dve_remove: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.removePath(key_s) catch |err| {
-            std.log.err("dve_remove: {}\n", .{err});
+            std.log.err("dve_remove: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
     }
@@ -235,11 +235,11 @@ export fn dve_rename(old_key: [*:0]const u8, new_key: [*:0]const u8) c_int {
     const new_s = std.mem.sliceTo(new_key, 0);
     switch (active_model) {
         .apple_nl => apple_db.?.renamePath(old_s, new_s) catch |err| {
-            std.log.err("dve_rename: {}\n", .{err});
+            std.log.err("dve_rename: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.renamePath(old_s, new_s) catch |err| {
-            std.log.err("dve_rename: {}\n", .{err});
+            std.log.err("dve_rename: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
     }

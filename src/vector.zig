@@ -691,7 +691,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             // invariant holds in both directions.
             if (embedded_sentences.len == 0) {
                 if (self.note_id_map.getId(path) != null) try self.removePath(path);
-                std.log.info("Embedded 0 sentences\n", .{});
+                std.log.info("Embedded 0 sentences", .{});
                 return;
             }
 
@@ -717,7 +717,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             };
             try self.replaceVectors(allocator, note_id, embedded_sentences, existing != null);
 
-            std.log.info("Embedded {d} sentences\n", .{embedded_sentences.len});
+            std.log.info("Embedded {d} sentences", .{embedded_sentences.len});
         }
 
         // Embed an entire document, a collection of sentences. And associate it with a key/path.

@@ -291,11 +291,11 @@ pub const MpnetEmbedder = struct {
         const tok = try acquireTokenizer(io, tokenizer_path);
 
         const NSString = objc.getClass("NSString") orelse {
-            std.log.err("Failed to get NSString class\n", .{});
+            std.log.err("Failed to get NSString class", .{});
             return error.ObjCClassNotFound;
         };
         const NSURL = objc.getClass("NSURL") orelse {
-            std.log.err("Failed to get NSURL class\n", .{});
+            std.log.err("Failed to get NSURL class", .{});
             return error.ObjCClassNotFound;
         };
         const fromUTF8 = objc.Sel.registerName("stringWithUTF8String:");
@@ -318,13 +318,13 @@ pub const MpnetEmbedder = struct {
 
         const path_ns = NSString.msgSend(Object, fromUTF8, .{full_path.ptr});
         if (path_ns.value == 0) {
-            std.log.err("Failed to create NSString from path\n", .{});
+            std.log.err("Failed to create NSString from path", .{});
             return error.NSStringCreateFailed;
         }
 
         const model_url = NSURL.msgSend(Object, fileURLWithPath, .{path_ns});
         if (model_url.value == 0) {
-            std.log.err("Failed to create NSURL from path\n", .{});
+            std.log.err("Failed to create NSURL from path", .{});
             return error.NSURLCreateFailed;
         }
 
@@ -384,13 +384,13 @@ pub const MpnetEmbedder = struct {
                 logModelNotFound("mpnet tokenizer", path, DOWNLOAD_CMD, "tokenizer_path");
                 return error.ModelNotFound;
             }
-            std.log.err("Failed to read tokenizer.json: {}\n", .{err});
+            std.log.err("Failed to read tokenizer.json: {}", .{err});
             return error.TokenizerLoadFailed;
         };
 
         const tok = allocator.create(WordPieceTokenizer) catch return error.TokenizerLoadFailed;
         tok.init(allocator, json) catch |err| {
-            std.log.err("Failed to parse tokenizer.json: {}\n", .{err});
+            std.log.err("Failed to parse tokenizer.json: {}", .{err});
             return error.TokenizerParseFailed;
         };
 
@@ -446,11 +446,11 @@ pub const MpnetEmbedder = struct {
                 const err = Object{ .value = @intFromPtr(err_ptr) };
                 const desc_sel = objc.Sel.registerName("localizedDescription");
                 const desc = err.msgSend([*:0]const u8, desc_sel, .{});
-                std.log.err("Failed to compile CoreML model: {s}\n", .{desc});
+                std.log.err("Failed to compile CoreML model: {s}", .{desc});
                 return error.ModelCompileFailed;
             }
             if (compiled_url.value == 0) {
-                std.log.err("Compiled URL is null\n", .{});
+                std.log.err("Compiled URL is null", .{});
                 return error.ModelCompileFailed;
             }
             break :compiled compiled_url;
@@ -497,11 +497,11 @@ pub const MpnetEmbedder = struct {
             const err = Object{ .value = @intFromPtr(err_ptr) };
             const desc_sel = objc.Sel.registerName("localizedDescription");
             const desc = err.msgSend([*:0]const u8, desc_sel, .{});
-            std.log.err("Failed to load CoreML model: {s}\n", .{desc});
+            std.log.err("Failed to load CoreML model: {s}", .{desc});
             return error.ModelLoadFailed;
         }
         if (model.value == 0) {
-            std.log.err("Model is null\n", .{});
+            std.log.err("Model is null", .{});
             return error.ModelLoadFailed;
         }
 
@@ -568,11 +568,11 @@ pub const MpnetEmbedder = struct {
         defer zone.end();
 
         if (str.len == 0) {
-            std.log.info("Skipping embed of zero-length string\n", .{});
+            std.log.info("Skipping embed of zero-length string", .{});
             return null;
         }
         if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
-            std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'\n", .{str});
+            std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
         }
 
         const token_ids = try self.tokenizer.tokenize(allocator, str);
@@ -630,11 +630,11 @@ pub const MpnetEmbedder = struct {
         var n: usize = 0;
         for (strs, 0..) |str, i| {
             if (str.len == 0) {
-                std.log.info("Skipping embed of zero-length string\n", .{});
+                std.log.info("Skipping embed of zero-length string", .{});
                 continue;
             }
             if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
-                std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'\n", .{str});
+                std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
             }
             const token_ids = try self.tokenizer.tokenize(allocator, str);
             tokens[n] = token_ids[0..@min(token_ids.len, SINGLE.seq)];
@@ -867,11 +867,11 @@ pub const MpnetEmbedder = struct {
             const desc_ns = err_obj.msgSend(Object, desc_sel, .{});
             const utf8_sel = objc.Sel.registerName("UTF8String");
             const desc = desc_ns.msgSend([*:0]const u8, utf8_sel, .{});
-            std.log.err("Prediction failed: {s}\n", .{desc});
+            std.log.err("Prediction failed: {s}", .{desc});
             return error.PredictionFailed;
         }
         if (prediction.value == 0) {
-            std.log.err("Prediction returned null (no error reported)\n", .{});
+            std.log.err("Prediction returned null (no error reported)", .{});
             return error.PredictionFailed;
         }
         // End of the prediction block
@@ -879,13 +879,13 @@ pub const MpnetEmbedder = struct {
         const output_key = NSString.msgSend(Object, fromUTF8, .{"last_hidden_state"});
         const output_fv = prediction.msgSend(Object, featureValueForName, .{output_key});
         if (output_fv.value == 0) {
-            std.log.err("Output feature value is null\n", .{});
+            std.log.err("Output feature value is null", .{});
             return error.OutputNotFound;
         }
 
         const output_array = output_fv.msgSend(Object, multiArrayValue_sel, .{});
         if (output_array.value == 0) {
-            std.log.err("Output multi array is null\n", .{});
+            std.log.err("Output multi array is null", .{});
             return error.OutputNotFound;
         }
 
@@ -940,7 +940,7 @@ pub const MpnetEmbedder = struct {
                     }
                 },
                 else => {
-                    std.log.err("Unsupported CoreML output dataType {d}\n", .{data_type});
+                    std.log.err("Unsupported CoreML output dataType {d}", .{data_type});
                     return error.UnsupportedOutputDataType;
                 },
             }
@@ -1031,7 +1031,7 @@ fn preferPrecompiled(allocator: Allocator, io: std.Io, path: [:0]const u8) ![:0]
 fn getExeRelativePath(allocator: Allocator, io: std.Io, relative_path: []const u8) ![:0]const u8 {
     var exe_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const exe_path_len = std.process.executableDirPath(io, &exe_path_buf) catch |err| {
-        std.log.err("Failed to get executable path: {}\n", .{err});
+        std.log.err("Failed to get executable path: {}", .{err});
         return error.ExePathFailed;
     };
     const exe_path = exe_path_buf[0..exe_path_len];
@@ -1152,11 +1152,11 @@ pub const NLEmbedder = struct {
         const getVectorForString = objc.Sel.registerName("getVector:forString:");
 
         if (str.len == 0 or str[0] == 0) {
-            std.log.info("Skipping embed of zero-length string\n", .{});
+            std.log.info("Skipping embed of zero-length string", .{});
             return null;
         }
         if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
-            std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'\n", .{str});
+            std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
         }
 
         const c_str = try std.fmt.allocPrintSentinel(allocator, "{s}", .{str}, 0);
@@ -1173,7 +1173,7 @@ pub const NLEmbedder = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (!self.embedder_obj.msgSend(bool, getVectorForString, .{ vec_buf, objc_str })) {
-            std.log.warn("Failed to embed '{s}'\n", .{str[0..@min(str.len, 10)]});
+            std.log.warn("Failed to embed '{s}'", .{str[0..@min(str.len, 10)]});
             return null;
         }
 
@@ -1284,11 +1284,11 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
         defer zone.end();
 
         if (str.len == 0) {
-            std.log.info("Skipping embed of zero-length string\n", .{});
+            std.log.info("Skipping embed of zero-length string", .{});
             return null;
         }
         if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
-            std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'\n", .{str});
+            std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
         }
 
         // The bridge takes a C string; anything past MAX_CTX is truncated there.
@@ -1348,11 +1348,11 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
         var n: usize = 0;
         for (strs, 0..) |str, i| {
             if (str.len == 0) {
-                std.log.info("Skipping embed of zero-length string\n", .{});
+                std.log.info("Skipping embed of zero-length string", .{});
                 continue;
             }
             if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
-                std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'\n", .{str});
+                std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
             }
             // The bridge takes a C string; anything past MAX_CTX is truncated there.
             c_strs[n] = (try allocator.dupeSentinel(u8, str, 0)).ptr;
