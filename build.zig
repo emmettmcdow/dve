@@ -98,6 +98,11 @@ pub fn build(b: *std.Build) !void {
     fake_options.addOption(StorageQuantize, "quant", .none);
     fake_options.addOption(bool, "llama", false);
 
+    // build.zig.zon itself, importable as "zon", so the source can read what the manifest
+    // pins rather than repeat it. One module shared by everything that compiles src/: a
+    // file cannot belong to two modules.
+    const zon_mod = b.createModule(.{ .root_source_file = b.path("build.zig.zon") });
+
     ////////////////////
     // Public Module  //
     ////////////////////
@@ -107,6 +112,7 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "config", .module = real_options.createModule() },
             .{ .name = "objc", .module = objc_dep.module("objc") },
             .{ .name = "tracy", .module = tracy_dep.module("tracy") },
+            .{ .name = "zon", .module = zon_mod },
         },
     });
     // Carried on the module itself so consumers don't link these by hand: a
@@ -161,6 +167,7 @@ pub fn build(b: *std.Build) !void {
             objc: *std.Build.Dependency,
             tr: *std.Build.Dependency,
             tr_enable: bool,
+            zon: *std.Build.Module,
         ) void {
             t.root_module.addOptions("config", cfg);
             t.root_module.addImport("objc", objc.module("objc"));
@@ -174,6 +181,7 @@ pub fn build(b: *std.Build) !void {
                 t.root_module.linkLibrary(tr.artifact("tracy"));
                 t.root_module.link_libcpp = true;
             }
+            t.root_module.addImport("zon", zon);
         }
     }.real;
 
@@ -306,7 +314,7 @@ pub fn build(b: *std.Build) !void {
             }),
             .filters = if (test_filter != null) filters else &.{"embed."},
         });
-        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
         // Compiles src/ directly, so it does not inherit the bridge from dve_mod.
         if (llama_bridge) |bridge| bridge.link(t.root_module);
         const run = runTest(b, t, use_lldb);
@@ -325,7 +333,7 @@ pub fn build(b: *std.Build) !void {
             }),
             .filters = if (test_filter != null) filters else &.{"vector."},
         });
-        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
         // Compiles src/ directly, so it does not inherit the bridge from dve_mod.
         if (llama_bridge) |bridge| bridge.link(t.root_module);
         const run = runTest(b, t, use_lldb);
@@ -345,7 +353,7 @@ pub fn build(b: *std.Build) !void {
             .filters = if (test_filter != null) filters else &.{},
         });
         t.root_module.addImport("dve", dve_mod);
-        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
         // Its own options module: "config" already reaches this binary through dve, and a
         // file cannot belong to two modules.
         const bench_options = b.addOptions();
@@ -369,7 +377,7 @@ pub fn build(b: *std.Build) !void {
             .filters = if (test_filter != null) filters else &.{},
         });
         t.root_module.addImport("dve", dve_mod);
-        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable);
+        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
         const run = runTest(b, t, use_lldb);
         for (model_installs) |s| run.step.dependOn(s);
         run.step.dependOn(precompiled_model);
@@ -395,7 +403,7 @@ pub fn build(b: *std.Build) !void {
             }),
         });
         exe.root_module.addImport("dve", dve_mod);
-        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
+        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
 
         // Installed by this step only, so a plain `zig build` doesn't build the
         // harness. The embedder resolves model assets relative to the
@@ -422,7 +430,7 @@ pub fn build(b: *std.Build) !void {
             }),
         });
         exe.root_module.addImport("dve", dve_mod);
-        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
+        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
         storebench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
@@ -444,7 +452,7 @@ pub fn build(b: *std.Build) !void {
             }),
         });
         exe.root_module.addImport("dve", dve_mod);
-        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
+        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
         binrecall_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
@@ -486,7 +494,7 @@ pub fn build(b: *std.Build) !void {
             }),
         });
         exe.root_module.addImport("dve", dve_mod);
-        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
+        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
         codesbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
@@ -508,7 +516,7 @@ pub fn build(b: *std.Build) !void {
             }),
         });
         exe.root_module.addImport("dve", dve_mod);
-        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
+        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
         // The CoreML backend resolves its model bundle relative to the executable.
         for (model_installs) |s| embedbench_step.dependOn(s);
         embedbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
@@ -533,7 +541,7 @@ pub fn build(b: *std.Build) !void {
             }),
         });
         exe.root_module.addImport("dve", dve_mod);
-        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable);
+        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
         for (model_installs) |s| beirbench_step.dependOn(s);
         beirbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
         beirbench_step.dependOn(b.getInstallStep());
@@ -598,6 +606,7 @@ pub fn build(b: *std.Build) !void {
                     .{ .name = "config", .module = xcfw_options.createModule() },
                     .{ .name = "objc", .module = objc_dep.module("objc") },
                     .{ .name = "tracy", .module = xcfw_tracy.module("tracy") },
+                    .{ .name = "zon", .module = zon_mod },
                 },
             }));
             lib.root_module.linkFramework("NaturalLanguage", .{});

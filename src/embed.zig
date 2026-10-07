@@ -191,8 +191,9 @@ pub const MpnetEmbedder = struct {
     pub const BUNDLE_TOKENIZER_PATH = "tokenizer.json";
     /// Fetches the model and tokenizer into ./all_mpnet_base_v2/. The release is the one
     /// build.zig.zon pins as `coreml_models`; keep the two, and USAGE.md, in step.
-    pub const DOWNLOAD_CMD = "curl -L https://github.com/emmettmcdow/dve/releases/download/" ++
-        "coreml-models-v6/coreml_models_v6.tar.gz | tar -xz all_mpnet_base_v2";
+    pub const DOWNLOAD_CMD = "curl -L " ++
+        zon.dependencies.coreml_models.url ++
+        " | tar -xz all_mpnet_base_v2";
     const MAX_SEQ_LEN = 512;
 
     /// An input shape the model was converted for. The Neural Engine takes fixed shapes
@@ -2193,6 +2194,7 @@ const db_suffix = @import("vec_util.zig").db_suffix;
 const validateL2 = @import("vec_util.zig").validateL2;
 const WordPieceTokenizer = tokenizer_mod.WordPieceTokenizer;
 const Mutex = std.Io.Mutex;
+const zon = @import("zon");
 
 /// An environment variable of this process, or null. Read through libc, which is always
 /// linked here: std hands the environment to `main` now rather than keeping it global, and a
