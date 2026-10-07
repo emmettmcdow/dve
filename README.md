@@ -56,5 +56,5 @@ See [USAGE.md](./USAGE.md) for installation and full usage details.
 - iOS support.
 - Multi-modal embedding support.
 - Download links within text documents and embed them.
-- Support for multiple model types (beyond mpnet and Apple NL).
+- Generalize llama.cpp and CoreML engines to run any supported model.
 - Support multiple database instances within a single process.
