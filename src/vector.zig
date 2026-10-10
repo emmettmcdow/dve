@@ -21,6 +21,11 @@ pub const SearchResult = struct {
     similarity: f32 = 0.0,
 };
 
+const WorkQueueSz = union(enum) {
+    fixed: u32,
+    growable: void,
+};
+
 /// Optional overrides for the files an embedding model loads at startup. A null field leaves
 /// the embedder's own default in place; see each embedder's `InitOptions` for what that is.
 /// Embedding models that need no files of their own -- currently `.apple_nlembedding` --
@@ -41,6 +46,8 @@ pub const InitOptions = struct {
     /// Threads for the code scan. Null is the CPU count. Four saturate memory
     /// bandwidth on the machine this was measured on; see `experiments/results/hamscan.md`.
     scan_threads: ?usize = null,
+    /// Growth behavior of the asynchronous work queue.
+    work_queue_size: WorkQueueSz = .{ .fixed = 1024 },
 };
 
 const BaseEmbedder = union(EmbeddingModel) {
@@ -92,6 +99,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         /// module imports the other.
         pub const VecCodes = codes.Codes(VEC_SZ, STORED_VEC_TYPE, codes.DEFAULT_BITS);
         pub const quant = config.quant;
+        pub const WorkQueue = UniqueCircularBuffer(EmbedJob, u64, EmbedJob.id);
 
         /// Converts a vector as the embedder produced it into the form VecStorage holds.
         /// The switch is on a comptime config value, so only the configured prong is
@@ -103,8 +111,6 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 .i_8 => quant32toi8(VEC_SZ, v),
             };
         }
-
-        const WorkQueue = UniqueCircularBuffer(EmbedJob, u64, EmbedJob.id);
 
         base_embedder: BaseEmbedder,
         embedder: embed.Embedder,
@@ -210,7 +216,11 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 try reconcile(allocator, &vecs, &vcodes, note_id_map);
             }
 
-            const wq = try WorkQueue.init(allocator, io, 1024);
+            const wqopts: WorkQueue.BufOpts = switch (opts.work_queue_size) {
+                .fixed => |sz| .{ .sz = sz },
+                .growable => .{ .growable = true },
+            };
+            const wq = try WorkQueue.init(allocator, io, wqopts);
 
             const self = try allocator.create(Self);
             self.* = .{
@@ -2113,6 +2123,7 @@ const isAlphanumeric = std.ascii.isAlphanumeric;
 const note_id_map_mod = @import("note_id_map.zig");
 const NoteID = note_id_map_mod.NoteID;
 const NoteIdMap = note_id_map_mod.NoteIdMap;
+const EmbeddingModelOutput = embed.EmbeddingModelOutput;
 
 const NLEmbedder = embed.NLEmbedder;
 const MpnetEmbedder = embed.MpnetEmbedder;

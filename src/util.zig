@@ -1,5 +1,5 @@
 pub fn UniqueCircularBuffer(T: type, ID_T: type, GET_ID_FN: fn (T) ID_T) type {
-    const HashMap = HashMapUnmanaged(ID_T, usize, AutoContext(ID_T), 99);
+    const HashMap = HashMapUnmanaged(ID_T, usize, AutoContext(ID_T), 50);
 
     return struct {
         N: u32,
@@ -7,23 +7,32 @@ pub fn UniqueCircularBuffer(T: type, ID_T: type, GET_ID_FN: fn (T) ID_T) type {
         id_to_idx: *HashMap,
         allocator: Allocator,
         io: Io,
+        growable: bool,
         read_i: usize = 0,
         write_i: usize = 0,
         mutex: Mutex = .init,
 
-        pub const Error = error{Full};
+        pub const Error = error{ Full, TooSmall };
+        pub const DEFAULT_SZ: u32 = 1024;
 
-        pub fn init(allocator: Allocator, io: Io, sz: u32) !*@This() {
+        pub const BufOpts = struct {
+            sz: u32 = DEFAULT_SZ,
+            growable: bool = false,
+        };
+
+        pub fn init(allocator: Allocator, io: Io, opts: BufOpts) !*@This() {
+            if (opts.sz < 2) return Error.TooSmall;
             var map = try allocator.create(HashMap);
             map.* = .empty;
-            try map.ensureTotalCapacity(allocator, sz);
+            try map.ensureTotalCapacity(allocator, opts.sz);
             const self = try allocator.create(@This());
             self.* = .{
-                .N = sz,
-                .ring_buf = try allocator.alloc(T, sz),
+                .N = opts.sz,
+                .ring_buf = try allocator.alloc(T, opts.sz),
                 .id_to_idx = map,
                 .allocator = allocator,
                 .io = io,
+                .growable = opts.growable,
             };
             return self;
         }
@@ -57,7 +66,7 @@ pub fn UniqueCircularBuffer(T: type, ID_T: type, GET_ID_FN: fn (T) ID_T) type {
         /// An item whose id is already queued replaces the queued one in place, keeping its
         /// position. The replaced item is returned so the caller can release anything it
         /// owns; dropping the return value leaks it.
-        pub fn push(self: *@This(), item: T) Error!?T {
+        pub fn push(self: *@This(), item: T) !?T {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
@@ -69,7 +78,24 @@ pub fn UniqueCircularBuffer(T: type, ID_T: type, GET_ID_FN: fn (T) ID_T) type {
             }
 
             if ((self.write_i + 1) % self.N == self.read_i) {
-                return error.Full;
+                if (self.growable) {
+                    const new_n = self.N * 2;
+                    try self.id_to_idx.ensureTotalCapacity(self.allocator, new_n);
+                    self.ring_buf = try self.allocator.realloc(self.ring_buf, new_n);
+                    if (self.read_i != 0) {
+                        const new_write_i = self.N + self.write_i;
+                        @memcpy(self.ring_buf[self.N..new_write_i], self.ring_buf[0..self.write_i]);
+                        for (self.N..new_write_i) |i| {
+                            const v = self.ring_buf[i];
+                            const id = GET_ID_FN(v);
+                            self.id_to_idx.getPtr(id).?.* = i;
+                        }
+                        self.write_i = new_write_i;
+                    }
+                    self.N = new_n;
+                } else {
+                    return error.Full;
+                }
             }
             self.ring_buf[self.write_i] = item;
             self.id_to_idx.putAssumeCapacity(GET_ID_FN(item), self.write_i);
@@ -132,21 +158,21 @@ fn usizeID(a: usize) usize {
 }
 
 test "UniqueCircularBuffer" {
-    const capacity = 4;
     const UsizeCircularBuf = UniqueCircularBuffer(usize, usize, usizeID);
+    const cfg: UsizeCircularBuf.BufOpts = .{ .sz = 4 };
     const allocator = std.testing.allocator;
 
     { // FIFO base
-        var buf = try UsizeCircularBuf.init(allocator, std.testing.io, capacity);
+        var buf = try UsizeCircularBuf.init(allocator, std.testing.io, cfg);
         defer buf.deinit();
-        for (0..capacity - 1) |i| try expectEqual(null, try buf.push(i));
-        for (0..capacity - 1) |i| try expectEqual(i, buf.pop());
+        for (0..cfg.sz - 1) |i| try expectEqual(null, try buf.push(i));
+        for (0..cfg.sz - 1) |i| try expectEqual(i, buf.pop());
     }
     { // Error Cases
-        var buf = try UsizeCircularBuf.init(allocator, std.testing.io, capacity);
+        var buf = try UsizeCircularBuf.init(allocator, std.testing.io, cfg);
         defer buf.deinit();
         try expectEqual(null, buf.pop());
-        for (0..capacity - 1) |i| _ = try buf.push(i);
+        for (0..cfg.sz - 1) |i| _ = try buf.push(i);
         try expectEqual(UsizeCircularBuf.Error.Full, buf.push(4));
     }
     { // Update unique.
@@ -159,7 +185,7 @@ test "UniqueCircularBuffer" {
             }
         };
         const StructCircularBuf = UniqueCircularBuffer(TestStruct, usize, TestStruct.getID);
-        var buf = try StructCircularBuf.init(allocator, std.testing.io, capacity);
+        var buf = try StructCircularBuf.init(allocator, std.testing.io, .{ .sz = 4 });
         defer buf.deinit();
 
         const a = TestStruct{ .id = 1, .val = 1 };
@@ -179,11 +205,114 @@ test "UniqueCircularBuffer" {
         try expectEqualDeep(c, buf.pop());
     }
     { // A replacement does not consume a slot.
-        var buf = try UsizeCircularBuf.init(allocator, std.testing.io, capacity);
+        var buf = try UsizeCircularBuf.init(allocator, std.testing.io, cfg);
         defer buf.deinit();
-        for (0..capacity - 1) |i| _ = try buf.push(i);
+        for (0..cfg.sz - 1) |i| _ = try buf.push(i);
         try expectEqual(0, try buf.push(0));
-        try expectEqual(UsizeCircularBuf.Error.Full, buf.push(capacity));
+        try expectEqual(UsizeCircularBuf.Error.Full, buf.push(cfg.sz));
+    }
+    { // Configurable size
+        const cfg2: UsizeCircularBuf.BufOpts = .{ .sz = 5 };
+        var buf = try UsizeCircularBuf.init(allocator, std.testing.io, cfg2);
+        defer buf.deinit();
+        for (0..cfg2.sz - 1) |i| _ = try buf.push(i);
+        try expectEqual(0, try buf.push(0));
+        try expectEqual(UsizeCircularBuf.Error.Full, buf.push(cfg.sz));
+    }
+    { // Growable setting
+        const cfg2: UsizeCircularBuf.BufOpts = .{ .sz = 5, .growable = true };
+        var buf = try UsizeCircularBuf.init(allocator, std.testing.io, cfg2);
+        defer buf.deinit();
+        for (0..cfg2.sz * 2) |i| _ = try buf.push(i);
+    }
+    { // Old items aren't lost after growth
+        const cfg2: UsizeCircularBuf.BufOpts = .{ .sz = 4, .growable = true };
+        var buf = try UsizeCircularBuf.init(allocator, std.testing.io, cfg2);
+        defer buf.deinit();
+        // [X, X, X, X]
+        // r = 0, w = 0
+        _ = try buf.push(0);
+        // [0, X, X, X]
+        // r = 0, w = 1
+        _ = try buf.push(1);
+        // [0, 1, X, X]
+        // r = 0, w = 2
+        _ = try buf.push(2);
+        // [0, 1, 2, X]
+        // r = 0, w = 3
+        try expectEqual(0, buf.pop());
+        // [X, 1, 2, X]
+        // r = 1, w = 3
+        _ = try buf.push(3);
+        // [X, 1, 2, 3]
+        // r = 1, w = 0
+        _ = try buf.push(4);
+        // [X, 1, 2, 3, (4), X, X, X]
+        // r = 1, w = 4 -- grows
+        try expectEqual(8, buf.N);
+        try expectEqual(1, buf.pop());
+    }
+    { // too small
+        try expectError(
+            UsizeCircularBuf.Error.TooSmall,
+            UsizeCircularBuf.init(allocator, std.testing.io, .{ .sz = 1 }),
+        );
+    }
+}
+
+test "UniqueCircularBuffer growth keeps order" {
+    const Buf = UniqueCircularBuffer(usize, usize, usizeID);
+    const allocator = std.testing.allocator;
+    const sz = 4;
+
+    // `offset` rotates read_i/write_i before filling, so growth is hit at every
+    // position: offset 0 is the unwrapped case, the rest are wrapped.
+    for (0..sz) |offset| {
+        var buf = try Buf.init(allocator, std.testing.io, .{ .sz = sz, .growable = true });
+        defer buf.deinit();
+
+        for (0..offset) |i| {
+            _ = try buf.push(1000 + i);
+            try expectEqual(1000 + i, buf.pop());
+        }
+
+        // Enough to grow twice.
+        const n = sz * 4;
+        for (0..n) |i| try expectEqual(null, try buf.push(i));
+        for (0..n) |i| try expectEqual(i, buf.pop());
+        try expectEqual(null, buf.pop());
+    }
+}
+
+test "UniqueCircularBuffer replace after growth" {
+    const Item = struct {
+        id: usize,
+        val: usize,
+        fn getID(self: @This()) usize {
+            return self.id;
+        }
+    };
+    const Buf = UniqueCircularBuffer(Item, usize, Item.getID);
+    const allocator = std.testing.allocator;
+    const sz = 4;
+
+    for (0..sz) |offset| {
+        var buf = try Buf.init(allocator, std.testing.io, .{ .sz = sz, .growable = true });
+        defer buf.deinit();
+
+        for (0..offset) |i| {
+            _ = try buf.push(.{ .id = 1000 + i, .val = 0 });
+            _ = buf.pop();
+        }
+
+        const n = sz * 2;
+        for (0..n) |i| _ = try buf.push(.{ .id = i, .val = 0 });
+        // Every queued id must still resolve to its own slot.
+        for (0..n) |i| {
+            try expectEqualDeep(Item{ .id = i, .val = 0 }, try buf.push(.{ .id = i, .val = 1 }));
+        }
+        for (0..n) |i| try expectEqualDeep(Item{ .id = i, .val = 1 }, buf.pop());
+        try expectEqual(null, buf.pop());
     }
 }
 
@@ -364,6 +493,7 @@ const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
 const AutoContext = std.hash_map.AutoContext;
 const expectEqual = std.testing.expectEqual;
+const expectError = std.testing.expectError;
 const expectEqualDeep = std.testing.expectEqualDeep;
 const HashMapUnmanaged = std.hash_map.HashMapUnmanaged;
 const Io = std.Io;
