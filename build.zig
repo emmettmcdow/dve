@@ -31,6 +31,11 @@ pub fn build(b: *std.Build) !void {
         "bench-report",
         "Print the embedding quality benchmark's scores even when they match their baselines",
     ) orelse false;
+    const tsan = b.option(
+        bool,
+        "tsan",
+        "Build the tests with ThreadSanitizer (default: false)",
+    ) orelse false;
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -193,6 +198,7 @@ pub fn build(b: *std.Build) !void {
                 .root_source_file = b.path("src/vec_storage.zig"),
                 .target = target,
                 .optimize = optimize,
+                .sanitize_thread = tsan,
             }),
             .filters = if (test_filter != null) filters else &.{"vec_storage."},
         });
@@ -212,6 +218,7 @@ pub fn build(b: *std.Build) !void {
                 .root_source_file = b.path("src/pfile.zig"),
                 .target = target,
                 .optimize = optimize,
+                .sanitize_thread = tsan,
             }),
             .filters = if (test_filter != null) filters else &.{"pfile."},
         });
@@ -228,6 +235,7 @@ pub fn build(b: *std.Build) !void {
                 .root_source_file = b.path("src/vstore.zig"),
                 .target = target,
                 .optimize = optimize,
+                .sanitize_thread = tsan,
             }),
             .filters = if (test_filter != null) filters else &.{"vstore."},
         });
@@ -249,6 +257,7 @@ pub fn build(b: *std.Build) !void {
                 .root_source_file = b.path("src/codes.zig"),
                 .target = target,
                 .optimize = optimize,
+                .sanitize_thread = tsan,
             }),
             .filters = if (test_filter != null) filters else &.{"codes."},
         });
@@ -265,6 +274,7 @@ pub fn build(b: *std.Build) !void {
                 .root_source_file = b.path("src/note_id_map.zig"),
                 .target = target,
                 .optimize = optimize,
+                .sanitize_thread = tsan,
             }),
             .filters = if (test_filter != null) filters else &.{"note_id_map."},
         });
@@ -284,6 +294,7 @@ pub fn build(b: *std.Build) !void {
                 .root_source_file = b.path("src/util.zig"),
                 .target = target,
                 .optimize = optimize,
+                .sanitize_thread = tsan,
             }),
             .filters = if (test_filter != null) filters else &.{"util."},
         });
@@ -298,6 +309,7 @@ pub fn build(b: *std.Build) !void {
                 .root_source_file = b.path("src/tokenizer.zig"),
                 .target = target,
                 .optimize = optimize,
+                .sanitize_thread = tsan,
             }),
             .filters = if (test_filter != null) filters else &.{"tokenizer."},
         });
@@ -311,6 +323,7 @@ pub fn build(b: *std.Build) !void {
                 .root_source_file = b.path("src/embed.zig"),
                 .target = target,
                 .optimize = optimize,
+                .sanitize_thread = tsan,
             }),
             .filters = if (test_filter != null) filters else &.{"embed."},
         });
@@ -330,6 +343,7 @@ pub fn build(b: *std.Build) !void {
                 .root_source_file = b.path("src/vector.zig"),
                 .target = target,
                 .optimize = optimize,
+                .sanitize_thread = tsan,
             }),
             .filters = if (test_filter != null) filters else &.{"vector."},
         });
@@ -349,6 +363,7 @@ pub fn build(b: *std.Build) !void {
                 .root_source_file = b.path("src/benchmark.zig"),
                 .target = target,
                 .optimize = optimize,
+                .sanitize_thread = tsan,
             }),
             .filters = if (test_filter != null) filters else &.{},
         });
@@ -373,6 +388,7 @@ pub fn build(b: *std.Build) !void {
                 .root_source_file = b.path("src/profile.zig"),
                 .target = target,
                 .optimize = optimize,
+                .sanitize_thread = tsan,
             }),
             .filters = if (test_filter != null) filters else &.{},
         });

@@ -127,6 +127,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         work_queue_mutex: std.Io.Mutex = .init,
         work_queue_condition: std.Io.Condition = .init,
         work_queue_running: bool,
+        store_mutex: std.Io.Mutex = .init,
 
         /// **`allocator` must be thread-safe.** The engine runs a background embedding thread
         /// from the moment `init` returns, and both it and the caller's thread allocate from
@@ -494,21 +495,24 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             const query_vec: StoredArray = toStored(@field(query_vec_union, @tagName(embedding_model)).*);
 
             debugSearchHeader(query);
-            const scored = try self.twoStage(arena.allocator(), &query_vec, max_results);
-            var found_n: usize = 0;
-            for (scored) |sc| {
-                const p = self.note_id_map.getPath(sc.row.doc_id) orelse continue;
-                buf[found_n] = SearchResult{
-                    .path = p,
-                    .start_i = sc.row.start_i,
-                    .end_i = sc.row.end_i,
-                    .similarity = sc.similarity,
-                };
-                found_n += 1;
+            { // hold the lock when accessing the stores
+                self.store_mutex.lockUncancelable(self.io);
+                defer self.store_mutex.unlock(self.io);
+                const scored = try self.twoStage(arena.allocator(), &query_vec, max_results);
+                var found_n: usize = 0;
+                for (scored) |sc| {
+                    const p = self.note_id_map.getPath(sc.row.doc_id) orelse continue;
+                    buf[found_n] = SearchResult{
+                        .path = p,
+                        .start_i = sc.row.start_i,
+                        .end_i = sc.row.end_i,
+                        .similarity = sc.similarity,
+                    };
+                    found_n += 1;
+                }
+                std.log.info("Found {d} results searching with `{s}`", .{ found_n, query });
+                return found_n;
             }
-
-            std.log.info("Found {d} results searching with `{s}`", .{ found_n, query });
-            return found_n;
         }
 
         /// Searches the vector database. Each path/key will be unique in the results.
@@ -527,31 +531,34 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             const query_vec: StoredArray = toStored(@field(query_vec_union, @tagName(embedding_model)).*);
 
             debugSearchHeader(query);
-            // Over-fetches, because collapsing to one hit per path can discard most of a
-            // result set: a long document matching well occupies many of the top rows.
-            const scored = try self.twoStage(arena.allocator(), &query_vec, self.candidates);
-            const found_n = scored.len;
-            var unique_found_n: usize = 0;
-            outer: for (scored) |sc| {
-                if (unique_found_n >= buf.len) break;
-                const path = self.note_id_map.getPath(sc.row.doc_id) orelse continue;
-                for (0..unique_found_n) |j| {
-                    if (std.mem.eql(u8, buf[j].path, path)) continue :outer;
+            { // hold the lock when accessing the stores
+                self.store_mutex.lockUncancelable(self.io);
+                defer self.store_mutex.unlock(self.io);
+                // Over-fetches, because collapsing to one hit per path can discard most of a
+                // result set: a long document matching well occupies many of the top rows.
+                const scored = try self.twoStage(arena.allocator(), &query_vec, self.candidates);
+                const found_n = scored.len;
+                var unique_found_n: usize = 0;
+                outer: for (scored) |sc| {
+                    if (unique_found_n >= buf.len) break;
+                    const path = self.note_id_map.getPath(sc.row.doc_id) orelse continue;
+                    for (0..unique_found_n) |j| {
+                        if (std.mem.eql(u8, buf[j].path, path)) continue :outer;
+                    }
+                    buf[unique_found_n] = SearchResult{
+                        .path = path,
+                        .start_i = sc.row.start_i,
+                        .end_i = sc.row.end_i,
+                        .similarity = sc.similarity,
+                    };
+                    unique_found_n += 1;
                 }
-                buf[unique_found_n] = SearchResult{
-                    .path = path,
-                    .start_i = sc.row.start_i,
-                    .end_i = sc.row.end_i,
-                    .similarity = sc.similarity,
-                };
-                unique_found_n += 1;
+                std.log.info(
+                    "Condensed {d} duplicate results to {d} duplicate searching with {s}\n",
+                    .{ found_n, unique_found_n, query },
+                );
+                return unique_found_n;
             }
-
-            std.log.info(
-                "Condensed {d} duplicate results to {d} duplicate searching with {s}\n",
-                .{ found_n, unique_found_n, query },
-            );
-            return unique_found_n;
         }
 
         /// Given a sentence(result_content), highlight words in the sentence that most match the
@@ -705,27 +712,31 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 return;
             }
 
-            // A path the manifest has never seen cannot have vectors, because an id is
-            // durable before any row carries it (see note_id_map.createId). So asking first
-            // and keeping the answer lets `replaceVectors` skip hunting for rows to replace,
-            // which is a scan of the entire store.
-            //
-            // Re-embedding an existing path still pays that scan. At corpus scale it is the
-            // dominant cost of an update and wants a doc_id -> slots index; that is a
-            // separate change, and `vecsForDoc` is where it goes.
-            const existing = self.note_id_map.getId(path);
-            const note_id = existing orelse try self.note_id_map.createId(path);
-            // A name created just now exists only to label the vectors below. If they do not
-            // land, the name would describe nothing and the document would look indexed
-            // while being unsearchable, so take it back out. An id that was already there
-            // must survive: its older vectors are still in the store and still its own.
-            errdefer if (existing == null) {
-                self.note_id_map.removePath(path) catch |e| std.log.err(
-                    "failed to roll back the path mapping for '{s}' after a failed write: {t}",
-                    .{ path, e },
-                );
-            };
-            try self.replaceVectors(allocator, note_id, embedded_sentences, existing != null);
+            { // Commit to disk
+                self.store_mutex.lockUncancelable(self.io);
+                defer self.store_mutex.unlock(self.io);
+                // A path the manifest has never seen cannot have vectors, because an id is
+                // durable before any row carries it (see note_id_map.createId). So asking first
+                // and keeping the answer lets `replaceVectors` skip hunting for rows to replace,
+                // which is a scan of the entire store.
+                //
+                // Re-embedding an existing path still pays that scan. At corpus scale it is the
+                // dominant cost of an update and wants a doc_id -> slots index; that is a
+                // separate change, and `vecsForDoc` is where it goes.
+                const existing = self.note_id_map.getId(path);
+                const note_id = existing orelse try self.note_id_map.createId(path);
+                // A name created just now exists only to label the vectors below. If they do not
+                // land, the name would describe nothing and the document would look indexed
+                // while being unsearchable, so take it back out. An id that was already there
+                // must survive: its older vectors are still in the store and still its own.
+                errdefer if (existing == null) {
+                    self.note_id_map.removePath(path) catch |e| std.log.err(
+                        "failed to roll back the path mapping for '{s}' after a failed write: {t}",
+                        .{ path, e },
+                    );
+                };
+                try self.replaceVectors(allocator, note_id, embedded_sentences, existing != null);
+            }
 
             std.log.info("Embedded {d} sentences", .{embedded_sentences.len});
         }
@@ -883,6 +894,8 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         /// The trailing `note_id_map.removePath` runs whether or not there was an id, because
         /// it is how a path with no vectors -- the state above -- gets cleaned up.
         pub fn removePath(self: *Self, path: []const u8) !void {
+            self.store_mutex.lockUncancelable(self.io);
+            defer self.store_mutex.unlock(self.io);
             if (path.len == 0) return Error.InvalidPath;
             if (self.note_id_map.getId(path)) |note_id| {
                 // Collected before the removal, because afterwards there is nothing to look up.
@@ -994,6 +1007,8 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         pub fn rawVectorSearch(self: *Self, raw_vec: RawVector, buf: []SearchResult) !usize {
             const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:rawVectorSearch" });
             defer zone.end();
+            self.store_mutex.lockUncancelable(self.io);
+            defer self.store_mutex.unlock(self.io);
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
@@ -1876,6 +1891,198 @@ test "embedTextAsync rejects after shutdown" {
     const path = "test.md";
     db.shutdown();
     try expectEqual(Error.NotQueuedShuttingDown, db.embedTextAsync(path, "pizza"));
+}
+
+fn continuouslyRawSearch(db: *TestVecDB, query: RawVec(.apple_nlembedding), running: *std.atomic.Value(bool)) !void {
+    while (running.load(.acquire)) {
+        var output: [10]SearchResult = undefined;
+        _ = try db.rawVectorSearch(query, &output);
+        std.Thread.yield() catch {}; // Don't hog the CPU!
+    }
+}
+
+test "TSan embed and raw search" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+
+    const query = try rawQueryVec(.apple_nlembedding, &db.embedder, arena.allocator(), "hello");
+    var running = std.atomic.Value(bool).init(true);
+    var t = try spawn(.{}, continuouslyRawSearch, .{ db, query, &running });
+
+    const sentences = 20;
+    const repeated: [sentences][7]u8 = @splat("pizza. ".*);
+    const text: []const u8 = @ptrCast(&repeated);
+    const N = 40;
+    for (0..N) |i| {
+        var path_buf: [16]u8 = undefined;
+        const path = try bufPrint(&path_buf, "test{d}.md", .{i});
+        try db.embedTextAsync(path, text);
+    }
+
+    db.shutdown();
+    running.store(false, .release);
+    t.join();
+
+    try db.validate();
+}
+
+fn continuouslySearch(db: *TestVecDB, running: *std.atomic.Value(bool)) !void {
+    while (running.load(.acquire)) {
+        var output: [10]SearchResult = undefined;
+        _ = try db.search("hello", &output);
+        std.Thread.yield() catch {}; // Don't hog the CPU!
+    }
+}
+
+test "TSan embed and search" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+
+    var running = std.atomic.Value(bool).init(true);
+    var t = try spawn(.{}, continuouslySearch, .{ db, &running });
+
+    const sentences = 20;
+    const repeated: [sentences][7]u8 = @splat("pizza. ".*);
+    const text: []const u8 = @ptrCast(&repeated);
+    const N = 40;
+    for (0..N) |i| {
+        var path_buf: [16]u8 = undefined;
+        const path = try bufPrint(&path_buf, "test{d}.md", .{i});
+        try db.embedTextAsync(path, text);
+    }
+
+    db.shutdown();
+    running.store(false, .release);
+    t.join();
+
+    try db.validate();
+}
+fn continuouslyUniqueSearch(db: *TestVecDB, running: *std.atomic.Value(bool)) !void {
+    while (running.load(.acquire)) {
+        var output: [10]SearchResult = undefined;
+        _ = try db.uniqueSearch("hello", &output);
+        std.Thread.yield() catch {}; // Don't hog the CPU!
+    }
+}
+
+test "TSan embed and unique search" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+
+    var running = std.atomic.Value(bool).init(true);
+    var t = try spawn(.{}, continuouslyUniqueSearch, .{ db, &running });
+
+    const sentences = 20;
+    const repeated: [sentences][7]u8 = @splat("pizza. ".*);
+    const text: []const u8 = @ptrCast(&repeated);
+    const N = 40;
+    for (0..N) |i| {
+        var path_buf: [16]u8 = undefined;
+        const path = try bufPrint(&path_buf, "test{d}.md", .{i});
+        try db.embedTextAsync(path, text);
+    }
+
+    db.shutdown();
+    running.store(false, .release);
+    t.join();
+
+    try db.validate();
+}
+
+fn continuouslyRemove(db: *TestVecDB, running: *std.atomic.Value(bool), max_id: usize) !void {
+    while (running.load(.acquire)) {
+        for (0..max_id) |i| {
+            var path_buf: [16]u8 = undefined;
+            const path = try bufPrint(&path_buf, "test{d}.md", .{i});
+            db.removePath(path) catch {};
+        }
+    }
+}
+
+test "TSan remove" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+
+    var running = std.atomic.Value(bool).init(true);
+    var curr_id = std.atomic.Value(usize).init(0);
+    const N = 20;
+    var t = try spawn(.{}, continuouslyRemove, .{ db, &running, N });
+
+    const sentences = 21;
+    const repeated: [sentences][7]u8 = @splat("pizza. ".*);
+    const text: []const u8 = @ptrCast(&repeated);
+    for (0..N) |i| {
+        var path_buf: [16]u8 = undefined;
+        const path = try bufPrint(&path_buf, "test{d}.md", .{i});
+        try db.embedTextAsync(path, text);
+        curr_id.store(i + 1, .release);
+    }
+
+    db.shutdown();
+    running.store(false, .release);
+    t.join();
+
+    try db.validate();
+}
+
+fn continuouslyEmbed(db: *TestVecDB, running: *std.atomic.Value(bool)) !void {
+    while (running.load(.acquire)) {
+        for (0..20) |i| {
+            var path_buf: [16]u8 = undefined;
+            const path = try bufPrint(&path_buf, "test{d}.md", .{i});
+            const sentences = 20;
+            const repeated: [sentences][7]u8 = @splat("pizza. ".*);
+            const text: []const u8 = @ptrCast(&repeated);
+            try db.embedText(path, text);
+            std.Thread.yield() catch {}; // Don't hog the CPU!
+        }
+    }
+}
+
+test "TSan embed and embed" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var arena = std.heap.ArenaAllocator.init(testing_allocator);
+    defer arena.deinit();
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+
+    var running = std.atomic.Value(bool).init(true);
+    var curr_id = std.atomic.Value(usize).init(0);
+    var t = try spawn(.{}, continuouslyEmbed, .{ db, &running });
+
+    const sentences = 21;
+    const repeated: [sentences][7]u8 = @splat("pizza. ".*);
+    const text: []const u8 = @ptrCast(&repeated);
+    const N = 20;
+    for (0..N) |i| {
+        var path_buf: [16]u8 = undefined;
+        const path = try bufPrint(&path_buf, "test{d}.md", .{i});
+        try db.embedTextAsync(path, text);
+        curr_id.store(i + 1, .release);
+    }
+
+    db.shutdown();
+    running.store(false, .release);
+    t.join();
+
+    try db.validate();
 }
 
 /// A second engine opened over the same directory. Tests use it to assert on what actually
