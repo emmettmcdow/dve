@@ -1893,125 +1893,263 @@ test "embedTextAsync rejects after shutdown" {
     try expectEqual(Error.NotQueuedShuttingDown, db.embedTextAsync(path, "pizza"));
 }
 
-fn continuouslyRawSearch(db: *TestVecDB, query: RawVec(.apple_nlembedding), running: *std.atomic.Value(bool)) !void {
-    while (running.load(.acquire)) {
-        var output: [10]SearchResult = undefined;
-        _ = try db.rawVectorSearch(query, &output);
-        std.Thread.yield() catch {}; // Don't hog the CPU!
-    }
-}
+/// Every public engine method that touches shared state. The TSan pair test runs each one
+/// against every other, and against itself, on two threads at once.
+///
+/// Tag names are the method names, which is what lets the comptime check in that test hold
+/// this list to the engine: a new public method fails the build until it is either added
+/// here or listed in `not_concurrent_ops`.
+const ConcurrentOp = enum {
+    search,
+    uniqueSearch,
+    rawVectorSearch,
+    exactVectorSearch,
+    embedQuery,
+    populateHighlights,
+    embedText,
+    embedTextAsync,
+    removePath,
+    renamePath,
+    reroot,
+    save,
+    saveIndex,
+    pruneOrphanedPaths,
+};
 
-test "TSan embed and raw search" {
-    var tmpD = std.testing.tmpDir(.{ .iterate = true });
-    defer tmpD.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing_allocator);
-    defer arena.deinit();
-    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
-    defer db.deinit();
+/// Public methods the pair test leaves out.
+const not_concurrent_ops = [_][]const u8{
+    // Lifecycle. Nothing may run during or after these, so there is no pairing to test.
+    // `shutdown` against `embedTextAsync` is the exception, and "embedTextAsync rejects after
+    // shutdown" covers it.
+    "init",
+    "deinit",
+    "shutdown",
+    // Test and benchmark support, not something the app calls.
+    "validate",
+    "embedderPathForTest",
+    // Reads only what `init` fixed.
+    "storageFiles",
+};
 
-    const query = try rawQueryVec(.apple_nlembedding, &db.embedder, arena.allocator(), "hello");
-    var running = std.atomic.Value(bool).init(true);
-    var t = try spawn(.{}, continuouslyRawSearch, .{ db, query, &running });
-
-    const sentences = 20;
-    const repeated: [sentences][7]u8 = @splat("pizza. ".*);
-    const text: []const u8 = @ptrCast(&repeated);
-    const N = 40;
-    for (0..N) |i| {
-        var path_buf: [16]u8 = undefined;
-        const path = try bufPrint(&path_buf, "test{d}.md", .{i});
-        try db.embedTextAsync(path, text);
-    }
-
-    db.shutdown();
-    running.store(false, .release);
-    t.join();
-
-    try db.validate();
-}
-
-fn continuouslySearch(db: *TestVecDB, running: *std.atomic.Value(bool)) !void {
-    while (running.load(.acquire)) {
-        var output: [10]SearchResult = undefined;
-        _ = try db.search("hello", &output);
-        std.Thread.yield() catch {}; // Don't hog the CPU!
-    }
-}
-
-test "TSan embed and search" {
-    var tmpD = std.testing.tmpDir(.{ .iterate = true });
-    defer tmpD.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing_allocator);
-    defer arena.deinit();
-    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
-    defer db.deinit();
-
-    var running = std.atomic.Value(bool).init(true);
-    var t = try spawn(.{}, continuouslySearch, .{ db, &running });
-
-    const sentences = 20;
-    const repeated: [sentences][7]u8 = @splat("pizza. ".*);
-    const text: []const u8 = @ptrCast(&repeated);
-    const N = 40;
-    for (0..N) |i| {
-        var path_buf: [16]u8 = undefined;
-        const path = try bufPrint(&path_buf, "test{d}.md", .{i});
-        try db.embedTextAsync(path, text);
-    }
-
-    db.shutdown();
-    running.store(false, .release);
-    t.join();
-
-    try db.validate();
-}
-fn continuouslyUniqueSearch(db: *TestVecDB, running: *std.atomic.Value(bool)) !void {
-    while (running.load(.acquire)) {
-        var output: [10]SearchResult = undefined;
-        _ = try db.uniqueSearch("hello", &output);
-        std.Thread.yield() catch {}; // Don't hog the CPU!
-    }
-}
-
-test "TSan embed and unique search" {
-    var tmpD = std.testing.tmpDir(.{ .iterate = true });
-    defer tmpD.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing_allocator);
-    defer arena.deinit();
-    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
-    defer db.deinit();
-
-    var running = std.atomic.Value(bool).init(true);
-    var t = try spawn(.{}, continuouslyUniqueSearch, .{ db, &running });
-
-    const sentences = 20;
-    const repeated: [sentences][7]u8 = @splat("pizza. ".*);
-    const text: []const u8 = @ptrCast(&repeated);
-    const N = 40;
-    for (0..N) |i| {
-        var path_buf: [16]u8 = undefined;
-        const path = try bufPrint(&path_buf, "test{d}.md", .{i});
-        try db.embedTextAsync(path, text);
-    }
-
-    db.shutdown();
-    running.store(false, .release);
-    t.join();
-
-    try db.validate();
-}
-
-fn continuouslyRemove(db: *TestVecDB, running: *std.atomic.Value(bool), max_id: usize) !void {
-    while (running.load(.acquire)) {
-        for (0..max_id) |i| {
-            var path_buf: [16]u8 = undefined;
-            const path = try bufPrint(&path_buf, "test{d}.md", .{i});
-            db.removePath(path) catch {};
+/// Every unordered pair of ops, including each op with itself.
+const concurrent_op_pairs = blk: {
+    const ops = std.enums.values(ConcurrentOp);
+    var pairs: [ops.len * (ops.len + 1) / 2][2]ConcurrentOp = undefined;
+    var n: usize = 0;
+    for (ops, 0..) |a, i| {
+        for (ops[i..]) |b| {
+            pairs[n] = .{ a, b };
+            n += 1;
         }
     }
+    break :blk pairs;
+};
+
+/// How many documents a pair works over. Seeded before the threads start, so every op has
+/// something to act on from its first call.
+const pair_pool_n = 8;
+/// Calls each side makes at the least. A side keeps going past this until the other side
+/// reaches it too, so the two always overlap for the whole of the shorter run.
+const pair_min_ops = 20;
+/// The floors a pair has to clear to count as having tested anything. Falling under one is a
+/// workload problem, not an engine one: the ops are not reaching the state they are meant to
+/// race on.
+const pair_min_useful = pair_min_ops / 2;
+const pair_min_overlap = pair_min_ops / 2;
+
+const pair_text = "pizza. pizza. pizza. pizza.";
+
+/// Far past what any pair takes, even under TSan: a pair still running at this point has
+/// deadlocked.
+const pair_timeout_ms = 60_000;
+
+/// Turns a deadlocked pair into a failure that names it. Without this the run just stops,
+/// with nothing saying which pair, or that it is stuck rather than slow.
+fn pairWatchdog(done: *const std.atomic.Value(bool), a: ConcurrentOp, b: ConcurrentOp) void {
+    var waited_ms: usize = 0;
+    while (!done.load(.acquire)) : (waited_ms += 100) {
+        if (waited_ms >= pair_timeout_ms) std.debug.panic(
+            "TSan pair {t} x {t} has not finished in {d}s; it is likely deadlocked",
+            .{ a, b, pair_timeout_ms / 1000 },
+        );
+        std.testing.io.sleep(.fromMilliseconds(100), .awake) catch {};
+    }
 }
 
-test "TSan remove" {
+const PairCtx = struct {
+    query: RawVec(.apple_nlembedding),
+    /// Holds a file for every path the workload can produce, so `pruneOrphanedPaths` scans
+    /// the whole manifest and drops nothing. A drop there would orphan vectors by design.
+    notes: std.Io.Dir,
+
+    /// Every name the workload can give document `i`: `renamePath` toggles `renamed`, and
+    /// `reroot` toggles `sub`. Documents start and are added under `home`.
+    const Name = struct { sub: bool, renamed: bool };
+    const home: Name = .{ .sub = false, .renamed = false };
+    const names = [_]Name{
+        home,
+        .{ .sub = false, .renamed = true },
+        .{ .sub = true, .renamed = false },
+        .{ .sub = true, .renamed = true },
+    };
+
+    fn format(buf: []u8, name: Name, i: usize) []const u8 {
+        return bufPrint(buf, "{s}test{d}{s}.md", .{
+            if (name.sub) "sub/" else "",
+            i % pair_pool_n,
+            if (name.renamed) "_renamed" else "",
+        }) catch unreachable;
+    }
+};
+
+/// What one call achieved. A call that returns without error has not necessarily touched
+/// anything: a search of an empty store or a removal of a missing path never reaches the
+/// state the pair is meant to race on.
+const OpOutcome = enum { did_work, no_op };
+
+fn runOp(comptime op: ConcurrentOp, db: *TestVecDB, ctx: *const PairCtx, i: usize) !OpOutcome {
+    var out: [10]SearchResult = undefined;
+    var buf: [32]u8 = undefined;
+    var buf2: [32]u8 = undefined;
+    const found: usize = switch (op) {
+        .search => try db.search("pizza", &out),
+        .uniqueSearch => try db.uniqueSearch("pizza", &out),
+        .rawVectorSearch => try db.rawVectorSearch(ctx.query, &out),
+        .exactVectorSearch => try db.exactVectorSearch(ctx.query, &out),
+        .embedQuery => @intFromBool(try db.embedQuery("pizza") != null),
+        .populateHighlights => blk: {
+            var hl: [4]usize = @splat(std.math.maxInt(usize));
+            try db.populateHighlights("pizza", "I really like pizza", &hl);
+            break :blk @intFromBool(hl[0] != std.math.maxInt(usize));
+        },
+        .embedText => blk: {
+            try db.embedText(PairCtx.format(&buf, PairCtx.home, i), pair_text);
+            break :blk 1;
+        },
+        // Queued is all the call itself does; the embedding happens on the worker.
+        .embedTextAsync => blk: {
+            try db.embedTextAsync(PairCtx.format(&buf, PairCtx.home, i), pair_text);
+            break :blk 1;
+        },
+        // Puts the document back afterwards, so removals do not drain the pool and leave
+        // every later call, on either side, acting on nothing. It goes back under the name it
+        // had, since a `reroot` on the other side drops a document outside the root it is
+        // about to move to.
+        .removePath => blk: {
+            // `removePath` succeeds on a missing path, so the lookup is what says whether it
+            // did anything. Racy, since the other side can move the document in between, but
+            // only as a statistic. Retried for the reason `.renamePath` says.
+            for (0..3) |_| {
+                for (PairCtx.names) |name| {
+                    const p = PairCtx.format(&buf, name, i);
+                    if (db.note_id_map.getId(p) == null) continue;
+                    try db.removePath(p);
+                    try db.embedText(p, pair_text);
+                    break :blk 1;
+                }
+            }
+            const p = PairCtx.format(&buf, PairCtx.home, i);
+            try db.removePath(p);
+            try db.embedText(p, pair_text);
+            break :blk 0;
+        },
+        // Back and forth between two names, so there is always one to move. Tries each name
+        // the document could have rather than looking first, and a few times over, because a
+        // `reroot` on the other side flips every name between any two calls this side makes.
+        .renamePath => blk: {
+            for (0..3) |_| {
+                for (PairCtx.names) |name| {
+                    const from = PairCtx.format(&buf, name, i);
+                    const to = PairCtx.format(&buf2, .{ .sub = name.sub, .renamed = !name.renamed }, i);
+                    if (db.renamePath(from, to)) |_| break :blk 1 else |e| {
+                        if (e != error.NotFound) return e;
+                    }
+                }
+            }
+            break :blk 0;
+        },
+        // Down a level and back up, so every other call sees the paths it started with.
+        .reroot => blk: {
+            const move: note_id_map_mod.Reroot = if (i % 2 == 0)
+                .{ .deeper = "sub" }
+            else
+                .{ .shallower = "sub" };
+            _ = try db.reroot(move);
+            break :blk 1;
+        },
+        .save => blk: {
+            try db.save();
+            break :blk 1;
+        },
+        .saveIndex => blk: {
+            try db.saveIndex();
+            break :blk 1;
+        },
+        .pruneOrphanedPaths => blk: {
+            try db.pruneOrphanedPaths(ctx.notes);
+            break :blk 1;
+        },
+    };
+    return if (found > 0) .did_work else .no_op;
+}
+
+/// One thread's half of a pair.
+const PairSide = struct {
+    /// Where this side starts in the path pool. Two sides walking the same paths in lockstep
+    /// would only ever find what the other just did: a removal right behind another removal
+    /// finds nothing to remove.
+    path_offset: usize = 0,
+    ops: std.atomic.Value(usize) = .init(0),
+    in_flight: std.atomic.Value(bool) = .init(false),
+    // Written only by this side's thread, and read after it joins.
+    overlapped: usize = 0,
+    useful: usize = 0,
+    err: ?anyerror = null,
+};
+
+fn PairHammer(comptime op: ConcurrentOp) type {
+    return struct {
+        fn run(
+            db: *TestVecDB,
+            ctx: *const PairCtx,
+            me: *PairSide,
+            other: *const PairSide,
+            start: *const std.atomic.Value(bool),
+        ) void {
+            loop(db, ctx, me, other, start) catch |e| {
+                me.err = e;
+                // Lets the other side's loop end instead of waiting on calls this one will
+                // never make.
+                me.ops.store(std.math.maxInt(usize), .release);
+            };
+        }
+
+        fn loop(
+            db: *TestVecDB,
+            ctx: *const PairCtx,
+            me: *PairSide,
+            other: *const PairSide,
+            start: *const std.atomic.Value(bool),
+        ) !void {
+            while (!start.load(.acquire)) std.atomic.spinLoopHint();
+            while (me.ops.load(.monotonic) < pair_min_ops or
+                other.ops.load(.acquire) < pair_min_ops)
+            {
+                // seq_cst on both sides, so two calls starting together cannot each miss the
+                // other's flag.
+                me.in_flight.store(true, .seq_cst);
+                if (other.in_flight.load(.seq_cst)) me.overlapped += 1;
+                const outcome = try runOp(op, db, ctx, me.path_offset + me.ops.load(.monotonic));
+                me.in_flight.store(false, .release);
+                if (outcome == .did_work) me.useful += 1;
+                _ = me.ops.fetchAdd(1, .release);
+                std.Thread.yield() catch {};
+            }
+        }
+    };
+}
+
+fn runPair(comptime a_op: ConcurrentOp, comptime b_op: ConcurrentOp, notes: std.Io.Dir) !void {
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
     var arena = std.heap.ArenaAllocator.init(testing_allocator);
@@ -2019,70 +2157,84 @@ test "TSan remove" {
     var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
     defer db.deinit();
 
-    var running = std.atomic.Value(bool).init(true);
-    var curr_id = std.atomic.Value(usize).init(0);
-    const N = 20;
-    var t = try spawn(.{}, continuouslyRemove, .{ db, &running, N });
-
-    const sentences = 21;
-    const repeated: [sentences][7]u8 = @splat("pizza. ".*);
-    const text: []const u8 = @ptrCast(&repeated);
-    for (0..N) |i| {
-        var path_buf: [16]u8 = undefined;
-        const path = try bufPrint(&path_buf, "test{d}.md", .{i});
-        try db.embedTextAsync(path, text);
-        curr_id.store(i + 1, .release);
+    for (0..pair_pool_n) |i| {
+        var buf: [32]u8 = undefined;
+        try db.embedText(PairCtx.format(&buf, PairCtx.home, i), pair_text);
     }
+    const ctx: PairCtx = .{
+        .query = try rawQueryVec(.apple_nlembedding, &db.embedder, arena.allocator(), "pizza"),
+        .notes = notes,
+    };
 
-    db.shutdown();
-    running.store(false, .release);
+    var a: PairSide = .{};
+    var b: PairSide = .{ .path_offset = pair_pool_n / 2 };
+    var start = std.atomic.Value(bool).init(false);
+    var done = std.atomic.Value(bool).init(false);
+    const watchdog = try spawn(.{}, pairWatchdog, .{ &done, a_op, b_op });
+    defer watchdog.join();
+    defer done.store(true, .release);
+    const t = try spawn(.{}, PairHammer(a_op).run, .{ db, &ctx, &a, &b, &start });
+    start.store(true, .release);
+    PairHammer(b_op).run(db, &ctx, &b, &a, &start);
     t.join();
+    db.shutdown();
 
+    const overlap = a.overlapped + b.overlapped;
+    std.debug.print("ops {d}/{d}, useful {d}/{d}, overlapped {d}\n", .{
+        a.ops.raw, b.ops.raw, a.useful, b.useful, overlap,
+    });
+    if (a.err) |e| return e;
+    if (b.err) |e| return e;
     try db.validate();
+    try expect(a.useful >= pair_min_useful);
+    try expect(b.useful >= pair_min_useful);
+    try expect(overlap >= pair_min_overlap);
 }
 
-fn continuouslyEmbed(db: *TestVecDB, running: *std.atomic.Value(bool)) !void {
-    while (running.load(.acquire)) {
-        for (0..20) |i| {
-            var path_buf: [16]u8 = undefined;
-            const path = try bufPrint(&path_buf, "test{d}.md", .{i});
-            const sentences = 20;
-            const repeated: [sentences][7]u8 = @splat("pizza. ".*);
-            const text: []const u8 = @ptrCast(&repeated);
-            try db.embedText(path, text);
-            std.Thread.yield() catch {}; // Don't hog the CPU!
+test "TSan every pair of concurrent ops" {
+    comptime {
+        // Every public method is an op or is excused...
+        for (std.meta.declarations(TestVecDB)) |decl| {
+            if (@typeInfo(@TypeOf(@field(TestVecDB, decl))) != .@"fn") continue;
+            if (@hasField(ConcurrentOp, decl)) continue;
+            for (not_concurrent_ops) |name| {
+                if (std.mem.eql(u8, name, decl)) break;
+            } else @compileError("VectorEngine." ++ decl ++ " is not in the TSan pair " ++
+                "test: add it to ConcurrentOp, or to not_concurrent_ops if it cannot race");
+        }
+        // ...and every op and excuse still names one, so a rename cannot leave either stale.
+        for (std.enums.values(ConcurrentOp)) |op| {
+            if (!@hasDecl(TestVecDB, @tagName(op)))
+                @compileError("ConcurrentOp." ++ @tagName(op) ++ " names no VectorEngine method");
+        }
+        for (not_concurrent_ops) |name| {
+            if (!@hasDecl(TestVecDB, name))
+                @compileError("not_concurrent_ops names " ++ name ++ ", no VectorEngine method");
         }
     }
-}
 
-test "TSan embed and embed" {
-    var tmpD = std.testing.tmpDir(.{ .iterate = true });
-    defer tmpD.cleanup();
-    var arena = std.heap.ArenaAllocator.init(testing_allocator);
-    defer arena.deinit();
-    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
-    defer db.deinit();
+    // Without TSan these runs can still crash, but a clean pass says nothing, and there are
+    // over a hundred of them.
+    if (!builtin.sanitize_thread) return error.SkipZigTest;
 
-    var running = std.atomic.Value(bool).init(true);
-    var curr_id = std.atomic.Value(usize).init(0);
-    var t = try spawn(.{}, continuouslyEmbed, .{ db, &running });
-
-    const sentences = 21;
-    const repeated: [sentences][7]u8 = @splat("pizza. ".*);
-    const text: []const u8 = @ptrCast(&repeated);
-    const N = 20;
-    for (0..N) |i| {
-        var path_buf: [16]u8 = undefined;
-        const path = try bufPrint(&path_buf, "test{d}.md", .{i});
-        try db.embedTextAsync(path, text);
-        curr_id.store(i + 1, .release);
+    var notesD = std.testing.tmpDir(.{});
+    defer notesD.cleanup();
+    try notesD.dir.createDirPath(std.testing.io, "sub");
+    for (0..pair_pool_n) |i| {
+        for (PairCtx.names) |name| {
+            var buf: [32]u8 = undefined;
+            const p = PairCtx.format(&buf, name, i);
+            (try notesD.dir.createFile(std.testing.io, p, .{})).close(std.testing.io);
+        }
     }
 
-    db.shutdown();
-    running.store(false, .release);
-    t.join();
-
-    try db.validate();
+    inline for (concurrent_op_pairs, 0..) |pair, n| {
+        // Before the run, so a TSan report printed during it lands under its pair's name.
+        std.debug.print("TSan pair {d}/{d} {t} x {t}: ", .{
+            n + 1, concurrent_op_pairs.len, pair[0], pair[1],
+        });
+        try runPair(pair[0], pair[1], notesD.dir);
+    }
 }
 
 /// A second engine opened over the same directory. Tests use it to assert on what actually
@@ -2313,6 +2465,7 @@ test "empty inputs" {
 }
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing_allocator = std.testing.allocator;
 const expectEqual = std.testing.expectEqual;
 const expectError = std.testing.expectError;
