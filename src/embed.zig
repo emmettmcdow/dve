@@ -275,8 +275,6 @@ pub const MpnetEmbedder = struct {
     // The calling thread wraps this in an AutoreleasePool, so we do not need to release
     // anything here. We only need to retain the model and the rest will be cleaned up.
     pub fn init(io: std.Io, opts: InitOptions) !MpnetEmbedder {
-        const init_zone = tracy.beginZone(@src(), .{ .name = "embed.zig:MpnetEmbedder.init" });
-        defer init_zone.end();
         const pool = objc.AutoreleasePool.init();
         defer pool.deinit();
         var tokenizer_alloc = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -565,9 +563,6 @@ pub const MpnetEmbedder = struct {
         str: []const u8,
     ) !?EmbeddingModelOutput {
         const self: *MpnetEmbedder = @ptrCast(@alignCast(ptr));
-        const zone = tracy.beginZone(@src(), .{ .name = "embed.zig:MpnetEmbedder.embed" });
-        defer zone.end();
-
         if (str.len == 0) {
             std.log.info("Skipping embed of zero-length string", .{});
             return null;
@@ -614,9 +609,6 @@ pub const MpnetEmbedder = struct {
         strs: []const []const u8,
     ) ![]?EmbeddingModelOutput {
         const self: *MpnetEmbedder = @ptrCast(@alignCast(ptr));
-        const zone = tracy.beginZone(@src(), .{ .name = "embed.zig:MpnetEmbedder.embedBatch" });
-        defer zone.end();
-
         const outs = try allocator.alloc(?EmbeddingModelOutput, strs.len);
         errdefer allocator.free(outs);
         @memset(outs, null);
@@ -1075,8 +1067,6 @@ pub const NLEmbedder = struct {
     pub const PATH = @tagName(ID) ++ db_suffix ++ ".db";
 
     pub fn init(io: std.Io) !NLEmbedder {
-        const init_zone = tracy.beginZone(@src(), .{ .name = "embed.zig:init" });
-        defer init_zone.end();
         const pool = objc.AutoreleasePool.init();
         defer pool.deinit();
 
@@ -1143,8 +1133,6 @@ pub const NLEmbedder = struct {
         str: []const u8,
     ) !?EmbeddingModelOutput {
         const self: *NLEmbedder = @ptrCast(@alignCast(ptr));
-        const zone = tracy.beginZone(@src(), .{ .name = "embed.zig:embed" });
-        defer zone.end();
         const pool = objc.AutoreleasePool.init();
         defer pool.deinit();
 
@@ -1279,11 +1267,6 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
 
     fn embed(ptr: *anyopaque, allocator: Allocator, str: []const u8) !?EmbeddingModelOutput {
         _ = ptr;
-        const zone = tracy.beginZone(@src(), .{
-            .name = "embed.zig:LlamaNomicEmbedTextV15F32.embed",
-        });
-        defer zone.end();
-
         if (str.len == 0) {
             std.log.info("Skipping embed of zero-length string", .{});
             return null;
@@ -1328,11 +1311,6 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
         strs: []const []const u8,
     ) ![]?EmbeddingModelOutput {
         _ = ptr;
-        const zone = tracy.beginZone(@src(), .{
-            .name = "embed.zig:LlamaNomicEmbedTextV15F32.embedBatch",
-        });
-        defer zone.end();
-
         const outs = try allocator.alloc(?EmbeddingModelOutput, strs.len);
         errdefer allocator.free(outs);
         @memset(outs, null);
@@ -2211,4 +2189,3 @@ const llama = @import("llama.zig");
 
 const objc = @import("objc");
 const Object = objc.Object;
-const tracy = @import("tracy");

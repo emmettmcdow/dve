@@ -7,9 +7,6 @@
         .zig_objc = .{
             .path = "deps/zig-objc",
         },
-        .tracy = .{
-            .path = "deps/zig-tracy",
-        },
         .coreml_models = .{
             .url = "https://github.com/emmettmcdow/dve/releases/download/coreml-models-v7/coreml_models_v7.tar.gz",
             .hash = "coreml_models-7.0.0-jFSN2VMJHg3VnNmaE8ccGxcs9U7V_NtoRlifb61t9Pml",

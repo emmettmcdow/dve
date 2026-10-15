@@ -31,8 +31,6 @@ pub inline fn writeSlice(
     w: *FileWriter,
     slice: []u8,
 ) !void {
-    const zone = tracy.beginZone(@src(), .{ .name = "vec_storage.zig:writeSlice" });
-    defer zone.end();
     return w.interface.writeAll(slice);
 }
 
@@ -62,9 +60,6 @@ pub inline fn readVec(N: usize, T: type, v: *@Vector(N, T), r: *FileReader, endi
 }
 
 pub inline fn writeVec(N: usize, T: type, w: *FileWriter, v: @Vector(N, T), endian: std.lang.Endian) !void {
-    const zone = tracy.beginZone(@src(), .{ .name = "vec_storage.zig:writeVec" });
-    defer zone.end();
-
     const native_endian = @import("builtin").cpu.arch.endian();
     const Stored = BinaryTypeRepresentation.to_binary(T).stored_as();
     // A vector cannot be indexed at runtime, so it is read through an array of the same shape.
@@ -291,9 +286,6 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
         const LENGTH_REFERENCE: f32 = 20.0;
 
         pub fn search(self: Self, query: Vector, buf: []SearchEntry, threshold: f32) !usize {
-            const zone = tracy.beginZone(@src(), .{ .name = "vec_storage.zig:search" });
-            defer zone.end();
-
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
@@ -338,9 +330,6 @@ pub fn Storage(vec_sz: usize, vec_type: type) type {
         }
 
         pub fn save(self: *Self, path: []const u8) !void {
-            const zone = tracy.beginZone(@src(), .{ .name = "vec_storage.zig:save" });
-            defer zone.end();
-
             const io = self.io;
             var f = self.dir.openFile(io, path, .{ .mode = .write_only }) catch |err| switch (err) {
                 std.Io.File.OpenError.FileNotFound => try self.dir.createFile(io, path, .{}),
@@ -1297,7 +1286,6 @@ const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
 
 const config = @import("config");
-const tracy = @import("tracy");
 
 const types = @import("types.zig");
 const storedDot = @import("vec_util.zig").storedDot;

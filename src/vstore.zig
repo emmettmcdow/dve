@@ -852,9 +852,6 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
         };
 
         pub fn search(self: *Self, query: *const Array, buf: []SearchEntry, threshold: f32) !usize {
-            const zone = tracy.beginZone(@src(), .{ .name = "vstore.zig:search" });
-            defer zone.end();
-
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
@@ -2157,8 +2154,6 @@ const tmpDir = std.testing.tmpDir;
 const testing_allocator = std.testing.allocator;
 const expect = std.testing.expect;
 const expectEqual = std.testing.expectEqual;
-
-const tracy = @import("tracy");
 
 const pfile = @import("pfile.zig");
 const types = @import("types.zig");

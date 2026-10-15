@@ -314,9 +314,6 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             index: *VecCodes,
             map: *NoteIdMap,
         ) !void {
-            const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:reconcile" });
-            defer zone.end();
-
             var c = try census(allocator, store, map);
             defer c.deinit();
 
@@ -410,8 +407,6 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         }
 
         fn buildCodes(store: *VecStorage, out: *VecCodes) !void {
-            const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:buildCodes" });
-            defer zone.end();
             var it = try store.iterate();
             defer it.deinit();
             while (try it.next()) |e| try out.put(e.slot, e.vec);
@@ -437,8 +432,6 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             query: *const StoredArray,
             want: usize,
         ) ![]Scored {
-            const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:twoStage" });
-            defer zone.end();
             if (want == 0) return &.{};
 
             const cands = try allocator.alloc(VecCodes.Candidate, self.candidates);
@@ -482,8 +475,6 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
 
         /// Searches the vector database. Can return multiple results per path/key.
         pub fn search(self: *Self, raw_query: []const u8, buf: []SearchResult) !usize {
-            const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:search" });
-            defer zone.end();
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
@@ -524,8 +515,6 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
 
         /// Searches the vector database. Each path/key will be unique in the results.
         pub fn uniqueSearch(self: *Self, raw_query: []const u8, buf: []SearchResult) !usize {
-            const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:uniqueSearch" });
-            defer zone.end();
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
@@ -576,9 +565,6 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             result_content: []const u8,
             highlights: []usize,
         ) !void {
-            const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:populateHighlights" });
-            defer zone.end();
-
             const max_highlights = @divExact(highlights.len, 2);
             if (max_highlights == 0) return;
 
@@ -663,8 +649,6 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         }
 
         fn embedTextInternal(self: *Self, path: []const u8, contents: []const u8) !void {
-            const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:embedText" });
-            defer zone.end();
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
             const allocator = arena.allocator();
@@ -1057,8 +1041,6 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         /// Searches the vector database with an already-embedded query vector. Behaves like
         /// `search`, but runs no embedding operations.
         pub fn rawVectorSearch(self: *Self, raw_vec: RawVector, buf: []SearchResult) !usize {
-            const zone = tracy.beginZone(@src(), .{ .name = "vector.zig:rawVectorSearch" });
-            defer zone.end();
             self.store_mutex.lockUncancelable(self.io);
             defer self.store_mutex.unlock(self.io);
             var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -2571,7 +2553,6 @@ const expectEqualSlices = std.testing.expectEqualSlices;
 const assert = std.debug.assert;
 
 const config = @import("config");
-const tracy = @import("tracy");
 
 const bufPrint = std.fmt.bufPrint;
 const embed = @import("embed.zig");

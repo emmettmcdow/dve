@@ -77,17 +77,6 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
     });
-    const tracy_enable = optimize == .debug;
-    const tracy_dep = b.dependency("tracy", .{
-        .target = target,
-        .optimize = optimize,
-        .tracy_enable = tracy_enable,
-        .tracy_callstack = @as(u32, 62),
-        // On-demand: collect nothing until a `tracy` server connects, so the
-        // client doesn't buffer profiling data unbounded when unattached. Must
-        // match nana's tracy options exactly (see nana build.zig addTracy).
-        .tracy_on_demand = true,
-    });
 
     ////////////////////
     // Config modules //
@@ -116,7 +105,6 @@ pub fn build(b: *std.Build) !void {
         .imports = &.{
             .{ .name = "config", .module = real_options.createModule() },
             .{ .name = "objc", .module = objc_dep.module("objc") },
-            .{ .name = "tracy", .module = tracy_dep.module("tracy") },
             .{ .name = "zon", .module = zon_mod },
         },
     });
@@ -164,34 +152,27 @@ pub fn build(b: *std.Build) !void {
         }
     }.run;
 
-    // Helper to wire up ObjC + tracy imports and framework/lib links for a test.
+    // Helper to wire up ObjC imports and framework/lib links for a test.
     const addDeps = struct {
         fn real(
             t: *std.Build.Step.Compile,
             cfg: *std.Build.Step.Options,
             objc: *std.Build.Dependency,
-            tr: *std.Build.Dependency,
-            tr_enable: bool,
             zon: *std.Build.Module,
         ) void {
             t.root_module.addOptions("config", cfg);
             t.root_module.addImport("objc", objc.module("objc"));
-            t.root_module.addImport("tracy", tr.module("tracy"));
             t.root_module.linkFramework("NaturalLanguage", .{});
             t.root_module.linkFramework("CoreML", .{});
             t.root_module.linkFramework("Foundation", .{});
             // vector.zig -> vstore.zig -> pfile.zig, which is a thin shim onto libc.
             t.root_module.link_libc = true;
-            if (tr_enable) {
-                t.root_module.linkLibrary(tr.artifact("tracy"));
-                t.root_module.link_libcpp = true;
-            }
             t.root_module.addImport("zon", zon);
         }
     }.real;
 
     // src/vec_storage.zig
-    // vec_storage and note_id_map tests use fake config + tracy only (no ObjC).
+    // vec_storage and note_id_map tests use fake config only (no ObjC).
     {
         const t = b.addTest(.{
             .root_module = b.createModule(.{
@@ -203,11 +184,6 @@ pub fn build(b: *std.Build) !void {
             .filters = if (test_filter != null) filters else &.{"vec_storage."},
         });
         t.root_module.addOptions("config", fake_options);
-        t.root_module.addImport("tracy", tracy_dep.module("tracy"));
-        if (tracy_enable) {
-            t.root_module.linkLibrary(tracy_dep.artifact("tracy"));
-            t.root_module.link_libcpp = true;
-        }
         test_step.dependOn(&runTest(b, t, use_lldb).step);
     }
 
@@ -223,7 +199,7 @@ pub fn build(b: *std.Build) !void {
             .filters = if (test_filter != null) filters else &.{"pfile."},
         });
         // pfile is a thin shim straight onto libc -- open, pread, pwrite, fsync, fcntl --
-        // so it needs libc and nothing else. No config, no tracy.
+        // so it needs libc and nothing else. No config.
         t.root_module.link_libc = true;
         test_step.dependOn(&runTest(b, t, use_lldb).step);
     }
@@ -242,11 +218,6 @@ pub fn build(b: *std.Build) !void {
         // vstore does its file IO through src/pfile.zig, straight onto libc.
         t.root_module.link_libc = true;
         t.root_module.addOptions("config", fake_options);
-        t.root_module.addImport("tracy", tracy_dep.module("tracy"));
-        if (tracy_enable) {
-            t.root_module.linkLibrary(tracy_dep.artifact("tracy"));
-            t.root_module.link_libcpp = true;
-        }
         test_step.dependOn(&runTest(b, t, use_lldb).step);
     }
 
@@ -279,11 +250,6 @@ pub fn build(b: *std.Build) !void {
             .filters = if (test_filter != null) filters else &.{"note_id_map."},
         });
         t.root_module.addOptions("config", fake_options);
-        t.root_module.addImport("tracy", tracy_dep.module("tracy"));
-        if (tracy_enable) {
-            t.root_module.linkLibrary(tracy_dep.artifact("tracy"));
-            t.root_module.link_libcpp = true;
-        }
         test_step.dependOn(&runTest(b, t, use_lldb).step);
     }
 
@@ -327,7 +293,7 @@ pub fn build(b: *std.Build) !void {
             }),
             .filters = if (test_filter != null) filters else &.{"embed."},
         });
-        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
+        addDeps(t, real_options, objc_dep, zon_mod);
         // Compiles src/ directly, so it does not inherit the bridge from dve_mod.
         if (llama_bridge) |bridge| bridge.link(t.root_module);
         const run = runTest(b, t, use_lldb);
@@ -347,7 +313,7 @@ pub fn build(b: *std.Build) !void {
             }),
             .filters = if (test_filter != null) filters else &.{"vector."},
         });
-        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
+        addDeps(t, real_options, objc_dep, zon_mod);
         // Compiles src/ directly, so it does not inherit the bridge from dve_mod.
         if (llama_bridge) |bridge| bridge.link(t.root_module);
         const run = runTest(b, t, use_lldb);
@@ -368,7 +334,7 @@ pub fn build(b: *std.Build) !void {
             .filters = if (test_filter != null) filters else &.{},
         });
         t.root_module.addImport("dve", dve_mod);
-        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
+        addDeps(t, real_options, objc_dep, zon_mod);
         // Its own options module: "config" already reaches this binary through dve, and a
         // file cannot belong to two modules.
         const bench_options = b.addOptions();
@@ -393,7 +359,7 @@ pub fn build(b: *std.Build) !void {
             .filters = if (test_filter != null) filters else &.{},
         });
         t.root_module.addImport("dve", dve_mod);
-        addDeps(t, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
+        addDeps(t, real_options, objc_dep, zon_mod);
         const run = runTest(b, t, use_lldb);
         for (model_installs) |s| run.step.dependOn(s);
         run.step.dependOn(precompiled_model);
@@ -419,7 +385,7 @@ pub fn build(b: *std.Build) !void {
             }),
         });
         exe.root_module.addImport("dve", dve_mod);
-        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
+        addDeps(exe, real_options, objc_dep, zon_mod);
 
         // Installed by this step only, so a plain `zig build` doesn't build the
         // harness. The embedder resolves model assets relative to the
@@ -446,7 +412,7 @@ pub fn build(b: *std.Build) !void {
             }),
         });
         exe.root_module.addImport("dve", dve_mod);
-        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
+        addDeps(exe, real_options, objc_dep, zon_mod);
         storebench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
@@ -468,7 +434,7 @@ pub fn build(b: *std.Build) !void {
             }),
         });
         exe.root_module.addImport("dve", dve_mod);
-        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
+        addDeps(exe, real_options, objc_dep, zon_mod);
         binrecall_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
@@ -510,7 +476,7 @@ pub fn build(b: *std.Build) !void {
             }),
         });
         exe.root_module.addImport("dve", dve_mod);
-        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
+        addDeps(exe, real_options, objc_dep, zon_mod);
         codesbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
@@ -532,7 +498,7 @@ pub fn build(b: *std.Build) !void {
             }),
         });
         exe.root_module.addImport("dve", dve_mod);
-        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
+        addDeps(exe, real_options, objc_dep, zon_mod);
         // The CoreML backend resolves its model bundle relative to the executable.
         for (model_installs) |s| embedbench_step.dependOn(s);
         embedbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
@@ -557,7 +523,7 @@ pub fn build(b: *std.Build) !void {
             }),
         });
         exe.root_module.addImport("dve", dve_mod);
-        addDeps(exe, real_options, objc_dep, tracy_dep, tracy_enable, zon_mod);
+        addDeps(exe, real_options, objc_dep, zon_mod);
         for (model_installs) |s| beirbench_step.dependOn(s);
         beirbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
         beirbench_step.dependOn(b.getInstallStep());
@@ -585,25 +551,10 @@ pub fn build(b: *std.Build) !void {
         // drag libllama.dylib and the libggml-*.dylib set into the bundle.
         xcfw_options.addOption(bool, "llama", false);
 
-        // Tracy must always be disabled in the xcframework. When tracy_enable=true
-        // Tracy starts C++ background threads (via global constructors) that
-        // interfere with Apple's NLEmbedding initialization on the main thread.
-        const xcfw_tracy_arm = b.dependency("tracy", .{
-            .target = arm_target,
-            .optimize = xcfw_optimize,
-            .tracy_enable = false,
-        });
-        const xcfw_tracy_x86 = b.dependency("tracy", .{
-            .target = x86_target,
-            .optimize = xcfw_optimize,
-            .tracy_enable = false,
-        });
-
         const xcfw_targets = [2]std.Build.ResolvedTarget{ arm_target, x86_target };
         var libs: [2]std.Build.LazyPath = undefined;
 
         for (xcfw_targets, 0..) |xcfw_target, i| {
-            const xcfw_tracy = if (i == 0) xcfw_tracy_arm else xcfw_tracy_x86;
             const lib = b.addLibrary(.{
                 .linkage = .dynamic,
                 .name = "dve",
@@ -616,13 +567,11 @@ pub fn build(b: *std.Build) !void {
             lib.bundle_compiler_rt = true;
             lib.root_module.addOptions("config", xcfw_options);
             lib.root_module.addImport("objc", objc_dep.module("objc"));
-            lib.root_module.addImport("tracy", xcfw_tracy.module("tracy"));
             lib.root_module.addImport("dve", b.createModule(.{
                 .root_source_file = b.path("src/root.zig"),
                 .imports = &.{
                     .{ .name = "config", .module = xcfw_options.createModule() },
                     .{ .name = "objc", .module = objc_dep.module("objc") },
-                    .{ .name = "tracy", .module = xcfw_tracy.module("tracy") },
                     .{ .name = "zon", .module = zon_mod },
                 },
             }));

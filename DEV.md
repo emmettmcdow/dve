@@ -85,10 +85,9 @@ zig build test-profile
 dve builds with Zig 0.17.0, and `build.zig.zon` says so in `minimum_zig_version`.
 
 - **`deps/zig-objc`** is [mitchellh/zig-objc](https://github.com/mitchellh/zig-objc) at commit `c8de82f`, which targets Zig 0.16, patched for 0.17: the type reflection in `block.zig`, `class.zig`, `encoding.zig` and `msg_send.zig` moved to 0.17's `field_names` / `field_types` / `attrs` layout, and the `**` repeats became `@splat`.
-- **`deps/zig-tracy`** is [tealsnow/zig-tracy](https://github.com/tealsnow/zig-tracy) at commit `5bc7238`, which targets Zig 0.14, patched for 0.17: `@cImport` is gone from the language, so `build.zig` translates `tracy/TracyC.h` into a `tracy-c` module that `src/tracy.zig` imports.
 - **`coreml_models`** is fetched from this repository's releases. Its `build.zig.zon` lives in `models/` and needs a `fingerprint`, which Zig 0.17 requires of every package it fetches. To cut a new one, bump the version there, tar `build.zig`, `build.zig.zon` and `all_mpnet_base_v2/` from `models/`, upload it as a `coreml-models-v<n>` release, and put the URL and the hash `zig fetch` prints for it into the root `build.zig.zon`.
 
-The two under `deps/` are vendored because neither upstream builds with 0.17. Once one does, point `build.zig.zon` back at it and delete the copy.
+`deps/zig-objc` is vendored because upstream does not build with 0.17. Once it does, point `build.zig.zon` back at it and delete the copy.
 
 ### Keeping `zig build test` fast
 

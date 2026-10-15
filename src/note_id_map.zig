@@ -269,9 +269,6 @@ pub const NoteIdMap = struct {
     // Possibly update the save and load to use SOA. We want to write the fields of the struct all
     // at once, we should be able to call one syscall to write all of the data.
     fn load(self: *Self) !void {
-        const zone = tracy.beginZone(@src(), .{ .name = "note_id_map.zig:load" });
-        defer zone.end();
-
         const file = try self.basedir.openFile(self.io, MANIFEST_FILENAME, .{});
         defer file.close(self.io);
 
@@ -299,9 +296,6 @@ pub const NoteIdMap = struct {
     }
 
     fn save(self: *Self) !void {
-        const zone = tracy.beginZone(@src(), .{ .name = "note_id_map.zig:save" });
-        defer zone.end();
-
         const tmp_name = MANIFEST_FILENAME ++ ".tmp";
 
         const file = try self.basedir.createFile(self.io, tmp_name, .{});
@@ -668,7 +662,6 @@ test "pruneOrphanedPaths removes missing files" {
 const db_suffix = @import("vec_util.zig").db_suffix;
 const std = @import("std");
 const pfile = @import("pfile.zig");
-const tracy = @import("tracy");
 
 fn readIntLE(reader: *std.Io.File.Reader, comptime T: type) !T {
     var buf: [@sizeOf(T)]u8 = undefined;
