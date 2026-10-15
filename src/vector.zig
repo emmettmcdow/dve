@@ -843,6 +843,11 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         pub fn saveIndex(self: *Self) !void {
             var buf: [256]u8 = undefined;
             const name = try codesPath(&buf, self.embedder.path);
+            // Over the write as well as the stamp. The stamp is what decides whether the next
+            // open trusts this file, so codes and stamp have to be taken from the same moment:
+            // an embed landing between the two would be written as fresh and missing.
+            self.store_mutex.lockUncancelable(self.io);
+            defer self.store_mutex.unlock(self.io);
             try self.codes.save(self.basedir, name, stampOf(&self.vec_storage));
         }
 
