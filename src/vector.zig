@@ -997,6 +997,8 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         /// measures the two-stage path against -- recall is only meaningful against the answer
         /// an exhaustive scan would have given, and computing that needs the scan.
         pub fn exactVectorSearch(self: *Self, raw_vec: RawVector, buf: []SearchResult) !usize {
+            self.store_mutex.lockUncancelable(self.io);
+            defer self.store_mutex.unlock(self.io);
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
