@@ -910,6 +910,10 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         /// For entries associated with a given path, associate them with a different path.
         pub fn renamePath(self: *Self, old_path: []const u8, new_path: []const u8) !void {
             if (old_path.len == 0 or new_path.len == 0) return Error.InvalidPath;
+            // The map's own lock is not enough: a rename frees the old path, and a search
+            // holding `store_mutex` is still reading the paths it got from the map.
+            self.store_mutex.lockUncancelable(self.io);
+            defer self.store_mutex.unlock(self.io);
             try self.note_id_map.renamePath(old_path, new_path);
         }
 
@@ -920,6 +924,10 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         /// layout: a vector is keyed by note id and carries no path at all, so a root that moves
         /// costs one rewrite of the id manifest. Nothing here re-reads or re-embeds a note.
         pub fn reroot(self: *Self, move: note_id_map_mod.Reroot) !usize {
+            // Held for the whole move, not just the store half: rewriting the map frees every
+            // old path, which a search holding this lock may still be reading.
+            self.store_mutex.lockUncancelable(self.io);
+            defer self.store_mutex.unlock(self.io);
             var dropped: std.ArrayList(NoteID) = .empty;
             defer dropped.deinit(self.allocator);
 
@@ -1983,7 +1991,8 @@ const PairCtx = struct {
     notes: std.Io.Dir,
 
     /// Every name the workload can give document `i`: `renamePath` toggles `renamed`, and
-    /// `reroot` toggles `sub`. Documents start and are added under `home`.
+    /// `reroot` adds `sub` for the moment between its two moves. Documents start and are
+    /// added under `home`.
     const Name = struct { sub: bool, renamed: bool };
     const home: Name = .{ .sub = false, .renamed = false };
     const names = [_]Name{
@@ -2068,13 +2077,12 @@ fn runOp(comptime op: ConcurrentOp, db: *TestVecDB, ctx: *const PairCtx, i: usiz
             }
             break :blk 0;
         },
-        // Down a level and back up, so every other call sees the paths it started with.
+        // Down a level and back up in one op, so the other side mostly finds documents under
+        // their usual names. Alternating across ops left them under `sub/` half the time, and
+        // a document the other side put back without the prefix was dropped by the next move.
         .reroot => blk: {
-            const move: note_id_map_mod.Reroot = if (i % 2 == 0)
-                .{ .deeper = "sub" }
-            else
-                .{ .shallower = "sub" };
-            _ = try db.reroot(move);
+            _ = try db.reroot(.{ .deeper = "sub" });
+            _ = try db.reroot(.{ .shallower = "sub" });
             break :blk 1;
         },
         .save => blk: {
