@@ -272,7 +272,7 @@ pub const MpnetEmbedder = struct {
         cpu_and_neural_engine = 3,
     };
 
-    // The calling Swift thread wraps this in an AutoreleasePool, so we do not need to release
+    // The calling thread wraps this in an AutoreleasePool, so we do not need to release
     // anything here. We only need to retain the model and the rest will be cleaned up.
     pub fn init(io: std.Io, opts: InitOptions) !MpnetEmbedder {
         const init_zone = tracy.beginZone(@src(), .{ .name = "embed.zig:MpnetEmbedder.init" });
@@ -1644,8 +1644,8 @@ test "embed - nlembed solo" {
     try std.testing.expectApproxEqAbs(0.83664304, sum, 1e-4);
 }
 
-test "embed - mpnetembed init with autorelease pool (simulates Swift caller)" {
-    // Swift has an autorelease pool on the calling thread. If init() over-releases
+test "embed - mpnetembed init with autorelease pool (simulates a caller with its own pool)" {
+    // The caller may have an autorelease pool on the calling thread. If init() over-releases
     // autoreleased objects, the pool drain will crash with EXC_BAD_ACCESS.
     const pool = objc.AutoreleasePool.init();
     var mpnet = try MpnetEmbedder.init(std.testing.io, .{});
@@ -1660,8 +1660,8 @@ test "embed - mpnetembed init with autorelease pool (simulates Swift caller)" {
     try std.testing.expect(output != null);
 }
 
-test "embed - nlembedder init with autorelease pool (simulates Swift caller)" {
-    // Swift has an autorelease pool on the calling thread. If init() over-releases
+test "embed - nlembedder init with autorelease pool (simulates a caller with its own pool)" {
+    // The caller may have an autorelease pool on the calling thread. If init() over-releases
     // autoreleased objects, the pool drain will crash with EXC_BAD_ACCESS.
     const pool = objc.AutoreleasePool.init();
     var nlembed = try NLEmbedder.init(std.testing.io);

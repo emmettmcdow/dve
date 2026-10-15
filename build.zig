@@ -566,9 +566,10 @@ pub fn build(b: *std.Build) !void {
     ///////////////////
     // XCFramework   //
     ///////////////////
-    // Builds DVECore.xcframework for use by Swift/C consumers.
+    // Builds DVECore.xcframework for use by C consumers.
     // Both models are compiled in; the C bindings pick one at runtime (bindings/c/src/intf.zig).
-    // The mpnet model files are bundled in Resources/ so that model works out of the box.
+    // The mpnet model files are bundled in Resources/. Nothing finds them automatically: callers
+    // locate them via the framework's bundle identifier and pass the paths to dve_init.
     const xcfw_step = b.step("xcframework", "Build DVECore.xcframework");
     {
         const arm_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos });

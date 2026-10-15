@@ -19,7 +19,7 @@ cp "$DYLIB" "$FRAMEWORK_DIR/DVECore"
 # Public header
 cp bindings/c/include/dve.h "$FRAMEWORK_DIR/Headers/"
 
-# Framework-style module map (required for Swift import)
+# Framework-style module map (required for Clang module import)
 cat > "$FRAMEWORK_DIR/Modules/module.modulemap" <<'EOF'
 framework module DVECore {
     umbrella header "dve.h"
@@ -28,7 +28,7 @@ framework module DVECore {
 }
 EOF
 
-# Info.plist — sets the bundle identifier used by DVEKit to locate model resources.
+# Info.plist — sets the bundle identifier callers use to locate the model resources.
 cat > "$FRAMEWORK_DIR/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -50,6 +50,7 @@ cat > "$FRAMEWORK_DIR/Info.plist" <<'EOF'
 </plist>
 EOF
 
-# Model resources — DVEKit resolves these at runtime via the framework bundle.
+# Model resources. dve does not resolve these itself; callers find them via the bundle
+# identifier above and pass their paths to dve_init.
 cp -r "$MODEL_PACKAGE" "$FRAMEWORK_DIR/Resources/"
 cp "$TOKENIZER" "$FRAMEWORK_DIR/Resources/"

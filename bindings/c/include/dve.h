@@ -24,10 +24,15 @@ typedef struct {
  * Initialize the dve database.
  *
  * basedir        - absolute path to the directory where the database will be stored.
- * model_path     - absolute path to the .mlpackage or .mlmodelc model file.
- *                  Pass NULL or empty string when compiled for apple_nlembedding.
- * tokenizer_path - absolute path to the tokenizer.json file.
- *                  Pass NULL or empty string when compiled for apple_nlembedding.
+ * model_path     - absolute path to the mpnet .mlpackage or .mlmodelc. Both models are
+ *                  compiled in; this picks one. A non-empty path selects mpnet, an empty
+ *                  string selects Apple NL. Must not be NULL.
+ *                  In DVECore.framework the mpnet files are in its Resources/, but dve does
+ *                  not look there: find them via the bundle identifier
+ *                  com.emmettmcdow.DVECore (e.g. CFBundleGetBundleWithIdentifier).
+ * tokenizer_path - absolute path to the tokenizer.json file. Must not be NULL. With mpnet,
+ *                  an empty string looks in the app bundle's Resources/, then beside the
+ *                  executable. Ignored with Apple NL.
  *
  * Returns DVE_SUCCESS on success, negative DVEError on failure.
  */
