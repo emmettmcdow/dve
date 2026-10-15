@@ -155,7 +155,7 @@ fn run(
     const buf = try allocator.alloc(dve.SearchResult, opts.recall_at);
     defer allocator.free(buf);
 
-    const Failure = struct { id: []const u8, ndcg: f64, rank: ?usize, top: []const u8 };
+    const Failure = struct { id: []const u8, ndcg: f64, rank: ?usize, top: ?dve.SearchResult };
     var failures: std.ArrayList(Failure) = .empty;
     defer failures.deinit(allocator);
 
@@ -173,7 +173,7 @@ fn run(
         const n = try db.uniqueSearch(qtext, buf);
         search_ns += timer.read();
 
-        const m = score(buf[0..n], relevant, opts.k);
+        const m = score(db, buf[0..n], relevant, opts.k);
         sum_ndcg += m.ndcg;
         sum_recall += m.recall;
         sum_mrr += m.mrr;
@@ -183,7 +183,7 @@ fn run(
             .id = qid,
             .ndcg = m.ndcg,
             .rank = m.first_rank,
-            .top = if (n > 0) buf[0].path else "<nothing>",
+            .top = if (n > 0) buf[0] else null,
         });
     }
 
@@ -223,6 +223,11 @@ fn run(
         });
         for (failures.items[0..@min(opts.show_failures, failures.items.len)]) |f| {
             const qtext = queries.get(f.id) orelse "";
+            var top_buf: [256]u8 = undefined;
+            const top: []const u8 = if (f.top) |r| top: {
+                const path = db.pathOfResult(r, &top_buf) catch break :top "<too long>";
+                break :top path orelse "<removed>";
+            } else "<nothing>";
             std.debug.print("  nDCG {d:.3} ", .{f.ndcg});
             if (f.rank) |r| {
                 std.debug.print("(gold at rank {d}) ", .{r});
@@ -232,7 +237,7 @@ fn run(
             std.debug.print("q{s}: '{s}'\n    top hit: {s}\n", .{
                 f.id,
                 qtext[0..@min(qtext.len, 70)],
-                f.top,
+                top,
             });
         }
     }
@@ -302,14 +307,17 @@ const Metrics = struct {
 /// SciFact's judgments are binary, so exponential gain (2^rel - 1) and linear gain agree; the
 /// exponential form is written out because it is what TREC and BEIR use and a graded dataset
 /// would need it.
-fn score(results: []const dve.SearchResult, relevant: []const []const u8, k: usize) Metrics {
+fn score(db: anytype, results: []const dve.SearchResult, relevant: []const []const u8, k: usize) Metrics {
     var dcg: f64 = 0;
     var hits_at_k: usize = 0;
     var hits_all: usize = 0;
     var first_rank: ?usize = null;
 
     for (results, 1..) |r, rank| {
-        if (!contains(relevant, r.path)) continue;
+        var path_buf: [256]u8 = undefined;
+        // A path too long for the buffer cannot be one of the judged ids, which are short.
+        const path = (db.pathOfResult(r, &path_buf) catch continue) orelse continue;
+        if (!contains(relevant, path)) continue;
         hits_all += 1;
         if (first_rank == null) first_rank = rank;
         if (rank <= k) {

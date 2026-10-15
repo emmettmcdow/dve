@@ -34,7 +34,7 @@ fn binarySingleWords(comptime model: EmbeddingModel) !void {
         var searchBuf: [10]SearchResult = undefined;
         const n_out = try db.uniqueSearch(case.query, &searchBuf);
         if (n_out > 0) {
-            if (std.mem.eql(u8, searchBuf[0].path, case.want)) {
+            if (isPath(db, searchBuf[0], case.want)) {
                 curr_score += 20;
                 if (n_out == 1) curr_score += 20;
             }
@@ -106,11 +106,11 @@ fn sentenceSimilarity(comptime model: EmbeddingModel) !void {
         const n_out = try db.uniqueSearch(case.query, &searchBuf);
         for (case.to_include) |path| {
             curr_max_score += case_weight;
-            if (outputContains(searchBuf[0..n_out], path)) curr_score += case_weight;
+            if (outputContains(db, searchBuf[0..n_out], path)) curr_score += case_weight;
         }
         for (case.no_include) |path| {
             curr_max_score += case_weight;
-            if (!outputContains(searchBuf[0..n_out], path)) curr_score += case_weight;
+            if (!outputContains(db, searchBuf[0..n_out], path)) curr_score += case_weight;
         }
     }
 }
@@ -161,11 +161,11 @@ fn sentenceSplit(comptime model: EmbeddingModel) !void {
         const n_out = try db.search(case.query, &searchBuf);
         for (case.to_include) |path| {
             curr_max_score += case_weight;
-            if (n_out > 0 and outputContains(searchBuf[0..n_out], path)) curr_score += case_weight;
+            if (n_out > 0 and outputContains(db, searchBuf[0..n_out], path)) curr_score += case_weight;
         }
         for (case.no_include) |path| {
             curr_max_score += case_weight;
-            if (n_out == 0 or !outputContains(searchBuf[0..n_out], path)) curr_score += case_weight;
+            if (n_out == 0 or !outputContains(db, searchBuf[0..n_out], path)) curr_score += case_weight;
         }
     }
 }
@@ -212,7 +212,7 @@ fn queryLengthParity(comptime model: EmbeddingModel) !void {
     for (cases) |case| {
         curr_max_score += case_weight;
         const n_out = try db.uniqueSearch(case.query, &searchBuf);
-        if (n_out > 0 and std.mem.eql(u8, searchBuf[0].path, case.expected)) {
+        if (n_out > 0 and isPath(db, searchBuf[0], case.expected)) {
             curr_score += case_weight;
         }
     }
@@ -285,11 +285,11 @@ fn longComplexSentences(comptime model: EmbeddingModel) !void {
         const n_out = try db.uniqueSearch(case.query, &searchBuf);
         for (case.to_include) |path| {
             curr_max_score += case_weight;
-            if (outputContains(searchBuf[0..n_out], path)) curr_score += case_weight;
+            if (outputContains(db, searchBuf[0..n_out], path)) curr_score += case_weight;
         }
         for (case.no_include) |path| {
             curr_max_score += case_weight;
-            if (!outputContains(searchBuf[0..n_out], path)) curr_score += case_weight;
+            if (!outputContains(db, searchBuf[0..n_out], path)) curr_score += case_weight;
         }
     }
 }
@@ -366,11 +366,11 @@ fn markdownStructure(comptime model: EmbeddingModel) !void {
         const n_out = try db.uniqueSearch(case.query, &searchBuf);
         for (case.to_include) |path| {
             curr_max_score += case_weight;
-            if (outputContains(searchBuf[0..n_out], path)) curr_score += case_weight;
+            if (outputContains(db, searchBuf[0..n_out], path)) curr_score += case_weight;
         }
         for (case.no_include) |path| {
             curr_max_score += case_weight;
-            if (!outputContains(searchBuf[0..n_out], path)) curr_score += case_weight;
+            if (!outputContains(db, searchBuf[0..n_out], path)) curr_score += case_weight;
         }
     }
 }
@@ -475,10 +475,10 @@ fn distractorDensity(comptime model: EmbeddingModel) !void {
         // separately so a change that fixes the ordering is visible from a change that only
         // stops the answer being buried.
         curr_max_score += 20;
-        if (n_out > 0 and std.mem.eql(u8, searchBuf[0].path, case.want)) curr_score += 20;
+        if (n_out > 0 and isPath(db, searchBuf[0], case.want)) curr_score += 20;
 
         curr_max_score += 10;
-        if (outputContains(searchBuf[0..@min(n_out, 3)], case.want)) curr_score += 10;
+        if (outputContains(db, searchBuf[0..@min(n_out, 3)], case.want)) curr_score += 10;
     }
 }
 
@@ -727,9 +727,15 @@ const Row = struct {
 const Board = struct { rows: [N_CASES]Row = undefined, n: usize = 0 };
 var boards = std.EnumArray(EmbeddingModel, Board).initFill(.{});
 
-fn outputContains(output: []SearchResult, path: []const u8) bool {
+/// Whether `r` is the document named `path`.
+fn isPath(db: anytype, r: SearchResult, path: []const u8) bool {
+    const id = db.idOf(path) orelse return false;
+    return r.id == id;
+}
+
+fn outputContains(db: anytype, output: []SearchResult, path: []const u8) bool {
     for (output) |out_item| {
-        if (std.mem.eql(u8, out_item.path, path)) return true;
+        if (isPath(db, out_item, path)) return true;
     }
     return false;
 }

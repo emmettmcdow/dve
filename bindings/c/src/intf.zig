@@ -61,6 +61,7 @@ const CError = enum(c_int) {
     GenericFail = -1,
     DoubleInit = -2,
     NotInit = -3,
+    NotFound = -4,
 };
 
 export fn dve_init(
@@ -202,9 +203,58 @@ export fn dve_search(
     };
 
     for (tmp[0..written], 0..) |sr, i| {
-        outbuf[i] = toC(sr);
+        outbuf[i] = .{
+            .id = sr.id,
+            .start_i = @intCast(sr.start_i),
+            .end_i = @intCast(sr.end_i),
+            .similarity = sr.similarity,
+        };
     }
     return @intCast(written);
+}
+
+export fn dve_path_of_result(result: *const CDVESearchResult, buf: [*c]u8, len: usize) i64 {
+    mutex.lockUncancelable(shim_io);
+    defer mutex.unlock(shim_io);
+
+    if (!initialized) return @backingInt(CError.NotInit);
+    const sr: dve.SearchResult = .{
+        .id = result.id,
+        .start_i = result.start_i,
+        .end_i = result.end_i,
+        .similarity = result.similarity,
+    };
+    // One byte is held back for the terminator, as snprintf does.
+    const room: []u8 = if (len == 0) &.{} else buf[0 .. len - 1];
+    if (pathOfResult(sr, room)) |found| {
+        const path = found orelse return @backingInt(CError.NotFound);
+        if (len != 0) buf[path.len] = 0;
+        return @intCast(path.len);
+    } else |_| {}
+
+    // Cut short. snprintf's contract is to return the full length anyway, which the engine
+    // only reports by the path fitting, so find it in a scratch buffer grown until it does.
+    // A loop, because the first scratch buffer may itself be too small.
+    var scratch_len: usize = @max(len * 2, 256);
+    while (true) : (scratch_len *= 2) {
+        const scratch = gpa.allocator().alloc(u8, scratch_len) catch {
+            return @backingInt(CError.GenericFail);
+        };
+        defer gpa.allocator().free(scratch);
+        const found = pathOfResult(sr, scratch) catch continue;
+        const path = found orelse return @backingInt(CError.NotFound);
+        const n = @min(path.len, room.len);
+        @memcpy(room[0..n], path[0..n]);
+        if (len != 0) buf[n] = 0;
+        return @intCast(path.len);
+    }
+}
+
+fn pathOfResult(sr: dve.SearchResult, buf: []u8) error{NoSpaceLeft}!?[]u8 {
+    return switch (active_model) {
+        .apple_nl => apple_db.?.pathOfResult(sr, buf),
+        .mpnet => mpnet_db.?.pathOfResult(sr, buf),
+    };
 }
 
 export fn dve_remove(key: [*:0]const u8) c_int {
@@ -247,23 +297,9 @@ export fn dve_rename(old_key: [*:0]const u8, new_key: [*:0]const u8) c_int {
 }
 
 // Internal C-compatible result type
-const DVE_PATH_MAX = 1024;
-
 const CDVESearchResult = extern struct {
-    key: [DVE_PATH_MAX]u8,
+    id: u64,
     start_i: u32,
     end_i: u32,
     similarity: f32,
 };
-
-fn toC(sr: dve.SearchResult) CDVESearchResult {
-    var r = CDVESearchResult{
-        .key = std.mem.zeroes([DVE_PATH_MAX]u8),
-        .start_i = @intCast(sr.start_i),
-        .end_i = @intCast(sr.end_i),
-        .similarity = sr.similarity,
-    };
-    const len = @min(sr.path.len, DVE_PATH_MAX - 1);
-    @memcpy(r.key[0..len], sr.path[0..len]);
-    return r;
-}

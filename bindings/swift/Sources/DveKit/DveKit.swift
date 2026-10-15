@@ -5,6 +5,8 @@ import Foundation
 // MARK: - Public types
 
 public struct SearchResult {
+    /// Durable id of the note: it survives renames and reopening the database.
+    public let id: UInt64
     public let key: String
     public let startIndex: Int
     public let endIndex: Int
@@ -89,15 +91,31 @@ public final class VectorEngine {
         guard n >= 0 else {
             throw VectorEngineError.searchFailed(code: n)
         }
-        return buf[0..<Int(n)].map { r in
-            SearchResult(
-                key: withUnsafeBytes(of: r.key) { bytes in
-                    String(cString: bytes.baseAddress!.assumingMemoryBound(to: CChar.self))
-                },
+        // A note removed between the search and the path lookup is dropped from the results.
+        return buf[0..<Int(n)].compactMap { r in
+            guard let key = path(of: r) else { return nil }
+            return SearchResult(
+                id: r.id,
+                key: key,
                 startIndex: Int(r.start_i),
                 endIndex: Int(r.end_i),
                 similarity: r.similarity
             )
+        }
+    }
+
+    /// The current path of a result's note, or nil if it has been removed.
+    private func path(of result: DVESearchResult) -> String? {
+        var result = result
+        var buf = [CChar](repeating: 0, count: 256)
+        while true {
+            let n = dve_path_of_result(&result, &buf, buf.count)
+            guard n >= 0 else { return nil }
+            if n < Int64(buf.count) { return String(cString: buf) }
+            // Cut short: grow to the full length dve_path_of_result reported and ask again.
+            // A loop, not one retry, because a rename on another thread can lengthen the path
+            // in between.
+            buf = [CChar](repeating: 0, count: Int(n) + 1)
         }
     }
 

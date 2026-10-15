@@ -1,17 +1,20 @@
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
-
-#define DVE_PATH_MAX 1024
 
 typedef enum {
     DVE_SUCCESS        =  0,
     DVE_ERR_GENERIC    = -1,
     DVE_ERR_DOUBLE_INIT = -2,
     DVE_ERR_NOT_INIT   = -3,
+    DVE_ERR_NOT_FOUND  = -4,
 } DVEError;
 
+/**
+ * One search hit. `id` names the note; read its path with dve_path_of_result.
+ */
 typedef struct {
-    char key[DVE_PATH_MAX];
+    uint64_t id;
     uint32_t start_i;
     uint32_t end_i;
     float similarity;
@@ -56,6 +59,20 @@ int dve_embed_async(const char *key, const char *content);
  * Returns the number of results written, or negative DVEError on failure.
  */
 int dve_search(const char *query, DVESearchResult *outbuf, uint32_t n);
+
+/**
+ * Copy the current path of result's note into buf, as snprintf does: at most len - 1 bytes,
+ * always NUL-terminated when len > 0. A rename since the search shows up as the new path.
+ * result - a result from dve_search; must not be NULL.
+ * buf    - caller-provided buffer; may be NULL when len is 0.
+ * len    - capacity of buf, including the terminator.
+ *
+ * Returns the path's full length, excluding the terminator. A value >= len means the path
+ * was cut short; call again with a buffer of at least that value + 1. Returns
+ * DVE_ERR_NOT_FOUND if the note has been removed since the search, or another negative
+ * DVEError on failure.
+ */
+int64_t dve_path_of_result(const DVESearchResult *result, char *buf, size_t len);
 
 /** Remove all embeddings associated with key. */
 int dve_remove(const char *key);

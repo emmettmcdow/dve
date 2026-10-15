@@ -11,8 +11,13 @@ pub const Error = error{
 };
 
 pub const SearchResult = struct {
-    /// The path or the key associated with this vector.
-    path: []const u8,
+    /// The note this vector belongs to. Read its path with `pathOfResult`.
+    ///
+    /// An id rather than the path itself, because the engine owns the path: a borrowed one
+    /// would be freed by a rename or removal on another thread while the caller still held
+    /// it. Ids are durable, so they survive a reopen, and a note removed since the search
+    /// shows up as `pathOfResult` returning null rather than as freed memory.
+    id: NoteID,
     /// If a document has multiple vectors, then start_i is the index where this vector starts.
     start_i: usize,
     /// If a document has multiple vectors, then start_i is the index where this vector ends.
@@ -501,9 +506,11 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 const scored = try self.twoStage(arena.allocator(), &query_vec, max_results);
                 var found_n: usize = 0;
                 for (scored) |sc| {
-                    const p = self.note_id_map.getPath(sc.row.doc_id) orelse continue;
+                    // A row whose note has no name is unreachable; `reconcile` drops it at the
+                    // next open.
+                    if (self.note_id_map.getPath(sc.row.doc_id) == null) continue;
                     buf[found_n] = SearchResult{
-                        .path = p,
+                        .id = sc.row.doc_id,
                         .start_i = sc.row.start_i,
                         .end_i = sc.row.end_i,
                         .similarity = sc.similarity,
@@ -541,12 +548,12 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 var unique_found_n: usize = 0;
                 outer: for (scored) |sc| {
                     if (unique_found_n >= buf.len) break;
-                    const path = self.note_id_map.getPath(sc.row.doc_id) orelse continue;
-                    for (0..unique_found_n) |j| {
-                        if (std.mem.eql(u8, buf[j].path, path)) continue :outer;
+                    if (self.note_id_map.getPath(sc.row.doc_id) == null) continue;
+                    for (buf[0..unique_found_n]) |r| {
+                        if (r.id == sc.row.doc_id) continue :outer;
                     }
                     buf[unique_found_n] = SearchResult{
-                        .path = path,
+                        .id = sc.row.doc_id,
                         .start_i = sc.row.start_i,
                         .end_i = sc.row.end_i,
                         .similarity = sc.similarity,
@@ -922,6 +929,33 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             try self.note_id_map.renamePath(old_path, new_path);
         }
 
+        /// The current path of `result`'s note, copied into `buf`. The returned slice is the
+        /// part of `buf` it fills. Null if the note has been removed since the search, and
+        /// `error.NoSpaceLeft` if the path does not fit.
+        ///
+        /// The path is that of the note now, so a rename since the search shows up here. The
+        /// copy is made under the store lock, so a rename or removal on another thread cannot
+        /// free the path midway through it.
+        pub fn pathOfResult(
+            self: *Self,
+            result: SearchResult,
+            buf: []u8,
+        ) error{NoSpaceLeft}!?[]u8 {
+            self.store_mutex.lockUncancelable(self.io);
+            defer self.store_mutex.unlock(self.io);
+            const path = self.note_id_map.getPath(result.id) orelse return null;
+            if (path.len > buf.len) return error.NoSpaceLeft;
+            @memcpy(buf[0..path.len], path);
+            return buf[0..path.len];
+        }
+
+        /// The note currently named `path`, or null if there is none. The inverse of
+        /// `pathOfResult`: a caller looking for a known document in search results compares
+        /// ids.
+        pub fn idOf(self: *Self, path: []const u8) ?NoteID {
+            return self.note_id_map.getId(path);
+        }
+
         /// Re-express every stored path against a workspace root that has moved, dropping the
         /// vectors of any note the move puts outside it. Returns how many notes were dropped.
         ///
@@ -1008,9 +1042,9 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
 
             var found: usize = 0;
             for (entries[0..n]) |e| {
-                const p = self.note_id_map.getPath(e.row.doc_id) orelse continue;
+                if (self.note_id_map.getPath(e.row.doc_id) == null) continue;
                 buf[found] = .{
-                    .path = p,
+                    .id = e.row.doc_id,
                     .start_i = e.row.start_i,
                     .end_i = e.row.end_i,
                     .similarity = e.similarity,
@@ -1035,9 +1069,9 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             const scored = try self.twoStage(arena.allocator(), &vec, buf.len);
             var found_n: usize = 0;
             for (scored) |sc| {
-                const p = self.note_id_map.getPath(sc.row.doc_id) orelse continue;
+                if (self.note_id_map.getPath(sc.row.doc_id) == null) continue;
                 buf[found_n] = SearchResult{
-                    .path = p,
+                    .id = sc.row.doc_id,
                     .start_i = sc.row.start_i,
                     .end_i = sc.row.end_i,
                     .similarity = sc.similarity,
@@ -1129,7 +1163,7 @@ test "embedText hello" {
     var buf: [1]SearchResult = undefined;
     try expectEqual(1, try db.search(text, &buf));
 
-    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+    try expectSearchResultsIgnoresimilarity(db, &[_]ExpectedResult{
         .{ .path = path, .start_i = 0, .end_i = 5 },
     }, buf[0..1]);
 
@@ -1203,7 +1237,7 @@ test "search" {
 
     var buffer: [10]SearchResult = undefined;
     try expectEqual(3, try db.search("pizza", &buffer));
-    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+    try expectSearchResultsIgnoresimilarity(db, &[_]ExpectedResult{
         .{ .path = path, .start_i = 0, .end_i = 5 },
         .{ .path = path, .start_i = 7, .end_i = 12 },
         .{ .path = path, .start_i = 14, .end_i = 19 },
@@ -1223,7 +1257,7 @@ test "search mpnet" {
 
     var buffer: [10]SearchResult = undefined;
     try expectEqual(3, try db.search("pizza", &buffer));
-    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+    try expectSearchResultsIgnoresimilarity(db, &[_]ExpectedResult{
         .{ .path = path, .start_i = 0, .end_i = 5 },
         .{ .path = path, .start_i = 7, .end_i = 12 },
         .{ .path = path, .start_i = 14, .end_i = 19 },
@@ -1295,7 +1329,7 @@ test "uniqueSearch" {
 
     var buffer: [10]SearchResult = undefined;
     try expectEqual(1, try db.uniqueSearch("pizza", &buffer));
-    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+    try expectSearchResultsIgnoresimilarity(db, &[_]ExpectedResult{
         .{ .path = path, .start_i = 0, .end_i = 5 },
     }, buffer[0..1]);
 
@@ -1315,7 +1349,7 @@ test "search returns results with similarity" {
     var buffer: [10]SearchResult = undefined;
     try expectEqual(3, try db.search("pizza", &buffer));
 
-    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+    try expectSearchResultsIgnoresimilarity(db, &[_]ExpectedResult{
         .{ .path = path, .start_i = 14, .end_i = 19 },
         .{ .path = path, .start_i = 7, .end_i = 12 },
         .{ .path = path, .start_i = 0, .end_i = 5 },
@@ -1347,7 +1381,7 @@ test "uniqueSearch returns results with similarity" {
     var buffer: [10]SearchResult = undefined;
     try expectEqual(3, try db.search("pizza", &buffer));
 
-    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+    try expectSearchResultsIgnoresimilarity(db, &[_]ExpectedResult{
         .{ .path = path3, .start_i = 0, .end_i = 5 },
         .{ .path = path2, .start_i = 0, .end_i = 5 },
         .{ .path = path1, .start_i = 0, .end_i = 5 },
@@ -1399,7 +1433,7 @@ test "rawVectorSearch hello" {
     const query = try rawQueryVec(.apple_nlembedding, &db.embedder, arena.allocator(), "hello");
     var buf: [1]SearchResult = undefined;
     try expectEqual(1, try db.rawVectorSearch(query, &buf));
-    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+    try expectSearchResultsIgnoresimilarity(db, &[_]ExpectedResult{
         .{ .path = path, .start_i = 0, .end_i = 5 },
     }, buf[0..1]);
     try expect(buf[0].similarity > 0);
@@ -1425,10 +1459,7 @@ test "rawVectorSearch matches search" {
     const query = try rawQueryVec(.apple_nlembedding, &db.embedder, arena.allocator(), "pizza");
     var actual: [10]SearchResult = undefined;
     try expectEqual(expected_n, try db.rawVectorSearch(query, &actual));
-    try expectSearchResultsIgnoresimilarity(expected[0..expected_n], actual[0..expected_n]);
-    for (expected[0..expected_n], actual[0..expected_n]) |e, a| {
-        try expectEqual(e.similarity, a.similarity);
-    }
+    try expectEqualSlices(SearchResult, expected[0..expected_n], actual[0..expected_n]);
 
     try db.validate();
 }
@@ -1449,7 +1480,7 @@ test "rawVectorSearch returns results with similarity" {
     var buffer: [10]SearchResult = undefined;
     try expectEqual(3, try db.rawVectorSearch(query, &buffer));
 
-    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+    try expectSearchResultsIgnoresimilarity(db, &[_]ExpectedResult{
         .{ .path = path, .start_i = 14, .end_i = 19 },
         .{ .path = path, .start_i = 7, .end_i = 12 },
         .{ .path = path, .start_i = 0, .end_i = 5 },
@@ -1550,7 +1581,7 @@ test "rawVectorSearch mpnet" {
     const query = try rawQueryVec(.mpnet_embedding, &db.embedder, arena.allocator(), "pizza");
     var buffer: [10]SearchResult = undefined;
     try expectEqual(3, try db.rawVectorSearch(query, &buffer));
-    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+    try expectSearchResultsIgnoresimilarity(db, &[_]ExpectedResult{
         .{ .path = path, .start_i = 0, .end_i = 5 },
         .{ .path = path, .start_i = 7, .end_i = 12 },
         .{ .path = path, .start_i = 14, .end_i = 19 },
@@ -1637,7 +1668,20 @@ test "search strip queries" {
     _ = try db.uniqueSearch("??foo??", &results);
 }
 
-fn expectSearchResultsIgnoresimilarity(expected: []const SearchResult, actual: []const SearchResult) !void {
+/// What a test expects a search to return, written the way a caller reads a result: by path.
+const ExpectedResult = struct { path: []const u8, start_i: usize, end_i: usize };
+
+/// `r`'s path as `db` has it now, or a marker if the note is gone.
+fn resultPath(db: anytype, r: SearchResult, buf: []u8) []const u8 {
+    const path = db.pathOfResult(r, buf) catch return "<too long>";
+    return path orelse "<removed>";
+}
+
+fn expectSearchResultsIgnoresimilarity(
+    db: anytype,
+    expected: []const ExpectedResult,
+    actual: []const SearchResult,
+) !void {
     if (expected.len != actual.len) {
         std.debug.print(
             "slice lengths differ: expected {d}, found {d}\n",
@@ -1646,10 +1690,12 @@ fn expectSearchResultsIgnoresimilarity(expected: []const SearchResult, actual: [
         return error.TestExpectedEqual;
     }
     for (expected, actual, 0..) |e, a, i| {
-        if (!std.mem.eql(u8, e.path, a.path) or e.start_i != a.start_i or e.end_i != a.end_i) {
+        var buf: [256]u8 = undefined;
+        const a_path = resultPath(db, a, &buf);
+        if (!std.mem.eql(u8, e.path, a_path) or e.start_i != a.start_i or e.end_i != a.end_i) {
             std.debug.print(
                 "index {d}: expected {{ .path = {s}, .start_i = {d}, .end_i = {d} }}, found {{ .path = {s}, .start_i = {d}, .end_i = {d} }}\n",
-                .{ i, e.path, e.start_i, e.end_i, a.path, a.start_i, a.end_i },
+                .{ i, e.path, e.start_i, e.end_i, a_path, a.start_i, a.end_i },
             );
             return error.TestExpectedEqual;
         }
@@ -1932,6 +1978,8 @@ const ConcurrentOp = enum {
     save,
     saveIndex,
     pruneOrphanedPaths,
+    pathOfResult,
+    idOf,
 };
 
 /// Public methods the pair test leaves out.
@@ -2031,10 +2079,12 @@ fn runOp(comptime op: ConcurrentOp, db: *TestVecDB, ctx: *const PairCtx, i: usiz
     var buf: [32]u8 = undefined;
     var buf2: [32]u8 = undefined;
     const found: usize = switch (op) {
-        .search => try db.search("pizza", &out),
-        .uniqueSearch => try db.uniqueSearch("pizza", &out),
-        .rawVectorSearch => try db.rawVectorSearch(ctx.query, &out),
-        .exactVectorSearch => try db.exactVectorSearch(ctx.query, &out),
+        // Each search reads its results' paths, as a caller would. That read is what races a
+        // rename or removal on the other side, which frees the path being read.
+        .search => try readPaths(db, out[0..try db.search("pizza", &out)]),
+        .uniqueSearch => try readPaths(db, out[0..try db.uniqueSearch("pizza", &out)]),
+        .rawVectorSearch => try readPaths(db, out[0..try db.rawVectorSearch(ctx.query, &out)]),
+        .exactVectorSearch => try readPaths(db, out[0..try db.exactVectorSearch(ctx.query, &out)]),
         .embedQuery => @intFromBool(try db.embedQuery("pizza") != null),
         .populateHighlights => blk: {
             var hl: [4]usize = @splat(std.math.maxInt(usize));
@@ -2061,7 +2111,7 @@ fn runOp(comptime op: ConcurrentOp, db: *TestVecDB, ctx: *const PairCtx, i: usiz
             for (0..3) |_| {
                 for (PairCtx.names) |name| {
                     const p = PairCtx.format(&buf, name, i);
-                    if (db.note_id_map.getId(p) == null) continue;
+                    if (db.idOf(p) == null) continue;
                     try db.removePath(p);
                     try db.embedText(p, pair_text);
                     break :blk 1;
@@ -2107,8 +2157,32 @@ fn runOp(comptime op: ConcurrentOp, db: *TestVecDB, ctx: *const PairCtx, i: usiz
             try db.pruneOrphanedPaths(ctx.notes);
             break :blk 1;
         },
+        .idOf => blk: {
+            for (PairCtx.names) |name| {
+                if (db.idOf(PairCtx.format(&buf, name, i)) != null) break :blk 1;
+            }
+            break :blk 0;
+        },
+        // Looked up under each name rather than only `home`, for the reason `.renamePath`
+        // gives; once found, the id holds through any rename.
+        .pathOfResult => blk: {
+            for (PairCtx.names) |name| {
+                const id = db.idOf(PairCtx.format(&buf, name, i)) orelse continue;
+                const result: SearchResult = .{ .id = id, .start_i = 0, .end_i = 0 };
+                if (try db.pathOfResult(result, &buf2) != null) break :blk 1;
+            }
+            break :blk 0;
+        },
     };
     return if (found > 0) .did_work else .no_op;
+}
+
+/// Reads the path of every result, and returns how many were still there to read.
+fn readPaths(db: *TestVecDB, results: []const SearchResult) !usize {
+    var buf: [32]u8 = undefined;
+    var n: usize = 0;
+    for (results) |r| n += @intFromBool(try db.pathOfResult(r, &buf) != null);
+    return n;
 }
 
 /// One thread's half of a pair.
@@ -2285,7 +2359,11 @@ const Reopened = struct {
 
 /// Like `expectSearchResultsIgnoresimilarity`, but order-independent. Results that tie on
 /// similarity come back in an arbitrary order, which these tests don't care about.
-fn expectSearchResultsUnordered(expected: []const SearchResult, actual: []const SearchResult) !void {
+fn expectSearchResultsUnordered(
+    db: anytype,
+    expected: []const ExpectedResult,
+    actual: []const SearchResult,
+) !void {
     if (expected.len != actual.len) {
         std.debug.print(
             "slice lengths differ: expected {d}, found {d}\n",
@@ -2298,7 +2376,9 @@ fn expectSearchResultsUnordered(expected: []const SearchResult, actual: []const 
     outer: for (expected) |e| {
         for (actual, 0..) |a, i| {
             if (matched[i]) continue;
-            if (std.mem.eql(u8, e.path, a.path) and e.start_i == a.start_i and e.end_i == a.end_i) {
+            var buf: [256]u8 = undefined;
+            const a_path = resultPath(db, a, &buf);
+            if (std.mem.eql(u8, e.path, a_path) and e.start_i == a.start_i and e.end_i == a.end_i) {
                 matched[i] = true;
                 continue :outer;
             }
@@ -2328,7 +2408,7 @@ test "embedText persists to disk" {
     var buf: [10]SearchResult = undefined;
     const found = try reopened.db.search("hello", &buf);
     try expectEqual(1, found);
-    try expectSearchResultsUnordered(&[_]SearchResult{
+    try expectSearchResultsUnordered(reopened.db, &[_]ExpectedResult{
         .{ .path = path, .start_i = 0, .end_i = 5 },
     }, buf[0..found]);
 
@@ -2350,7 +2430,7 @@ test "embedText persists multiple sentences and paths to disk" {
     var buf: [10]SearchResult = undefined;
     const found = try reopened.db.search("pizza", &buf);
     try expectEqual(4, found);
-    try expectSearchResultsUnordered(&[_]SearchResult{
+    try expectSearchResultsUnordered(reopened.db, &[_]ExpectedResult{
         .{ .path = "test1.md", .start_i = 0, .end_i = 5 },
         .{ .path = "test1.md", .start_i = 7, .end_i = 12 },
         .{ .path = "test1.md", .start_i = 14, .end_i = 19 },
@@ -2378,7 +2458,7 @@ test "embedText persists removals to disk" {
     try expectEqual(0, try reopened.db.search("hello", &buf));
     const found = try reopened.db.search("flatiron", &buf);
     try expectEqual(1, found);
-    try expectSearchResultsUnordered(&[_]SearchResult{
+    try expectSearchResultsUnordered(reopened.db, &[_]ExpectedResult{
         .{ .path = path, .start_i = 0, .end_i = 8 },
     }, buf[0..found]);
 
@@ -2402,7 +2482,7 @@ test "embedTextAsync persists to disk after shutdown" {
     var buf: [10]SearchResult = undefined;
     const found = try reopened.db.search("pizza", &buf);
     try expectEqual(3, found);
-    try expectSearchResultsUnordered(&[_]SearchResult{
+    try expectSearchResultsUnordered(reopened.db, &[_]ExpectedResult{
         .{ .path = path, .start_i = 0, .end_i = 5 },
         .{ .path = path, .start_i = 7, .end_i = 12 },
         .{ .path = path, .start_i = 14, .end_i = 19 },
@@ -2419,7 +2499,7 @@ test "embedTextAsync persists every queued job after shutdown" {
 
     const N = 10;
     var path_bufs: [N][16]u8 = undefined;
-    var expected: [N]SearchResult = undefined;
+    var expected: [N]ExpectedResult = undefined;
     for (0..N) |i| {
         const path = try bufPrint(&path_bufs[i], "test{d}.md", .{i});
         try db.embedTextAsync(path, "pizza");
@@ -2438,7 +2518,7 @@ test "embedTextAsync persists every queued job after shutdown" {
     try expectEqual(N, reopened.db.vec_storage.len());
     try expectEqual(N, reopened.db.codes.len());
     try expectEqual(N, found);
-    try expectSearchResultsUnordered(&expected, buf[0..found]);
+    try expectSearchResultsUnordered(reopened.db, &expected, buf[0..found]);
 
     try reopened.db.validate();
 }
@@ -2554,7 +2634,100 @@ test "the code index stays in step with the store across re-embeds and removals"
     // The removed document must be gone from results, not merely from the store.
     var buf: [10]SearchResult = undefined;
     const n = try db.search("trains", &buf);
-    for (buf[0..n]) |r| try std.testing.expect(!std.mem.eql(u8, r.path, "b.md"));
+    for (buf[0..n]) |r| {
+        var path_buf: [64]u8 = undefined;
+        try expect(!std.mem.eql(u8, resultPath(db, r, &path_buf), "b.md"));
+    }
+}
+
+/// The id of the best hit for `query`, which the tests below phrase to match one note.
+fn topId(db: *TestVecDB, query: []const u8) !NoteID {
+    var buf: [1]SearchResult = undefined;
+    try expectEqual(1, try db.uniqueSearch(query, &buf));
+    return buf[0].id;
+}
+
+test "a note keeps its id through re-embeds, renames, reroots and reopens" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    const lighthouse = "the lighthouse keeper polished the lens";
+    var path_buf: [64]u8 = undefined;
+    var id: NoteID = undefined;
+    {
+        var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+        defer db.deinit();
+
+        try db.embedText("a.md", lighthouse);
+        try db.embedText("b.md", "bicycle chains need oil");
+        id = db.idOf("a.md").?;
+        // Held across everything below, as a caller holding a result would.
+        var held: [1]SearchResult = undefined;
+        try expectEqual(1, try db.uniqueSearch(lighthouse, &held));
+        try expectEqual(id, held[0].id);
+
+        // New contents replace the vectors, not the note.
+        try db.embedText("a.md", "the lighthouse keeper trimmed the wick");
+        try expectEqual(id, db.idOf("a.md").?);
+        try expectEqual(id, try topId(db, "the lighthouse keeper trimmed the wick"));
+
+        try db.renamePath("a.md", "c.md");
+        try expectEqual(null, db.idOf("a.md"));
+        try expectEqual(id, db.idOf("c.md").?);
+        // The held result follows the note to its new name.
+        try std.testing.expectEqualStrings("c.md", (try db.pathOfResult(held[0], &path_buf)).?);
+
+        _ = try db.reroot(.{ .deeper = "sub" });
+        try expectEqual(id, db.idOf("sub/c.md").?);
+        _ = try db.reroot(.{ .shallower = "sub" });
+        try expectEqual(id, db.idOf("c.md").?);
+
+        // Other notes coming and going leave it alone.
+        try db.removePath("b.md");
+        try db.embedText("d.md", "sourdough needs a starter culture");
+        try expectEqual(id, db.idOf("c.md").?);
+        try db.validate();
+    }
+
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+    try expectEqual(id, db.idOf("c.md").?);
+    try expectEqual(id, try topId(db, "the lighthouse keeper trimmed the wick"));
+    const result: SearchResult = .{ .id = id, .start_i = 0, .end_i = 0 };
+    try std.testing.expectEqualStrings("c.md", (try db.pathOfResult(result, &path_buf)).?);
+}
+
+test "a removed note's id is never handed to another note, even across a reopen" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    // If an id came back, a result held from before the removal would quietly name whichever
+    // note got it, instead of reading as removed.
+    var path_buf: [64]u8 = undefined;
+    var held: [1]SearchResult = undefined;
+    {
+        var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+        defer db.deinit();
+
+        try db.embedText("a.md", "the lighthouse keeper polished the lens");
+        try expectEqual(1, try db.uniqueSearch("the lighthouse keeper polished the lens", &held));
+        try db.removePath("a.md");
+        try expectEqual(null, try db.pathOfResult(held[0], &path_buf));
+
+        // The same path again is a new note, not the old one back.
+        try db.embedText("a.md", "the lighthouse keeper polished the lens");
+        try expect(db.idOf("a.md").? != held[0].id);
+        try db.embedText("b.md", "bicycle chains need oil");
+        try expect(db.idOf("b.md").? != held[0].id);
+        try expectEqual(null, try db.pathOfResult(held[0], &path_buf));
+    }
+
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+    try db.embedText("c.md", "sourdough needs a starter culture");
+    try expect(db.idOf("c.md").? != held[0].id);
+    try expectEqual(null, try db.pathOfResult(held[0], &path_buf));
+    try db.validate();
 }
 
 test "the index is rebuilt on reopen and finds what it found before" {
@@ -2572,8 +2745,6 @@ test "the index is rebuilt on reopen and finds what it found before" {
         try db.embedText("a.md", text);
         n_before = try db.search("trains are fast", &before);
         try std.testing.expect(n_before > 0);
-        // `path` borrows from this db's note_id_map, which the defer above is about to free.
-        for (before[0..n_before]) |*r| r.path = try arena.allocator().dupe(u8, r.path);
     }
 
     // Nothing persists the codes yet, so this exercises the rebuild path in `init`.
@@ -2585,8 +2756,9 @@ test "the index is rebuilt on reopen and finds what it found before" {
     var after: [4]SearchResult = undefined;
     const n_after = try db.search("trains are fast", &after);
     try expectEqual(n_before, n_after);
+    // Ids are durable, so the same document answers under the same id across the reopen.
     for (before[0..n_before], after[0..n_after]) |a, b| {
-        try std.testing.expectEqualStrings(a.path, b.path);
+        try expectEqual(a.id, b.id);
         try expectEqual(a.start_i, b.start_i);
         try expectEqual(a.end_i, b.end_i);
     }
@@ -2679,7 +2851,6 @@ test "a missing index is rebuilt, and answers the same as a loaded one" {
         var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
         defer db.deinit();
         n_loaded = try db.search("trains are fast", &loaded_buf);
-        for (loaded_buf[0..n_loaded]) |*r| r.path = try arena.allocator().dupe(u8, r.path);
     }
 
     // That reopen consumed the index, and this deinit wrote a fresh one -- delete it so the
@@ -2693,7 +2864,7 @@ test "a missing index is rebuilt, and answers the same as a loaded one" {
 
     try expectEqual(n_loaded, n_rebuilt);
     for (loaded_buf[0..n_loaded], rebuilt[0..n_rebuilt]) |a, b| {
-        try std.testing.expectEqualStrings(a.path, b.path);
+        try expectEqual(a.id, b.id);
         try expectEqual(a.start_i, b.start_i);
         try expectEqual(a.similarity, b.similarity);
     }
@@ -2748,7 +2919,8 @@ test "tear: a lost manifest does not let a new document inherit old vectors" {
     var buf: [10]SearchResult = undefined;
     const found = try db.search("the kangaroo hops across the outback", &buf);
     for (buf[0..found]) |r| {
-        if (std.mem.eql(u8, r.path, "new.md")) {
+        var path_buf: [64]u8 = undefined;
+        if (std.mem.eql(u8, resultPath(db, r, &path_buf), "new.md")) {
             std.debug.print(
                 "old.md's vector surfaced under new.md at [{d}..{d}]\n",
                 .{ r.start_i, r.end_i },
@@ -2789,7 +2961,8 @@ test "tear: a rolled back manifest does not let a new document inherit old vecto
     var buf: [10]SearchResult = undefined;
     const found = try db.search("the printing press changed europe", &buf);
     for (buf[0..found]) |r| {
-        if (std.mem.eql(u8, r.path, "third.md")) {
+        var path_buf: [64]u8 = undefined;
+        if (std.mem.eql(u8, resultPath(db, r, &path_buf), "third.md")) {
             std.debug.print(
                 "second.md's vector surfaced under third.md at [{d}..{d}]\n",
                 .{ r.start_i, r.end_i },
@@ -2817,7 +2990,8 @@ test "tear: rows whose doc_id names nothing are invisible" {
     var buf: [10]SearchResult = undefined;
     const found = try db.search("the lighthouse keeper polished the lens", &buf);
     for (buf[0..found]) |r| {
-        try expect(!std.mem.eql(u8, r.path, "gone.md"));
+        var path_buf: [64]u8 = undefined;
+        try expect(!std.mem.eql(u8, resultPath(db, r, &path_buf), "gone.md"));
     }
 }
 
@@ -2937,7 +3111,7 @@ test "reroot re-expresses paths without re-embedding" {
     // The same vectors answer the same query, under the new path. Nothing was embedded again.
     var buf: [1]SearchResult = undefined;
     try expectEqual(1, try db.search("hello", &buf));
-    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+    try expectSearchResultsIgnoresimilarity(db, &[_]ExpectedResult{
         .{ .path = "md-src/one.md", .start_i = 0, .end_i = 5 },
     }, buf[0..1]);
     try db.validate();
@@ -2967,7 +3141,7 @@ test "reroot drops the notes the new root no longer contains" {
 
     var buf: [4]SearchResult = undefined;
     try expectEqual(1, try db.search("hello", &buf));
-    try expectSearchResultsIgnoresimilarity(&[_]SearchResult{
+    try expectSearchResultsIgnoresimilarity(db, &[_]ExpectedResult{
         .{ .path = "kept.md", .start_i = 0, .end_i = 5 },
     }, buf[0..1]);
     try db.validate();

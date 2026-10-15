@@ -67,7 +67,11 @@ pub fn main(init: std.process.Init) !void {
         }
 
         for (results[0..n]) |result| {
-            std.debug.print("  [{s}] (similarity: {d:.2})\n", .{ result.path, result.similarity });
+            // Results carry an id; the path is copied out separately. Null means the note was
+            // removed since the search.
+            var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const path = try vectors.pathOfResult(result, &path_buf) orelse continue;
+            std.debug.print("  [{s}] (similarity: {d:.2})\n", .{ path, result.similarity });
         }
         std.debug.print("\n", .{});
     }

@@ -118,8 +118,9 @@ a document's vectors on every re-embed -- leaked a slot per sentence, forever. T
 real v1 defect.
 
 **It needed no index and no compaction pass.** `vec_id`s are ephemeral: `SearchResult` carries
-path/start_i/end_i/similarity and no id, `note_id_map` has no `VectorID` at all, and inside
-`vector.zig` ids appear only as `rm(old_v.id)` within `replaceVectors` plus one test helper --
+a note id (a `NoteID`, which is durable, not a `VectorID`) plus start_i/end_i/similarity,
+`note_id_map` has no `VectorID` at all, and inside `vector.zig` ids appear only as
+`rm(old_v.id)` within `replaceVectors` plus one test helper --
 `put`'s return is discarded. No id is persisted, exposed to consumers, or held across a process
 boundary.
 

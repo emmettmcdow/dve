@@ -301,12 +301,12 @@ fn runSearch(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
             const exact_ns = exact_timer.read();
             exact_ns_sum += exact_ns;
 
-            // Matched on (path, start_i): two results naming the same span of the same
+            // Matched on (id, start_i): two results naming the same span of the same
             // document are the same result, whatever their ranks.
             var hit: usize = 0;
             for (exact[0..n_exact]) |e| {
                 for (buf[0..found]) |g| {
-                    if (e.start_i == g.start_i and std.mem.eql(u8, e.path, g.path)) {
+                    if (e.start_i == g.start_i and e.id == g.id) {
                         hit += 1;
                         break;
                     }
@@ -322,9 +322,11 @@ fn runSearch(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
             });
         };
         for (buf[0..found]) |r| {
+            var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+            const path = try db.pathOfResult(r, &path_buf) orelse continue;
             std.debug.print("    {d:.4}  {s} [{d}..{d}]\n", .{
                 r.similarity,
-                r.path,
+                path,
                 r.start_i,
                 r.end_i,
             });

@@ -37,7 +37,10 @@ try vectors.embedText("doc2", "The solar system has eight planets");
 // Search returns results ordered by similarity.
 var results: [10]dve.SearchResult = undefined;
 const n = try vectors.search("artificial intelligence", &results);
-// results[0].path == "doc1"
+// Results identify documents by id; copy the path out to read it.
+var path_buf: [256]u8 = undefined;
+const path = (try vectors.pathOfResult(results[0], &path_buf)).?;
+// path == "doc1"
 ```
 
 See the [examples](./examples) directory for complete working demos in Zig.

@@ -51,8 +51,15 @@ try vectors.embedTextAsync("doc2", "The solar system has eight planets");
 var results: [10]dve.SearchResult = undefined;
 const n = try vectors.search("artificial intelligence", &results);
 for (results[0..n]) |result| {
-    std.debug.print("{s} (similarity: {d:.2})\n", .{ result.path, result.similarity });
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    // A result carries the document's id, not its path; `pathOfResult` copies the path into a
+    // buffer you own.
+    const path = try vectors.pathOfResult(result, &path_buf) orelse continue;
+    std.debug.print("{s} (similarity: {d:.2})\n", .{ path, result.similarity });
 }
+
+// To check whether a known document came back, IDs can be compared.
+const top_is_doc1 = n > 0 and results[0].id == vectors.idOf("doc1");
 ```
 
 ## Model selection
