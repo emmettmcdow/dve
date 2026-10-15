@@ -964,6 +964,9 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         /// `validate` is what reports it. This is for documents the user deleted out from
         /// under us.
         pub fn pruneOrphanedPaths(self: *Self, basedir: std.Io.Dir) !void {
+            // Dropping a name frees its path, which a search holding this lock may be reading.
+            self.store_mutex.lockUncancelable(self.io);
+            defer self.store_mutex.unlock(self.io);
             try self.note_id_map.pruneOrphanedPaths(basedir);
         }
 
