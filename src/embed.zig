@@ -1942,6 +1942,10 @@ test "embed - output is L2-normalized (nlembed)" {
 
 // This is technically valid but likely unexpected. Throw a warning instead of failing.
 test "embed with punctuation" {
+    // The warning is the behavior under test rather than news.
+    std.testing.log_level = .err;
+    defer std.testing.log_level = .warn;
+
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();

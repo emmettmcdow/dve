@@ -2897,6 +2897,10 @@ fn testCodesName(buf: []u8) ![]const u8 {
 }
 
 test "tear: a lost manifest does not let a new document inherit old vectors" {
+    // The reopen logs the repair it makes, which is the behavior under test rather than news.
+    std.testing.log_level = .err;
+    defer std.testing.log_level = .warn;
+
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
@@ -2932,6 +2936,10 @@ test "tear: a lost manifest does not let a new document inherit old vectors" {
 }
 
 test "tear: a rolled back manifest does not let a new document inherit old vectors" {
+    // The reopen logs the repair it makes, which is the behavior under test rather than news.
+    std.testing.log_level = .err;
+    defer std.testing.log_level = .warn;
+
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
@@ -2996,6 +3004,10 @@ test "tear: rows whose doc_id names nothing are invisible" {
 }
 
 test "tear: a path with no vectors does not survive an open" {
+    // The reopen logs the repair it makes, which is the behavior under test rather than news.
+    std.testing.log_level = .err;
+    defer std.testing.log_level = .warn;
+
     var tmpD = std.testing.tmpDir(.{ .iterate = true });
     defer tmpD.cleanup();
 
