@@ -8,6 +8,9 @@ pub const Error = error{
     /// otherwise shows up as results that silently stop appearing.
     IndexOutOfSync,
     ManifestOutOfSync,
+    /// populateHighlights was given an odd number of slots. Highlights take two each, so the
+    /// last could hold only half of one.
+    OddHighlightsLength,
 };
 
 pub const SearchResult = struct {
@@ -559,22 +562,31 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
 
         /// Given a sentence(result_content), highlight words in the sentence that most match the
         /// query. This can be used to highlight to the user *why* a search result appeared.
+        ///
+        /// Each highlight takes two slots of `highlights`: the start and end byte offsets of the
+        /// word in `result_content`. Returns how many highlights were written, in the order they
+        /// appear, stopping when `highlights` is full. An odd-length `highlights` is
+        /// `Error.OddHighlightsLength`.
         pub fn populateHighlights(
             self: *Self,
-            query: []const u8,
+            raw_query: []const u8,
             result_content: []const u8,
             highlights: []usize,
-        ) !void {
-            const max_highlights = @divExact(highlights.len, 2);
-            if (max_highlights == 0) return;
+        ) !usize {
+            if (highlights.len % 2 != 0) return Error.OddHighlightsLength;
+            const max_highlights = highlights.len / 2;
+            if (max_highlights == 0) return 0;
+
+            const query = stripQuery(raw_query);
+            if (query.len == 0) return 0;
 
             var arena = std.heap.ArenaAllocator.init(self.allocator);
             defer arena.deinit();
 
-            const query_vec_union = (try self.embedder.embed(arena.allocator(), query)) orelse return;
+            const query_vec_union = (try self.embedder.embed(arena.allocator(), query)) orelse return 0;
             const query_vec = @field(query_vec_union, @tagName(embedding_model)).*;
 
-            var found: u8 = 0;
+            var found: usize = 0;
             var wordspliterator = embed.WordSpliterator.init(result_content);
             while (wordspliterator.next()) |word_chunk| {
                 const chunk_vec_union = (try self.embedder.embed(
@@ -593,10 +605,10 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                     highlights[found * 2] = word_chunk.start_i;
                     highlights[found * 2 + 1] = word_chunk.end_i;
                     found += 1;
-                    if (found >= max_highlights) return;
+                    if (found >= max_highlights) return found;
                 }
             }
-            return;
+            return found;
         }
 
         fn workQueueRun(self: *@This()) !void {
@@ -1094,26 +1106,7 @@ fn codesPath(buf: []u8, db_path: []const u8) ![]const u8 {
 }
 
 fn stripQuery(query: []const u8) []const u8 {
-    var start_i: usize = 0;
-    var end_i = query.len;
-    for (query, 0..) |c, i| {
-        start_i = i;
-        if (isAlphanumeric(c)) {
-            break;
-        }
-    }
-    const new_len = end_i - start_i;
-    if (start_i == end_i - 1) return query[0..0];
-    for (1..new_len + 1) |neg_i| {
-        const i = query.len - neg_i;
-        const c = query[i];
-        if (isAlphanumeric(c)) {
-            break;
-        }
-        end_i = i;
-    }
-    assert(start_i <= end_i);
-    return query[start_i..end_i];
+    return embed.trimToWords(query);
 }
 
 fn whitespaceOnly(contents: []const u8) bool {
@@ -1804,18 +1797,463 @@ test "populateHighlights" {
         const query = "hello";
         const contents = "bah hello";
         var highlights: [10]usize = @splat(0);
-        try db.populateHighlights(query, contents, &highlights);
+        try expectEqual(1, try db.populateHighlights(query, contents, &highlights));
         try expectEqualSlices(usize, &[10]usize{ 4, 9, 0, 0, 0, 0, 0, 0, 0, 0 }, &highlights);
     }
     { // Multiple hits
         const query = "hello";
         const contents = "hello; hello ";
         var highlights: [10]usize = @splat(0);
-        try db.populateHighlights(query, contents, &highlights);
+        try expectEqual(2, try db.populateHighlights(query, contents, &highlights));
         try expectEqualSlices(usize, &[10]usize{ 0, 5, 7, 12, 0, 0, 0, 0, 0, 0 }, &highlights);
     }
 
     try db.validate();
+}
+
+/// The models the default build links. Which words clear the threshold is up to the model, so
+/// the tests about what gets highlighted run against each.
+const highlight_models = [_]EmbeddingModel{ .apple_nlembedding, .mpnet_embedding };
+
+/// A value no offset can take, marking the slots populateHighlights left alone.
+const unwritten = std.math.maxInt(usize);
+
+/// Highlights `content` for `query` into `buf` and returns the pairs written, checking that
+/// nothing past them was touched.
+fn highlightPairs(
+    db: anytype,
+    query: []const u8,
+    content: []const u8,
+    buf: [][2]usize,
+) ![]const [2]usize {
+    @memset(buf, .{ unwritten, unwritten });
+    const n = try db.populateHighlights(query, content, @as([*]usize, @ptrCast(buf.ptr))[0 .. buf.len * 2]);
+    try expect(n <= buf.len);
+    for (buf[n..]) |pair| try expectEqual([2]usize{ unwritten, unwritten }, pair);
+    return buf[0..n];
+}
+
+/// `piece` `n` times over.
+fn repeatAlloc(allocator: std.mem.Allocator, piece: []const u8, n: usize) ![]u8 {
+    const out = try allocator.alloc(u8, piece.len * n);
+    for (0..n) |i| @memcpy(out[i * piece.len ..][0..piece.len], piece);
+    return out;
+}
+
+/// Checks of what gets highlighted that note each miss and carry on, so one run of a test shows
+/// every miss rather than the first.
+const HighlightChecks = struct {
+    misses: usize = 0,
+
+    /// Expects `query` to highlight exactly `expected` in `content`, in order.
+    fn expectWords(
+        self: *HighlightChecks,
+        db: anytype,
+        query: []const u8,
+        content: []const u8,
+        expected: []const []const u8,
+    ) !void {
+        var buf: [16][2]usize = undefined;
+        const pairs = try highlightPairs(db, query, content, &buf);
+        const matched = pairs.len == expected.len and for (expected, pairs) |word, p| {
+            if (!std.mem.eql(u8, word, content[p[0]..p[1]])) break false;
+        } else true;
+        if (matched) return;
+
+        self.misses += 1;
+        std.debug.print("{s}: query \"{f}\" in \"{f}\"\n  expected:", .{
+            @typeName(@TypeOf(db.*)),
+            std.zig.fmtString(query),
+            std.zig.fmtString(content),
+        });
+        for (expected) |word| std.debug.print(" \"{f}\"", .{std.zig.fmtString(word)});
+        std.debug.print("\n  got:     ", .{});
+        for (pairs) |p| std.debug.print(" \"{f}\"", .{std.zig.fmtString(content[p[0]..p[1]])});
+        std.debug.print("\n", .{});
+    }
+
+    fn finish(self: HighlightChecks) !void {
+        try expectEqual(0, self.misses);
+    }
+};
+
+/// The ways a highlight can be wrong whatever the model or query. A highlight is drawn over the
+/// text as-is, so it must be in bounds, after the one before it, and exactly one word: not part
+/// of one, and not several run together.
+const HighlightFault = enum {
+    empty,
+    out_of_bounds,
+    out_of_order,
+    splits_utf8_char,
+    starts_mid_word,
+    ends_mid_word,
+    spans_whitespace_or_control,
+    differs_on_repeat,
+};
+
+fn highlightFault(content: []const u8, pair: [2]usize, prev_end: usize) ?HighlightFault {
+    const start, const end = pair;
+    if (start >= end) return .empty;
+    if (end > content.len) return .out_of_bounds;
+    if (start < prev_end) return .out_of_order;
+    const word = content[start..end];
+    if (std.unicode.utf8ValidateSlice(content) and !std.unicode.utf8ValidateSlice(word)) {
+        return .splits_utf8_char;
+    }
+    if (start > 0 and embed.wordCharBefore(content, start)) return .starts_mid_word;
+    if (end < content.len and embed.wordCharAt(content, end)) return .ends_mid_word;
+    for (word) |c| {
+        if (std.ascii.isWhitespace(c) or std.ascii.isControl(c)) return .spans_whitespace_or_control;
+    }
+    return null;
+}
+
+/// Tallies HighlightFaults by kind over many calls, printing the first example of each, so one
+/// run reports every kind found.
+const FaultLog = struct {
+    counts: std.EnumArray(HighlightFault, usize) = .initFill(0),
+
+    fn record(
+        self: *FaultLog,
+        fault: HighlightFault,
+        model: []const u8,
+        query: []const u8,
+        content: []const u8,
+        pair: [2]usize,
+    ) void {
+        const count = self.counts.getPtr(fault);
+        if (count.* == 0) {
+            const shown = content[@min(pair[0], content.len)..@min(pair[1], content.len)];
+            std.debug.print("{t}, first seen in {s}: query \"{f}\" in \"{f}\" highlighted [{d},{d}) \"{f}\"\n", .{
+                fault,
+                model,
+                std.zig.fmtString(query),
+                std.zig.fmtString(content),
+                pair[0],
+                pair[1],
+                std.zig.fmtString(shown),
+            });
+        }
+        count.* += 1;
+    }
+
+    fn checkPairs(
+        self: *FaultLog,
+        model: []const u8,
+        query: []const u8,
+        content: []const u8,
+        pairs: []const [2]usize,
+    ) void {
+        var prev_end: usize = 0;
+        for (pairs) |pair| {
+            if (highlightFault(content, pair, prev_end)) |fault| {
+                self.record(fault, model, query, content, pair);
+            }
+            prev_end = pair[1];
+        }
+    }
+
+    /// Highlights `content` for each of its own words in turn, so that every query has at least
+    /// one exact match, and records the faults in what comes back.
+    fn checkEachWord(self: *FaultLog, db: anytype, content: []const u8) !void {
+        const model = @typeName(@TypeOf(db.*));
+        var words = embed.WordSpliterator.init(content);
+        while (words.next()) |word| {
+            var buf: [32][2]usize = undefined;
+            const pairs = try highlightPairs(db, word.contents, content, &buf);
+            self.checkPairs(model, word.contents, content, pairs);
+
+            var again_buf: [32][2]usize = undefined;
+            const again = try highlightPairs(db, word.contents, content, &again_buf);
+            if (!std.mem.eql([2]usize, pairs, again)) {
+                self.record(.differs_on_repeat, model, word.contents, content, .{ 0, 0 });
+            }
+        }
+    }
+
+    fn finish(self: *FaultLog) !void {
+        var total: usize = 0;
+        var it = self.counts.iterator();
+        while (it.next()) |entry| {
+            if (entry.value.* == 0) continue;
+            std.debug.print("{t}: {d}\n", .{ entry.key, entry.value.* });
+            total += entry.value.*;
+        }
+        try expectEqual(0, total);
+    }
+};
+
+test "populateHighlights odd-length buffer" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+
+    for ([_]usize{ 1, 3, 5 }) |len| {
+        var buf: [5]usize = @splat(unwritten);
+        try expectError(Error.OddHighlightsLength, db.populateHighlights("hello", "hello hello hello", buf[0..len]));
+        try expectEqualSlices(usize, &@as([5]usize, @splat(unwritten)), &buf);
+    }
+}
+
+test "populateHighlights more highlights than a u8 counts" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+
+    // 300 hits, room for all of them. The counter's pair index overflows a u8 at the 128th.
+    const n = 300;
+    const content = try repeatAlloc(testing_allocator, "hello ", n);
+    defer testing_allocator.free(content);
+    const buf = try testing_allocator.alloc([2]usize, n);
+    defer testing_allocator.free(buf);
+    const pairs = try highlightPairs(db, "hello", content, buf);
+    try expectEqual(n, pairs.len);
+    for (pairs, 0..) |p, i| try expectEqual([2]usize{ i * 6, i * 6 + 5 }, p);
+}
+
+test "populateHighlights stops at a full buffer" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+
+    const content = "hello bah hello bah hello";
+    { // Room for fewer than there are: the first ones, in order.
+        var buf: [2][2]usize = undefined;
+        try expectEqualSlices([2]usize, &.{ .{ 0, 5 }, .{ 10, 15 } }, try highlightPairs(db, "hello", content, &buf));
+    }
+    { // Room for exactly as many as there are.
+        var buf: [3][2]usize = undefined;
+        try expectEqualSlices(
+            [2]usize,
+            &.{ .{ 0, 5 }, .{ 10, 15 }, .{ 20, 25 } },
+            try highlightPairs(db, "hello", content, &buf),
+        );
+    }
+}
+
+test "populateHighlights exact word" {
+    var checks: HighlightChecks = .{};
+    inline for (highlight_models) |model| {
+        var tmpD = std.testing.tmpDir(.{ .iterate = true });
+        defer tmpD.cleanup();
+        var db = try VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
+        defer db.deinit();
+
+        try checks.expectWords(db, "hello", "bah hello", &.{"hello"});
+        try checks.expectWords(db, "Hello", "hello HELLO", &.{ "hello", "HELLO" });
+        try checks.expectWords(db, "hello", "hello\r\nworld", &.{"hello"});
+        try checks.expectWords(db, "naïve", "a naïve approach", &.{"naïve"});
+        // Words starting or ending outside ASCII.
+        try checks.expectWords(db, "café", "the café is open", &.{"café"});
+        try checks.expectWords(db, "über", "über alles", &.{"über"});
+        try checks.expectWords(db, "日本", "日本 is a country", &.{"日本"});
+        // Whitespace other than a space still separates words. Real words around it: NL puts
+        // made-up ones like "foo" close to "hello" (0.66).
+        try checks.expectWords(db, "hello", "the\thello\tthere", &.{"hello"});
+    }
+    try checks.finish();
+}
+
+test "populateHighlights cleans the query as search does" {
+    var checks: HighlightChecks = .{};
+    inline for (highlight_models) |model| {
+        var tmpD = std.testing.tmpDir(.{ .iterate = true });
+        defer tmpD.cleanup();
+        var db = try VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
+        defer db.deinit();
+
+        // A query is whatever the user typed into the search box, punctuation and all. Search
+        // strips it, so a result found for "hello?" ought to highlight what "hello" would.
+        for ([_][]const u8{ "hello?", "hello.", "\"hello\"", "#hello", "  hello  " }) |query| {
+            try checks.expectWords(db, query, "bah hello", &.{"hello"});
+        }
+        // And one that strips to nothing highlights nothing, as it finds nothing.
+        for ([_][]const u8{ "?!", "...", "   " }) |query| {
+            try checks.expectWords(db, query, "what?! ok ... fine", &.{});
+        }
+    }
+    try checks.finish();
+}
+
+test "populateHighlights multi-word query" {
+    var checks: HighlightChecks = .{};
+    inline for (highlight_models) |model| {
+        var tmpD = std.testing.tmpDir(.{ .iterate = true });
+        defer tmpD.cleanup();
+        var db = try VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
+        defer db.deinit();
+
+        // Search queries are usually phrases. A word of the phrase appearing in the result is
+        // the plainest reason it matched, so it should be highlighted.
+        const content = "my favorite pizza recipe uses basil";
+        var buf: [8][2]usize = undefined;
+        const pairs = try highlightPairs(db, "italian pizza recipe", content, &buf);
+        const has_pizza = for (pairs) |p| {
+            if (std.mem.eql(u8, "pizza", content[p[0]..p[1]])) break true;
+        } else false;
+        if (!has_pizza) {
+            std.debug.print("{t}: \"pizza\" not highlighted\n", .{model});
+            checks.misses += 1;
+        }
+    }
+    try checks.finish();
+}
+
+test "populateHighlights inflections" {
+    var checks: HighlightChecks = .{};
+    inline for (highlight_models) |model| {
+        var tmpD = std.testing.tmpDir(.{ .iterate = true });
+        defer tmpD.cleanup();
+        var db = try VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
+        defer db.deinit();
+
+        try checks.expectWords(db, "pizza", "two pizzas", &.{"pizzas"});
+        try checks.expectWords(db, "running", "he runs daily", &.{"runs"});
+    }
+    try checks.finish();
+}
+
+test "populateHighlights unrelated content" {
+    var checks: HighlightChecks = .{};
+    inline for (highlight_models) |model| {
+        var tmpD = std.testing.tmpDir(.{ .iterate = true });
+        defer tmpD.cleanup();
+        var db = try VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
+        defer db.deinit();
+
+        try checks.expectWords(db, "pizza", "the quarterly tax filing deadline is in April", &.{});
+        // Short words embed close to everything; none of them should get through.
+        try checks.expectWords(db, "pizza", "I a b x 1 2 3 ok so it", &.{});
+    }
+    try checks.finish();
+}
+
+test "populateHighlights well formed" {
+    var faults: FaultLog = .{};
+    inline for (highlight_models) |model| {
+        var tmpD = std.testing.tmpDir(.{ .iterate = true });
+        defer tmpD.cleanup();
+        var db = try VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
+        defer db.deinit();
+
+        const contents = [_][]const u8{
+            "hello world",
+            "  leading and trailing  ",
+            "...dots... everywhere...",
+            "comma,separated,words;and:more",
+            "(parenthesized) \"quoted\" words",
+            "#hash @at $dollar %percent",
+            "hyphen-ated slash/ed it's",
+            "tab\tseparated\twords",
+            "crlf\r\nline\r\nendings",
+            "form\x0bfeed\x0cand\x1bescape",
+            "nul\x00inside hello",
+            "café über naïve",
+            "日本語 and 中文 text",
+            "emoji 😀 between 🍕 words",
+            "invalid \xff\xfe utf8 \xc3 bytes",
+            "see https://example.com/a.b?c=d now",
+            "glued foohttps://example.com url",
+            "(https://example.com) wrapped",
+            "http:// bare prefix",
+            "1 2 3 a b c",
+            "x",
+            "!!!",
+        };
+        for (contents) |content| try faults.checkEachWord(db, content);
+    }
+    try faults.finish();
+}
+
+test "populateHighlights fuzz" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+
+    // Text built from pieces each of which has broken a splitter somewhere. Where words start and
+    // end doesn't depend on the model, so one is enough.
+    const pieces = [_][]const u8{
+        "hello", "world", "a",    "1",        " ",       "  ",      "\t",  "\n", "\r\n", ".", ",", "!", "?",
+        ";",     ":",     "(",    ")",        "\"",      "'",       "-",   "/",  "#",    "@", "_",
+        "café",
+        "日本",
+        "😀",
+        "é",
+        "\xff",  "\xc3",  "\x00", "https://", "http://", "x.com/y", "...",
+    };
+    var faults: FaultLog = .{};
+    var prng = std.Random.DefaultPrng.init(0x5eed);
+    const random = prng.random();
+    var content_buf: [256]u8 = undefined;
+    for (0..200) |_| {
+        var len: usize = 0;
+        for (0..random.intRangeAtMost(usize, 1, 12)) |_| {
+            const piece = pieces[random.uintLessThan(usize, pieces.len)];
+            @memcpy(content_buf[len..][0..piece.len], piece);
+            len += piece.len;
+        }
+        try faults.checkEachWord(db, content_buf[0..len]);
+    }
+    try faults.finish();
+}
+
+test "populateHighlights long input" {
+    var faults: FaultLog = .{};
+    inline for (highlight_models) |model| {
+        var tmpD = std.testing.tmpDir(.{ .iterate = true });
+        defer tmpD.cleanup();
+        var db = try VectorEngine(model).init(testing_allocator, std.testing.io, tmpD.dir, .{});
+        defer db.deinit();
+
+        var buf: [4][2]usize = undefined;
+        { // One word far past any model's context.
+            const word = try testing_allocator.alloc(u8, 64 * 1024);
+            defer testing_allocator.free(word);
+            @memset(word, 'a');
+            const model_name = @typeName(@TypeOf(db.*));
+            faults.checkPairs(model_name, "hello", word, try highlightPairs(db, "hello", word, &buf));
+            faults.checkPairs(model_name, word, "hello aaaa", try highlightPairs(db, word, "hello aaaa", &buf));
+        }
+        { // Many words, the match last.
+            const filler = try repeatAlloc(testing_allocator, "lorem ipsum dolor ", 300);
+            defer testing_allocator.free(filler);
+            const content = try std.mem.concat(testing_allocator, u8, &.{ filler, "hello" });
+            defer testing_allocator.free(content);
+            try expectEqualSlices(
+                [2]usize,
+                &.{.{ content.len - 5, content.len }},
+                try highlightPairs(db, "hello", content, &buf),
+            );
+        }
+    }
+    try faults.finish();
+}
+
+test "populateHighlights out of memory" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var failing = std.testing.FailingAllocator.init(testing_allocator, .{});
+    var db = try TestVecDB.init(failing.allocator(), std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+    defer failing.fail_index = unwritten;
+
+    // Fail each allocation the call makes in turn. Every one must come back as an error with
+    // nothing leaked, until the call needs no more than it is allowed and succeeds.
+    var fail_after: usize = 0;
+    while (true) : (fail_after += 1) {
+        failing.fail_index = failing.alloc_index + fail_after;
+        var buf: [4]usize = undefined;
+        const n = db.populateHighlights("hello", "bah hello world", &buf) catch |err| {
+            try expectEqual(error.OutOfMemory, err);
+            continue;
+        };
+        try expectEqualSlices(usize, &.{ 4, 9 }, buf[0 .. n * 2]);
+        break;
+    }
 }
 
 test "embed skip low-value" {
@@ -2088,9 +2526,8 @@ fn runOp(comptime op: ConcurrentOp, db: *TestVecDB, ctx: *const PairCtx, i: usiz
         .exactVectorSearch => try readPaths(db, out[0..try db.exactVectorSearch(ctx.query, &out)]),
         .embedQuery => @intFromBool(try db.embedQuery("pizza") != null),
         .populateHighlights => blk: {
-            var hl: [4]usize = @splat(std.math.maxInt(usize));
-            try db.populateHighlights("pizza", "I really like pizza", &hl);
-            break :blk @intFromBool(hl[0] != std.math.maxInt(usize));
+            var hl: [4]usize = undefined;
+            break :blk try db.populateHighlights("pizza", "I really like pizza", &hl);
         },
         .embedText => blk: {
             try db.embedText(PairCtx.format(&buf, PairCtx.home, i), pair_text);
@@ -2544,13 +2981,13 @@ test "empty inputs" {
     try expectEqual(0, db.uniqueSearch("", &res));
 
     var highlights: [2]usize = undefined;
-    try db.populateHighlights("", "", &.{});
-    try db.populateHighlights("", "book", &highlights);
-    try db.populateHighlights("book", "", &highlights);
-    try db.populateHighlights("book", "book", &.{});
-    try db.populateHighlights("book", "", &.{});
-    try db.populateHighlights("", "book", &.{});
-    try db.populateHighlights("", "", &highlights);
+    try expectEqual(0, try db.populateHighlights("", "", &.{}));
+    try expectEqual(0, try db.populateHighlights("", "book", &highlights));
+    try expectEqual(0, try db.populateHighlights("book", "", &highlights));
+    try expectEqual(0, try db.populateHighlights("book", "book", &.{}));
+    try expectEqual(0, try db.populateHighlights("book", "", &.{}));
+    try expectEqual(0, try db.populateHighlights("", "book", &.{}));
+    try expectEqual(0, try db.populateHighlights("", "", &highlights));
 
     try expectEqual(Error.InvalidPath, db.removePath(""));
 
@@ -2577,6 +3014,7 @@ const testing_allocator = std.testing.allocator;
 const expectEqual = std.testing.expectEqual;
 const expectError = std.testing.expectError;
 const expectEqualSlices = std.testing.expectEqualSlices;
+const expectEqualStrings = std.testing.expectEqualStrings;
 const assert = std.debug.assert;
 
 const config = @import("config");

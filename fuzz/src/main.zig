@@ -263,11 +263,11 @@ fn runWorker(allocator: std.mem.Allocator, io: std.Io, seed: u64, ops_per_worker
                     "{{\"event\":\"attempt\",\"op\":\"populateHighlights\",\"query\":\"{s}\",\"content\":\"{s}\"}}\n",
                     .{ query_json, content_json },
                 );
-                engine.populateHighlights(query, content, &highlights_buf) catch |err| {
+                const n = engine.populateHighlights(query, content, &highlights_buf) catch |err| {
                     try writeOut(allocator, io, "{{\"event\":\"error\",\"op\":\"populateHighlights\",\"err\":\"{s}\"}}\n", .{@errorName(err)});
                     continue;
                 };
-                try writeOut(allocator, io, "{{\"event\":\"ok\",\"op\":\"populateHighlights\"}}\n", .{});
+                try writeOut(allocator, io, "{{\"event\":\"ok\",\"op\":\"populateHighlights\",\"n\":{d}}}\n", .{n});
             },
             .remove => {
                 if (path_constraints and known_keys.items.len == 0) continue;

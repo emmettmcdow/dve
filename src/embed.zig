@@ -567,7 +567,7 @@ pub const MpnetEmbedder = struct {
             std.log.info("Skipping embed of zero-length string", .{});
             return null;
         }
-        if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
+        if (!startsAndEndsInWord(str)) {
             std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
         }
 
@@ -626,7 +626,7 @@ pub const MpnetEmbedder = struct {
                 std.log.info("Skipping embed of zero-length string", .{});
                 continue;
             }
-            if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
+            if (!startsAndEndsInWord(str)) {
                 std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
             }
             const token_ids = try self.tokenizer.tokenize(allocator, str);
@@ -1061,7 +1061,10 @@ pub const NLEmbedder = struct {
     pub const ID = EmbeddingModel.apple_nlembedding;
     pub const REFERENCE_IMPLEMENTATION_NAME = "apple-nlembedding";
     pub const THRESHOLD = 0.40;
-    pub const STRICT_THRESHOLD = THRESHOLD * 2;
+    // Between the closest unrelated words (tax/lease 0.54, pizza/bread 0.51) and the farthest
+    // ones a highlight should catch (pizza/pizzas 0.70, running/runs 0.62, a word of a phrase
+    // query 0.57+). Twice THRESHOLD, as it was, let through little short of an exact match.
+    pub const STRICT_THRESHOLD = THRESHOLD + 0.15;
     // Suffixed by storage type: a quantized database is not loadable by an unquantized
     // build, so the two live side by side rather than one refusing the other's file.
     pub const PATH = @tagName(ID) ++ db_suffix ++ ".db";
@@ -1144,7 +1147,7 @@ pub const NLEmbedder = struct {
             std.log.info("Skipping embed of zero-length string", .{});
             return null;
         }
-        if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
+        if (!startsAndEndsInWord(str)) {
             std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
         }
 
@@ -1271,7 +1274,7 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
             std.log.info("Skipping embed of zero-length string", .{});
             return null;
         }
-        if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
+        if (!startsAndEndsInWord(str)) {
             std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
         }
 
@@ -1330,7 +1333,7 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
                 std.log.info("Skipping embed of zero-length string", .{});
                 continue;
             }
-            if (!isAlphanumeric(str[0]) or !isAlphanumeric(str[str.len - 1])) {
+            if (!startsAndEndsInWord(str)) {
                 std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
             }
             // The bridge takes a C string; anything past MAX_CTX is truncated there.
@@ -1363,6 +1366,68 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
     }
 };
 
+/// Whether `cp` can be part of a word: an ASCII letter or digit, or any other character outside
+/// ASCII except the spaces and punctuation of Latin-1, General Punctuation and CJK Symbols and
+/// Punctuation -- so "café" and "日本" are words, and the quotes in “this” are not part of one.
+pub fn isWordCodepoint(cp: u21) bool {
+    if (cp < 0x80) return isAlphanumeric(@intCast(cp));
+    return !(cp <= 0xBF or (cp >= 0x2000 and cp <= 0x206F) or (cp >= 0x3000 and cp <= 0x303F));
+}
+
+const Char = struct { len: u3, word: bool };
+
+/// The character starting at `s[i]`. A byte that doesn't start a valid UTF-8 sequence stands
+/// alone, and isn't a word character.
+fn charAt(s: []const u8, i: usize) Char {
+    const invalid: Char = .{ .len = 1, .word = false };
+    const len = std.unicode.utf8ByteSequenceLength(s[i]) catch return invalid;
+    if (i + len > s.len) return invalid;
+    const cp = std.unicode.utf8Decode(s[i..][0..len]) catch return invalid;
+    return .{ .len = len, .word = isWordCodepoint(cp) };
+}
+
+/// The character ending just before `s[end]`.
+fn charBefore(s: []const u8, end: usize) Char {
+    var i = end - 1;
+    while (i > 0 and end - i < 4 and s[i] & 0xC0 == 0x80) i -= 1;
+    const c = charAt(s, i);
+    return if (i + c.len == end) c else .{ .len = 1, .word = false };
+}
+
+/// Whether the character starting at `s[i]` is a word character.
+pub fn wordCharAt(s: []const u8, i: usize) bool {
+    return charAt(s, i).word;
+}
+
+/// Whether the character ending just before `s[end]` is a word character.
+pub fn wordCharBefore(s: []const u8, end: usize) bool {
+    return charBefore(s, end).word;
+}
+
+/// `s` without the characters before its first word character and after its last one. Empty,
+/// at the end of `s`, if it has none.
+pub fn trimToWords(s: []const u8) []const u8 {
+    var start: usize = 0;
+    while (start < s.len) {
+        const c = charAt(s, start);
+        if (c.word) break;
+        start += c.len;
+    }
+    var end = s.len;
+    while (end > start) {
+        const c = charBefore(s, end);
+        if (c.word) break;
+        end -= c.len;
+    }
+    return s[start..end];
+}
+
+/// Whether `str` starts and ends with a word character, as a string about to be embedded
+/// should.
+fn startsAndEndsInWord(str: []const u8) bool {
+    return wordCharAt(str, 0) and wordCharBefore(str, str.len);
+}
+
 pub const Chunk = struct {
     contents: []const u8,
     start_i: u32,
@@ -1372,28 +1437,10 @@ pub const Chunk = struct {
     pub const Type = enum { string, url };
 
     pub fn strip(self: *Chunk) void {
-        for (self.contents, 0..) |c, i| {
-            if (isAlphanumeric(c)) {
-                self.contents = self.contents[i..];
-                break;
-            }
-            self.start_i += 1;
-        }
-        for (1..self.contents.len + 1) |neg_i| {
-            const i = self.contents.len - neg_i;
-            const c = self.contents[i];
-            if (isAlphanumeric(c)) {
-                self.contents = self.contents[0 .. i + 1];
-                break;
-            }
-            if (self.end_i <= self.start_i) {
-                self.contents = self.contents[0..0];
-                return;
-            }
-            self.end_i -= 1;
-        }
-        assert(self.end_i >= self.start_i);
-        assert(self.end_i - self.start_i == self.contents.len);
+        const words = trimToWords(self.contents);
+        self.start_i += @intCast(words.ptr - self.contents.ptr);
+        self.end_i = self.start_i + @as(u32, @intCast(words.len));
+        self.contents = words;
     }
 };
 
@@ -1412,8 +1459,9 @@ pub fn Spliterator(comptime delimiters: []const u8) type {
             return false;
         }
 
+        /// Whitespace or any other control byte.
         fn isUrlEnd(c: u8) bool {
-            return c == ' ' or c == '\n' or c == '\t';
+            return c <= ' ' or c == 0x7f;
         }
 
         fn findUrlPrefix(buf: []const u8) ?usize {
@@ -1445,18 +1493,7 @@ pub fn Spliterator(comptime delimiters: []const u8) type {
 
                 if (findUrlPrefix(self.buffer[self.index..])) |_| {
                     // There is a URL ahead
-                    const start = self.index;
-                    while (self.index < self.buffer.len and !isUrlEnd(self.buffer[self.index])) {
-                        self.index += 1;
-                    }
-                    const contents = self.buffer[start..self.index];
-                    var out = Chunk{
-                        .contents = contents,
-                        .start_i = @intCast(start),
-                        .end_i = @intCast(self.index),
-                        .type = .url,
-                    };
-                    out.strip();
+                    const out = self.takeUrl(self.index);
                     if (out.contents.len == 0) continue; // The contents are junk, skip this block
                     return out;
                 }
@@ -1464,7 +1501,12 @@ pub fn Spliterator(comptime delimiters: []const u8) type {
                 // We are at the first non-garbage character
                 const start = self.index;
                 while (self.index < self.buffer.len and !isDelimiter(self.buffer[self.index])) {
-                    if (findUrlPrefix(self.buffer[self.index..])) |_| break;
+                    if (findUrlPrefix(self.buffer[self.index..])) |_| {
+                        // A URL glued to the end of a word, as in "foohttps://", takes the word
+                        // with it rather than cutting it in two.
+                        if (wordCharBefore(self.buffer, self.index)) return self.takeUrl(start);
+                        break;
+                    }
                     self.index += 1;
                 }
 
@@ -1489,6 +1531,21 @@ pub fn Spliterator(comptime delimiters: []const u8) type {
             }
         }
 
+        /// The URL starting at `start`, which runs to the next whitespace whatever it holds.
+        fn takeUrl(self: *Self, start: usize) Chunk {
+            while (self.index < self.buffer.len and !isUrlEnd(self.buffer[self.index])) {
+                self.index += 1;
+            }
+            var out = Chunk{
+                .contents = self.buffer[start..self.index],
+                .start_i = @intCast(start),
+                .end_i = @intCast(self.index),
+                .type = .url,
+            };
+            out.strip();
+            return out;
+        }
+
         pub fn collectAll(self: *Self, allocator: Allocator) ![]Chunk {
             var list: std.ArrayList(Chunk) = .empty;
             errdefer list.deinit(allocator);
@@ -1500,7 +1557,14 @@ pub fn Spliterator(comptime delimiters: []const u8) type {
     };
 }
 
-const WORD_SPLIT_DELIMITERS = ".!?\n, ();\":";
+/// Every ASCII control byte, newline and tab among them. None is part of a word.
+const ASCII_CONTROL = blk: {
+    var out: [33]u8 = undefined;
+    for (0..32) |c| out[c] = c;
+    out[32] = 0x7f;
+    break :blk out;
+};
+const WORD_SPLIT_DELIMITERS = ".!?, ();\":" ++ ASCII_CONTROL;
 pub const WordSpliterator = Spliterator(WORD_SPLIT_DELIMITERS);
 const SENTENCE_SPLIT_DELIMITERS = ".!?\n";
 pub const SentenceSpliterator = Spliterator(SENTENCE_SPLIT_DELIMITERS);
@@ -1543,6 +1607,49 @@ test "spliterator - strip" {
             try expectEqualStrings(expected.contents, case.input[chunk.start_i..chunk.end_i]);
             try expectEqualStrings(expected.contents, chunk.contents);
             try expectEqual(expected.type, chunk.type);
+        }
+    }
+}
+
+test "trimToWords" {
+    const cases = [_][2][]const u8{
+        .{ "hello", "hello" },
+        .{ "  hello?! ", "hello" },
+        .{ "café", "café" },
+        .{ "über", "über" },
+        .{ "“quoted”", "quoted" },
+        .{ "¿qué?", "qué" },
+        .{ "日本。", "日本" },
+        .{ "\xffhello\xc3", "hello" },
+        .{ "a", "a" },
+        .{ "?!", "" },
+        .{ "", "" },
+    };
+    for (cases) |case| try expectEqualStrings(case[1], trimToWords(case[0]));
+}
+
+test "word spliterator - words" {
+    const cases = [_]struct { input: []const u8, expected: []const []const u8 }{
+        .{ .input = "café über naïve", .expected = &.{ "café", "über", "naïve" } },
+        .{ .input = "日本 is “here”", .expected = &.{ "日本", "is", "here" } },
+        .{ .input = "tab\tsplit\r\nlines", .expected = &.{ "tab", "split", "lines" } },
+        .{ .input = "nul\x00and\x1bescape", .expected = &.{ "nul", "and", "escape" } },
+        .{ .input = "hyphen-ated slash/ed", .expected = &.{ "hyphen-ated", "slash/ed" } },
+        // A URL glued to a word takes the word with it.
+        .{ .input = "glued foohttps://example.com url", .expected = &.{ "glued", "foohttps://example.com", "url" } },
+        .{ .input = "<https://example.com>", .expected = &.{"https://example.com"} },
+        // A URL ends at a control byte as at whitespace.
+        .{ .input = "https://example.com\x00after", .expected = &.{ "https://example.com", "after" } },
+    };
+    for (cases) |case| {
+        var splitter = WordSpliterator.init(case.input);
+        const chunks = try splitter.collectAll(std.testing.allocator);
+        defer std.testing.allocator.free(chunks);
+
+        try expectEqual(case.expected.len, chunks.len);
+        for (case.expected, chunks) |expected, chunk| {
+            try expectEqualStrings(expected, chunk.contents);
+            try expectEqualStrings(expected, case.input[chunk.start_i..chunk.end_i]);
         }
     }
 }
