@@ -54,7 +54,10 @@ pub const NoteIdMap = struct {
 
         self.load() catch |err| switch (err) {
             error.FileNotFound => self.manifest_present = false,
-            else => return err,
+            else => {
+                self.deinit();
+                return err;
+            },
         };
 
         return self;
@@ -131,10 +134,11 @@ pub const NoteIdMap = struct {
         _ = self.id_to_path.remove(id);
         self.allocator.free(owned_path);
 
+        // Logged by id: `path` may have been the buffer just freed.
         self.save() catch |e| {
             std.log.err(
-                "Failed to save mapping after removing path '{s}', with error: {}\n",
-                .{ path, e },
+                "Failed to save mapping after removing note {d}, with error: {}\n",
+                .{ id, e },
             );
             return e;
         };
@@ -145,14 +149,27 @@ pub const NoteIdMap = struct {
         defer self.mutex.unlock(self.io);
 
         const id = self.path_to_id.get(old_path) orelse return error.NotFound;
+        if (std.mem.eql(u8, old_path, new_path)) return;
 
-        _ = self.path_to_id.remove(old_path);
+        // Copied, and room made, before anything is touched: `new_path` may point into a
+        // buffer freed below, and a failure past this point would leave the map half-changed.
+        const new_copy = try self.allocator.dupe(u8, new_path);
+        errdefer self.allocator.free(new_copy);
+        try self.path_to_id.ensureUnusedCapacity(1);
 
-        if (self.id_to_path.getPtr(id)) |path_ptr| {
-            self.allocator.free(path_ptr.*);
-            path_ptr.* = try self.allocator.dupe(u8, new_path);
-            try self.path_to_id.put(path_ptr.*, id);
+        // Whatever already had `new_path` is replaced. Its vectors, if any, are the caller's
+        // to delete; this layer has no reach into them.
+        if (self.path_to_id.fetchRemove(new_copy)) |displaced| {
+            const owned = self.id_to_path.fetchRemove(displaced.value).?.value;
+            self.allocator.free(owned);
         }
+
+        const slot = self.id_to_path.getPtr(id).?;
+        // Before the free, since `old_path` may be that very buffer.
+        _ = self.path_to_id.remove(old_path);
+        self.allocator.free(slot.*);
+        slot.* = new_copy;
+        self.path_to_id.putAssumeCapacity(new_copy, id);
 
         try self.save();
     }
@@ -290,7 +307,10 @@ pub const NoteIdMap = struct {
 
             try reader.interface.readSliceAll(path);
 
+            // Into both maps or neither, so whatever `load` gets through before failing is
+            // still something `deinit` frees exactly once.
             try self.path_to_id.put(path, id);
+            errdefer _ = self.path_to_id.remove(path);
             try self.id_to_path.put(id, path);
         }
     }
@@ -765,4 +785,283 @@ test "rerooting an empty map is not an error" {
     defer dropped.deinit(testing_allocator);
     try map.reroot(.{ .deeper = "md-src" }, &dropped);
     try expectEqual(@as(usize, 0), map.count());
+}
+
+/// The invariant every use-after-free here breaks: `path_to_id`'s keys are the very buffers
+/// `id_to_path` owns, one for one. A key pointing anywhere else is either already dangling or
+/// will be once its owner is freed. Freed memory is poisoned in tests, so a key that dangles
+/// already fails the lookup too.
+fn expectConsistent(map: *NoteIdMap) !void {
+    try expectEqual(map.id_to_path.count(), map.path_to_id.count());
+    var it = map.id_to_path.iterator();
+    while (it.next()) |owned| {
+        const borrowed = map.path_to_id.getEntry(owned.value_ptr.*);
+        try expect(borrowed != null);
+        try expectEqual(owned.key_ptr.*, borrowed.?.value_ptr.*);
+        try expectEqual(owned.value_ptr.*.ptr, borrowed.?.key_ptr.*.ptr);
+    }
+}
+
+test "renamePath onto an existing path leaves no key without an owner" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
+    defer map.deinit();
+
+    const a = try map.createId("a.md");
+    const b = try map.createId("b.md");
+
+    // Refusing and replacing are both fine; keeping `b.md`'s buffer as the key for `a` is not.
+    if (map.renamePath("a.md", "b.md")) |_| {
+        try expectConsistent(&map);
+        try expectEqual(a, map.getId("b.md").?);
+        try expectEqual(@as(?[]const u8, null), map.getPath(b));
+        try expectEqual(@as(usize, 1), map.count());
+
+        try map.removePath("b.md");
+        try expectConsistent(&map);
+        try expectEqual(@as(usize, 0), map.count());
+    } else |_| {
+        try expectConsistent(&map);
+        try expectEqual(a, map.getId("a.md").?);
+        try expectEqual(b, map.getId("b.md").?);
+    }
+}
+
+test "renamePath onto a path borrowed from another entry" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
+    defer map.deinit();
+
+    const a = try map.createId("a.md");
+    const b = try map.createId("b.md");
+
+    // A rename that replaces `b` frees the very buffer `new_path` points into.
+    if (map.renamePath("a.md", map.getPath(b).?)) |_| {
+        try expectConsistent(&map);
+        try expectEqual(a, map.getId("b.md").?);
+        try expectEqualStrings("b.md", map.getPath(a).?);
+    } else |_| {
+        try expectConsistent(&map);
+        try expectEqualStrings("a.md", map.getPath(a).?);
+        try expectEqualStrings("b.md", map.getPath(b).?);
+    }
+}
+
+test "renamePath to its own path, borrowed from the map" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
+    defer map.deinit();
+
+    const id = try map.createId("note.md");
+    const other = try map.createId("other.md");
+
+    // Both arguments alias the buffer the rename frees before copying `new_path`.
+    try map.renamePath(map.getPath(id).?, map.getPath(id).?);
+    // Only `new_path` aliasing it.
+    try map.renamePath("other.md", map.getPath(other).?);
+
+    try expectEqual(@as(?NoteID, id), map.getId("note.md"));
+    try expectEqualStrings("note.md", map.getPath(id).?);
+    try expectEqual(@as(?NoteID, other), map.getId("other.md"));
+    try expectConsistent(&map);
+    try expectEqualStrings("other.md", map.getPath(other).?);
+}
+
+test "renamePath from a path borrowed from the map" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
+    defer map.deinit();
+
+    const id = try map.createId("note.md");
+    try map.renamePath(map.getPath(id).?, "new.md");
+
+    try expectConsistent(&map);
+    try expectEqual(@as(?NoteID, null), map.getId("note.md"));
+    try expectEqual(id, map.getId("new.md").?);
+    try expectEqualStrings("new.md", map.getPath(id).?);
+}
+
+test "removePath with a path borrowed from the map" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
+    defer map.deinit();
+
+    const id = try map.createId("note.md");
+    const kept = try map.createId("kept.md");
+    try map.removePath(map.getPath(id).?);
+
+    try expectConsistent(&map);
+    try expectEqual(@as(?NoteID, null), map.getId("note.md"));
+    try expectEqual(@as(?[]const u8, null), map.getPath(id));
+    try expectEqualStrings("kept.md", map.getPath(kept).?);
+}
+
+test "createId and getOrCreateId with a path borrowed from the map" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
+    defer map.deinit();
+
+    const id = try map.createId("note.md");
+    try expectEqual(id, try map.createId(map.getPath(id).?));
+    try expectEqual(id, try map.getOrCreateId(map.getPath(id).?));
+
+    try expectConsistent(&map);
+    try expectEqual(@as(usize, 1), map.count());
+}
+
+test "pruneOrphanedPaths leaves no dangling keys" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
+    defer map.deinit();
+
+    // Interleaved, so removals free buffers on both sides of the ones that stay.
+    for (0..10) |i| {
+        var buf: [32]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, "n{d}.md", .{i});
+        _ = try map.createId(path);
+        if (i % 2 == 0) (try tmpD.dir.createFile(std.testing.io, path, .{})).close(std.testing.io);
+    }
+
+    try map.pruneOrphanedPaths(tmpD.dir);
+
+    try expectConsistent(&map);
+    try expectEqual(@as(usize, 5), map.count());
+    for (0..10) |i| {
+        var buf: [32]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, "n{d}.md", .{i});
+        const id = map.getId(path);
+        try expectEqual(i % 2 == 0, id != null);
+        if (id) |found| try expectEqualStrings(path, map.getPath(found).?);
+    }
+}
+
+test "reroot leaves no dangling keys" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
+    defer map.deinit();
+
+    const inside = try map.createId("md-src/one.md");
+    _ = try map.createId("elsewhere/two.md");
+
+    var dropped: std.ArrayList(NoteID) = .empty;
+    defer dropped.deinit(testing_allocator);
+
+    try map.reroot(.{ .shallower = "md-src" }, &dropped);
+    try expectConsistent(&map);
+    try expectEqualStrings("one.md", map.getPath(inside).?);
+
+    try map.reroot(.{ .deeper = "md-src" }, &dropped);
+    try expectConsistent(&map);
+    try expectEqualStrings("md-src/one.md", map.getPath(inside).?);
+
+    // Mutating after a reroot touches keys the reroot installed.
+    try map.renamePath("md-src/one.md", "three.md");
+    try map.removePath("three.md");
+    try expectConsistent(&map);
+    try expectEqual(@as(usize, 0), map.count());
+}
+
+/// Runs `op` on a small populated map once for every allocation it makes, failing that one.
+/// Whatever the op got done before failing, it has to leave a map that is consistent and that
+/// `deinit` frees exactly once -- the testing allocator catches double frees and leaks.
+fn expectSurvivesEveryAllocationFailure(comptime op: fn (*NoteIdMap) anyerror!void) !void {
+    try std.testing.checkAllAllocationFailures(testing_allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var tmpD = std.testing.tmpDir(.{ .iterate = true });
+            defer tmpD.cleanup();
+
+            var map = try NoteIdMap.init(allocator, std.testing.io, tmpD.dir);
+            defer map.deinit();
+            _ = try map.createId("a.md");
+            _ = try map.createId("dir/b.md");
+
+            const result = op(&map);
+            try expectConsistent(&map);
+            return result;
+        }
+    }.run, .{});
+}
+
+test "createId survives every allocation failure" {
+    try expectSurvivesEveryAllocationFailure(struct {
+        fn op(map: *NoteIdMap) anyerror!void {
+            _ = try map.createId("c.md");
+        }
+    }.op);
+}
+
+test "renamePath survives every allocation failure" {
+    try expectSurvivesEveryAllocationFailure(struct {
+        fn op(map: *NoteIdMap) anyerror!void {
+            try map.renamePath("a.md", "renamed.md");
+        }
+    }.op);
+}
+
+test "removePath survives every allocation failure" {
+    try expectSurvivesEveryAllocationFailure(struct {
+        fn op(map: *NoteIdMap) anyerror!void {
+            try map.removePath("a.md");
+        }
+    }.op);
+}
+
+test "pruneOrphanedPaths survives every allocation failure" {
+    try expectSurvivesEveryAllocationFailure(struct {
+        fn op(map: *NoteIdMap) anyerror!void {
+            // Neither file exists, so both entries go.
+            try map.pruneOrphanedPaths(map.basedir);
+        }
+    }.op);
+}
+
+test "reroot survives every allocation failure" {
+    try expectSurvivesEveryAllocationFailure(struct {
+        fn op(map: *NoteIdMap) anyerror!void {
+            var dropped: std.ArrayList(NoteID) = .empty;
+            defer dropped.deinit(map.allocator);
+            try map.reroot(.{ .deeper = "md-src" }, &dropped);
+            try map.reroot(.{ .shallower = "md-src/dir" }, &dropped);
+        }
+    }.op);
+}
+
+test "init from a manifest survives every allocation failure" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+
+    {
+        var map = try NoteIdMap.init(testing_allocator, std.testing.io, tmpD.dir);
+        defer map.deinit();
+        for (0..10) |i| {
+            var buf: [32]u8 = undefined;
+            _ = try map.createId(try std.fmt.bufPrint(&buf, "n{d}.md", .{i}));
+        }
+    }
+
+    // `load` fills both maps entry by entry, so a failure partway has to unwind what it put.
+    try std.testing.checkAllAllocationFailures(testing_allocator, struct {
+        fn run(allocator: std.mem.Allocator, dir: std.Io.Dir) !void {
+            var map = try NoteIdMap.init(allocator, std.testing.io, dir);
+            defer map.deinit();
+            try expectConsistent(&map);
+            try expectEqual(@as(usize, 10), map.count());
+        }
+    }.run, .{tmpD.dir});
 }
