@@ -267,6 +267,24 @@ pub const NoteIdMap = struct {
         try self.save();
     }
 
+    /// Checks that `path_to_id` and `id_to_path` are exact inverses, and that every key in
+    /// `path_to_id` is the very buffer `id_to_path` owns for that id. Two ids naming one path
+    /// fails here, because only one of them can be the path's id; so does a key that borrows
+    /// a buffer belonging to some other id, which dangles once that id is removed.
+    pub fn validate(self: *Self) Error!void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        if (self.id_to_path.count() != self.path_to_id.count()) return Error.CorruptManifest;
+        var it = self.id_to_path.iterator();
+        while (it.next()) |owned| {
+            const borrowed = self.path_to_id.getEntry(owned.value_ptr.*) orelse
+                return Error.CorruptManifest;
+            if (borrowed.value_ptr.* != owned.key_ptr.*) return Error.CorruptManifest;
+            if (borrowed.key_ptr.*.ptr != owned.value_ptr.*.ptr) return Error.CorruptManifest;
+        }
+    }
+
     pub fn count(self: *Self) usize {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -792,14 +810,7 @@ test "rerooting an empty map is not an error" {
 /// will be once its owner is freed. Freed memory is poisoned in tests, so a key that dangles
 /// already fails the lookup too.
 fn expectConsistent(map: *NoteIdMap) !void {
-    try expectEqual(map.id_to_path.count(), map.path_to_id.count());
-    var it = map.id_to_path.iterator();
-    while (it.next()) |owned| {
-        const borrowed = map.path_to_id.getEntry(owned.value_ptr.*);
-        try expect(borrowed != null);
-        try expectEqual(owned.key_ptr.*, borrowed.?.value_ptr.*);
-        try expectEqual(owned.value_ptr.*.ptr, borrowed.?.key_ptr.*.ptr);
-    }
+    try map.validate();
 }
 
 test "renamePath onto an existing path leaves no key without an owner" {

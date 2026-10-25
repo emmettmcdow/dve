@@ -860,6 +860,10 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             // store loses results with no error anywhere.
             if (self.codes.len() != self.vec_storage.len()) return Error.IndexOutOfSync;
 
+            // Before the census, which trusts the manifest's own two halves to agree: two ids
+            // naming one path give every id a name and every name rows, so it would pass.
+            try self.note_id_map.validate();
+
             // The other binding: a row is visible only if the manifest names its document,
             // so disagreement between the two is lost data in one direction and unreachable
             // data in the other. `reconcile` fixes this at open; reaching it here means
@@ -3073,6 +3077,29 @@ test "tear: validate reports a next_id that trails the store" {
     // rather than missing ones. It has its own check for exactly that reason.
     db.note_id_map.next_id = 1;
     try expectError(Error.ManifestOutOfSync, db.validate());
+}
+
+test "tear: validate reports two ids mapped to the same path" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+
+    try db.embedText("a.md", "bees communicate by dancing");
+    try db.embedText("b.md", "the moon has no atmosphere");
+    try db.validate();
+
+    // The state renaming onto an existing path used to leave: `a`'s id now names `b.md`,
+    // and `b`'s id was never evicted. Every id still has a name and every name has rows,
+    // so the census is satisfied, but `b.md` is two notes at once.
+    const map = db.note_id_map;
+    const a = map.getId("a.md").?;
+    const old = map.id_to_path.get(a).?;
+    _ = map.path_to_id.remove(old);
+    try map.id_to_path.put(a, try testing_allocator.dupe(u8, "b.md"));
+    testing_allocator.free(old);
+
+    try expectError(note_id_map_mod.Error.CorruptManifest, db.validate());
 }
 
 test "a document with nothing embeddable gets no path" {
