@@ -2254,12 +2254,17 @@ fn runPair(comptime a_op: ConcurrentOp, comptime b_op: ConcurrentOp, notes: std.
     db.shutdown();
 
     const overlap = a.overlapped + b.overlapped;
-    std.debug.print("ops {d}/{d}, useful {d}/{d}, overlapped {d}\n", .{
+    const validated = db.validate();
+    const failed = a.err != null or b.err != null or (if (validated) |_| false else |_| true) or
+        a.useful < pair_min_useful or b.useful < pair_min_useful or overlap < pair_min_overlap;
+    // With -Ddebug-output the caller has already printed this pair's name.
+    if (!config.debug and failed) std.debug.print("TSan pair {t} x {t}: ", .{ a_op, b_op });
+    if (config.debug or failed) std.debug.print("ops {d}/{d}, useful {d}/{d}, overlapped {d}\n", .{
         a.ops.raw, b.ops.raw, a.useful, b.useful, overlap,
     });
     if (a.err) |e| return e;
     if (b.err) |e| return e;
-    try db.validate();
+    try validated;
     try expect(a.useful >= pair_min_useful);
     try expect(b.useful >= pair_min_useful);
     try expect(overlap >= pair_min_overlap);
@@ -2303,8 +2308,11 @@ test "TSan every pair of concurrent ops" {
     }
 
     inline for (concurrent_op_pairs, 0..) |pair, n| {
-        // Before the run, so a TSan report printed during it lands under its pair's name.
-        std.debug.print("TSan pair {d}/{d} {t} x {t}: ", .{
+        // Before the run, so a TSan report printed during it lands under its pair's name. Only
+        // with -Ddebug-output: `zig build` reports any stderr from a passing test as though
+        // the test had failed. Without it, a TSan report still names the pair in its stacks,
+        // through the `PairHammer(.op)` frames.
+        if (config.debug) std.debug.print("TSan pair {d}/{d} {t} x {t}: ", .{
             n + 1, concurrent_op_pairs.len, pair[0], pair[1],
         });
         try runPair(pair[0], pair[1], notesD.dir);
