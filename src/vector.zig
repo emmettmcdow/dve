@@ -904,12 +904,27 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
         }
 
         /// For entries associated with a given path, associate them with a different path.
+        /// Errors if `old_path` is not associated with any note.
         pub fn renamePath(self: *Self, old_path: []const u8, new_path: []const u8) !void {
             if (old_path.len == 0 or new_path.len == 0) return Error.InvalidPath;
             // The map's own lock is not enough: a rename frees the old path, and a search
             // holding `store_mutex` is still reading the paths it got from the map.
             self.store_mutex.lockUncancelable(self.io);
             defer self.store_mutex.unlock(self.io);
+
+            if (self.note_id_map.getId(old_path) == null) return error.NotFound;
+            // After the lookup, so a missing path is `NotFound` even when renamed onto itself.
+            if (std.mem.eql(u8, old_path, new_path)) return;
+
+            // Remove the vectors for the destination, if they exist.
+            if (self.note_id_map.getId(new_path)) |new_id| {
+                // Collected before the removal, because afterwards there is nothing to look up.
+                const rows = try self.vec_storage.vecsForDoc(self.allocator, new_id);
+                defer self.allocator.free(rows);
+                try self.vec_storage.rmByDocId(new_id);
+                for (rows) |row| self.codes.rm(VecStorage.slotOf(row.vec_id));
+                try self.note_id_map.removePath(new_path);
+            }
             try self.note_id_map.renamePath(old_path, new_path);
         }
 
@@ -3165,4 +3180,60 @@ test "search counts only the results it wrote" {
 
     var buf: [4]SearchResult = undefined;
     try expectEqual(0, try db.search("hello", &buf));
+}
+
+test "rename onto existing path" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+    const b_content = "bicycle chains need oil";
+    const a_content = "the lighthouse keeper polished the lens";
+    try db.embedText("a.md", a_content);
+    try db.embedText("b.md", b_content);
+    const old_a_id = db.idOf("a.md").?;
+    try db.renamePath("a.md", "b.md");
+
+    var held: [4]SearchResult = undefined;
+    try expectEqual(1, try db.uniqueSearch(a_content, &held));
+    try expectEqual(0, try db.uniqueSearch(b_content, &held));
+
+    try expect(held[0].id == old_a_id);
+    var buf: [16]u8 = undefined;
+    try expectEqualSlices(u8, "b.md", (try db.pathOfResult(held[0], &buf)).?);
+
+    try db.removePath("a.md");
+    try db.removePath("b.md");
+
+    try expectEqual(0, try db.uniqueSearch(a_content, &held));
+    try expectEqual(0, try db.uniqueSearch(b_content, &held));
+
+    try db.validate();
+}
+
+test "rename onto itself" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+
+    const a_content = "the lighthouse keeper polished the lens";
+    try db.embedText("a.md", a_content);
+    try db.renamePath("a.md", "a.md");
+    var held: [4]SearchResult = undefined;
+    try expectEqual(1, try db.uniqueSearch(a_content, &held));
+}
+
+test "rename source not found" {
+    var tmpD = std.testing.tmpDir(.{ .iterate = true });
+    defer tmpD.cleanup();
+    var db = try TestVecDB.init(testing_allocator, std.testing.io, tmpD.dir, .{});
+    defer db.deinit();
+
+    const a_content = "the lighthouse keeper polished the lens";
+    try db.embedText("a.md", a_content);
+    try expectError(error.NotFound, db.renamePath("b.md", "a.md"));
+    try expectError(error.NotFound, db.renamePath("b.md", "b.md"));
+    var held: [4]SearchResult = undefined;
+    try expectEqual(1, try db.uniqueSearch(a_content, &held));
 }
