@@ -196,6 +196,20 @@ pub fn build(b: *std.Build) !void {
         test_step.dependOn(&runTest(b, t, use_lldb).step);
     }
 
+    // src/log.zig
+    {
+        const t = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/log.zig"),
+                .target = target,
+                .optimize = optimize,
+                .sanitize_thread = tsan,
+            }),
+            .filters = if (test_filter != null) filters else &.{"log."},
+        });
+        test_step.dependOn(&runTest(b, t, use_lldb).step);
+    }
+
     // src/pfile.zig
     {
         const t = b.addTest(.{

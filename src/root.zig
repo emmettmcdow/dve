@@ -11,3 +11,5 @@ pub const embed = embed_mod;
 pub const llama = @import("llama.zig");
 /// How a workspace root moved, for `VectorEngine.reroot`.
 pub const Reroot = @import("note_id_map.zig").Reroot;
+/// Where dve's log lines go: `std.log` by default, or a function set with `log.setLogFn`.
+pub const log = @import("log.zig");

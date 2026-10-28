@@ -290,11 +290,11 @@ pub const MpnetEmbedder = struct {
         const tok = try acquireTokenizer(io, tokenizer_path);
 
         const NSString = objc.getClass("NSString") orelse {
-            std.log.err("Failed to get NSString class", .{});
+            log.err("Failed to get NSString class", .{});
             return error.ObjCClassNotFound;
         };
         const NSURL = objc.getClass("NSURL") orelse {
-            std.log.err("Failed to get NSURL class", .{});
+            log.err("Failed to get NSURL class", .{});
             return error.ObjCClassNotFound;
         };
         const fromUTF8 = objc.Sel.registerName("stringWithUTF8String:");
@@ -317,13 +317,13 @@ pub const MpnetEmbedder = struct {
 
         const path_ns = NSString.msgSend(Object, fromUTF8, .{full_path.ptr});
         if (path_ns.value == 0) {
-            std.log.err("Failed to create NSString from path", .{});
+            log.err("Failed to create NSString from path", .{});
             return error.NSStringCreateFailed;
         }
 
         const model_url = NSURL.msgSend(Object, fileURLWithPath, .{path_ns});
         if (model_url.value == 0) {
-            std.log.err("Failed to create NSURL from path", .{});
+            log.err("Failed to create NSURL from path", .{});
             return error.NSURLCreateFailed;
         }
 
@@ -342,7 +342,7 @@ pub const MpnetEmbedder = struct {
         // CoreML will not tell us which engine it actually chose, so the next best thing is
         // to say which ones it was allowed to choose from. Anything other than `all` means
         // somebody deliberately narrowed it, and `cpu_only` means degraded by construction.
-        std.log.info("mpnet: compute units {t}, model {s}", .{ opts.compute_units, resolved });
+        log.info("mpnet: compute units {t}, model {s}", .{ opts.compute_units, resolved });
 
         return .{
             .model = model,
@@ -383,13 +383,13 @@ pub const MpnetEmbedder = struct {
                 logModelNotFound("mpnet tokenizer", path, DOWNLOAD_CMD, "tokenizer_path");
                 return error.ModelNotFound;
             }
-            std.log.err("Failed to read tokenizer.json: {}", .{err});
+            log.err("Failed to read tokenizer.json: {}", .{err});
             return error.TokenizerLoadFailed;
         };
 
         const tok = allocator.create(WordPieceTokenizer) catch return error.TokenizerLoadFailed;
         tok.init(allocator, json) catch |err| {
-            std.log.err("Failed to parse tokenizer.json: {}", .{err});
+            log.err("Failed to parse tokenizer.json: {}", .{err});
             return error.TokenizerParseFailed;
         };
 
@@ -445,11 +445,11 @@ pub const MpnetEmbedder = struct {
                 const err = Object{ .value = @intFromPtr(err_ptr) };
                 const desc_sel = objc.Sel.registerName("localizedDescription");
                 const desc = err.msgSend([*:0]const u8, desc_sel, .{});
-                std.log.err("Failed to compile CoreML model: {s}", .{desc});
+                log.err("Failed to compile CoreML model: {s}", .{desc});
                 return error.ModelCompileFailed;
             }
             if (compiled_url.value == 0) {
-                std.log.err("Compiled URL is null", .{});
+                log.err("Compiled URL is null", .{});
                 return error.ModelCompileFailed;
             }
             break :compiled compiled_url;
@@ -496,11 +496,11 @@ pub const MpnetEmbedder = struct {
             const err = Object{ .value = @intFromPtr(err_ptr) };
             const desc_sel = objc.Sel.registerName("localizedDescription");
             const desc = err.msgSend([*:0]const u8, desc_sel, .{});
-            std.log.err("Failed to load CoreML model: {s}", .{desc});
+            log.err("Failed to load CoreML model: {s}", .{desc});
             return error.ModelLoadFailed;
         }
         if (model.value == 0) {
-            std.log.err("Model is null", .{});
+            log.err("Model is null", .{});
             return error.ModelLoadFailed;
         }
 
@@ -564,11 +564,11 @@ pub const MpnetEmbedder = struct {
     ) !?EmbeddingModelOutput {
         const self: *MpnetEmbedder = @ptrCast(@alignCast(ptr));
         if (str.len == 0) {
-            std.log.info("Skipping embed of zero-length string", .{});
+            log.info("Skipping embed of zero-length string", .{});
             return null;
         }
         if (!startsAndEndsInWord(str)) {
-            std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
+            log.debug("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
         }
 
         const token_ids = try self.tokenizer.tokenize(allocator, str);
@@ -623,11 +623,11 @@ pub const MpnetEmbedder = struct {
         var n: usize = 0;
         for (strs, 0..) |str, i| {
             if (str.len == 0) {
-                std.log.info("Skipping embed of zero-length string", .{});
+                log.info("Skipping embed of zero-length string", .{});
                 continue;
             }
             if (!startsAndEndsInWord(str)) {
-                std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
+                log.debug("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
             }
             const token_ids = try self.tokenizer.tokenize(allocator, str);
             tokens[n] = token_ids[0..@min(token_ids.len, SINGLE.seq)];
@@ -714,7 +714,7 @@ pub const MpnetEmbedder = struct {
             ) catch |err| {
                 for (models[0..i]) |m| m.release();
                 if (err != error.ModelFunctionNotFound) return err;
-                std.log.info(
+                log.info(
                     "mpnet: model has no '{s}' function, embedding one string at a time",
                     .{shape.function.?},
                 );
@@ -860,11 +860,11 @@ pub const MpnetEmbedder = struct {
             const desc_ns = err_obj.msgSend(Object, desc_sel, .{});
             const utf8_sel = objc.Sel.registerName("UTF8String");
             const desc = desc_ns.msgSend([*:0]const u8, utf8_sel, .{});
-            std.log.err("Prediction failed: {s}", .{desc});
+            log.err("Prediction failed: {s}", .{desc});
             return error.PredictionFailed;
         }
         if (prediction.value == 0) {
-            std.log.err("Prediction returned null (no error reported)", .{});
+            log.err("Prediction returned null (no error reported)", .{});
             return error.PredictionFailed;
         }
         // End of the prediction block
@@ -872,13 +872,13 @@ pub const MpnetEmbedder = struct {
         const output_key = NSString.msgSend(Object, fromUTF8, .{"last_hidden_state"});
         const output_fv = prediction.msgSend(Object, featureValueForName, .{output_key});
         if (output_fv.value == 0) {
-            std.log.err("Output feature value is null", .{});
+            log.err("Output feature value is null", .{});
             return error.OutputNotFound;
         }
 
         const output_array = output_fv.msgSend(Object, multiArrayValue_sel, .{});
         if (output_array.value == 0) {
-            std.log.err("Output multi array is null", .{});
+            log.err("Output multi array is null", .{});
             return error.OutputNotFound;
         }
 
@@ -893,7 +893,7 @@ pub const MpnetEmbedder = struct {
                 .msgSend(Object, objc.Sel.registerName("objectAtIndex:"), .{axis})
                 .msgSend(i64, objc.Sel.registerName("integerValue"), .{});
             if (stride != expected) {
-                std.log.err(
+                log.err(
                     "Unexpected CoreML output stride {d} on axis {d}, wanted {d}\n",
                     .{ stride, axis, expected },
                 );
@@ -933,7 +933,7 @@ pub const MpnetEmbedder = struct {
                     }
                 },
                 else => {
-                    std.log.err("Unsupported CoreML output dataType {d}", .{data_type});
+                    log.err("Unsupported CoreML output dataType {d}", .{data_type});
                     return error.UnsupportedOutputDataType;
                 },
             }
@@ -956,7 +956,7 @@ fn logModelNotFound(
     comptime download_cmd: []const u8,
     comptime option: []const u8,
 ) void {
-    std.log.err(
+    log.err(
         \\{s} not found at '{s}'.
         \\Download it with:
         \\
@@ -1024,7 +1024,7 @@ fn preferPrecompiled(allocator: Allocator, io: std.Io, path: [:0]const u8) ![:0]
 fn getExeRelativePath(allocator: Allocator, io: std.Io, relative_path: []const u8) ![:0]const u8 {
     var exe_path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const exe_path_len = std.process.executableDirPath(io, &exe_path_buf) catch |err| {
-        std.log.err("Failed to get executable path: {}", .{err});
+        log.err("Failed to get executable path: {}", .{err});
         return error.ExePathFailed;
     };
     const exe_path = exe_path_buf[0..exe_path_len];
@@ -1083,7 +1083,7 @@ pub const NLEmbedder = struct {
 
         const embedder_obj = NLEmbedding.msgSend(Object, sentenceEmbeddingForLang, .{ns_lang});
         if (embedder_obj.value == 0) {
-            std.log.err("NLEmbedding.sentenceEmbeddingForLanguage returned nil - ensure this is called from main thread", .{});
+            log.err("NLEmbedding.sentenceEmbeddingForLanguage returned nil - ensure this is called from main thread", .{});
             return error.EmbedderInitFailed;
         }
         assert(embedder_obj.getProperty(c_int, "dimension") == VEC_SZ);
@@ -1144,11 +1144,11 @@ pub const NLEmbedder = struct {
         const getVectorForString = objc.Sel.registerName("getVector:forString:");
 
         if (str.len == 0 or str[0] == 0) {
-            std.log.info("Skipping embed of zero-length string", .{});
+            log.info("Skipping embed of zero-length string", .{});
             return null;
         }
         if (!startsAndEndsInWord(str)) {
-            std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
+            log.debug("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
         }
 
         const c_str = try std.fmt.allocPrintSentinel(allocator, "{s}", .{str}, 0);
@@ -1165,7 +1165,7 @@ pub const NLEmbedder = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (!self.embedder_obj.msgSend(bool, getVectorForString, .{ vec_buf, objc_str })) {
-            std.log.warn("Failed to embed '{s}'", .{str[0..@min(str.len, 10)]});
+            log.warn("Failed to embed a {d}-byte string", .{str.len});
             return null;
         }
 
@@ -1271,11 +1271,11 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
     fn embed(ptr: *anyopaque, allocator: Allocator, str: []const u8) !?EmbeddingModelOutput {
         _ = ptr;
         if (str.len == 0) {
-            std.log.info("Skipping embed of zero-length string", .{});
+            log.info("Skipping embed of zero-length string", .{});
             return null;
         }
         if (!startsAndEndsInWord(str)) {
-            std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
+            log.debug("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
         }
 
         // The bridge takes a C string; anything past MAX_CTX is truncated there.
@@ -1330,11 +1330,11 @@ pub const LlamaNomicEmbedTextV15F32 = struct {
         var n: usize = 0;
         for (strs, 0..) |str, i| {
             if (str.len == 0) {
-                std.log.info("Skipping embed of zero-length string", .{});
+                log.info("Skipping embed of zero-length string", .{});
                 continue;
             }
             if (!startsAndEndsInWord(str)) {
-                std.log.warn("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
+                log.debug("Embedding str with punctuation is likely unexpected -> '{s}'", .{str});
             }
             // The bridge takes a C string; anything past MAX_CTX is truncated there.
             c_strs[n] = (try allocator.dupeSentinel(u8, str, 0)).ptr;
@@ -2025,12 +2025,9 @@ test "embed - output is L2-normalized (nlembed)" {
     }
 }
 
-// This is technically valid but likely unexpected. Throw a warning instead of failing.
+// This is technically valid but likely unexpected. Logged at debug instead of failing: the
+// line carries the text, which only a developer asking for debug output should see.
 test "embed with punctuation" {
-    // The warning is the behavior under test rather than news.
-    std.testing.log_level = .err;
-    defer std.testing.log_level = .warn;
-
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -2270,6 +2267,7 @@ test "embedBatch - LlamaNomicEmbedTextV15F32 splits on the token budget" {
 }
 
 const std = @import("std");
+const log = @import("log.zig");
 const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const expectEqual = std.testing.expectEqual;

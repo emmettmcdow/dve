@@ -136,7 +136,7 @@ pub const NoteIdMap = struct {
 
         // Logged by id: `path` may have been the buffer just freed.
         self.save() catch |e| {
-            std.log.err(
+            log.err(
                 "Failed to save mapping after removing note {d}, with error: {}\n",
                 .{ id, e },
             );
@@ -699,6 +699,7 @@ test "pruneOrphanedPaths removes missing files" {
 
 const db_suffix = @import("vec_util.zig").db_suffix;
 const std = @import("std");
+const log = @import("log.zig");
 const pfile = @import("pfile.zig");
 
 fn readIntLE(reader: *std.Io.File.Reader, comptime T: type) !T {

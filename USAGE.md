@@ -170,3 +170,31 @@ curl -LO "$URL"
 The bridge holds one model per process, so a second engine asking for a different GGUF fails with
 `error.ModelAlreadyLoaded`. Set `DVE_LLAMA_VERBOSE` to let llama.cpp's own logging through; it is
 suppressed by default.
+
+## Logging
+dve's log lines go to `std.log` under the `.dve` scope by default, so your program's
+`std_options` controls them like any other library's: `log_level` sets what is compiled in, and
+`log_scope_levels` can quiet dve alone.
+
+To handle them yourself instead, set a function. It applies process-wide and is not
+synchronized against logging, so set it before creating an engine:
+
+```zig
+fn onLog(level: std.log.Level, msg: [:0]const u8, ctx: ?*anyopaque) void {
+    _ = ctx;
+    std.debug.print("dve {t}: {s}\n", .{ level, msg });
+}
+
+dve.log.setLogFn(onLog, null, .debug);
+```
+
+The function runs on whichever thread logged, including the engine's work queue, sometimes
+while the engine holds its locks: it must be thread-safe and must not call back into dve.
+`std_options.log_level` still decides which levels are compiled in; the last argument filters
+below that at runtime.
+
+From C, `dve_set_log_callback` in `dve.h` is the same thing. Without a callback, the C bindings
+write warnings and errors to stderr.
+
+Only debug lines contain search queries or note text. Note paths and the database directory can
+appear at any level.

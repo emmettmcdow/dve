@@ -17,6 +17,7 @@
 
 const builtin = @import("builtin");
 const std = @import("std");
+const log = @import("log.zig");
 
 const is_darwin = builtin.os.tag.isDarwin();
 const is_linux = builtin.os.tag == .linux;
@@ -147,7 +148,7 @@ pub const SyncError = error{
 };
 
 fn unexpected(what: []const u8, e: c_int) error{Unexpected} {
-    std.log.warn("pfile: {s} failed with errno {d}", .{ what, e });
+    log.warn("pfile: {s} failed with errno {d}", .{ what, e });
     return error.Unexpected;
 }
 
@@ -209,7 +210,7 @@ pub const File = struct {
         // Retrying close on EINTR is a portability trap: on Linux the descriptor is already
         // gone, so a retry would close whatever fd got that number next. Report and move on.
         if (c.close(self.fd) != 0) {
-            std.log.warn("pfile: close failed with errno {d}", .{errno()});
+            log.warn("pfile: close failed with errno {d}", .{errno()});
         }
     }
 

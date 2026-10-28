@@ -2,10 +2,7 @@ const std = @import("std");
 const dve = @import("dve");
 const embed = dve.embed;
 
-const LOG_PATH = "/tmp/dve.log";
-var log_fd: ?std.Io.File = null;
-
-/// The `Io` for what this shim does itself: its lock and its log file. Blocking and without a
+/// The `Io` for what this shim does itself, which is its lock. Blocking and without a
 /// thread pool, which is all either needs, and usable before `dve_init` has run.
 const shim_io: std.Io = std.Io.Threaded.global_single_threaded.io();
 
@@ -17,25 +14,49 @@ const shim_io: std.Io = std.Io.Threaded.global_single_threaded.io();
 /// puts back whatever was there before on `deinit`.
 var engine_threaded: std.Io.Threaded = undefined;
 
+/// Where a line goes when no callback is set, and where std's own lines always go: stderr,
+/// warnings and errors only. Every level is compiled in, so a callback can still ask for
+/// debug output at runtime.
 fn logFn(
     comptime message_level: std.log.Level,
-    comptime scope: @TypeOf(.enum_literal),
+    comptime scope: @EnumLiteral(),
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (log_fd == null) {
-        log_fd = std.Io.Dir.createFileAbsolute(shim_io, LOG_PATH, .{}) catch return;
-    }
-    var buf: [1024]u8 = undefined;
-    const prefix = "[" ++ @tagName(message_level) ++ "] (" ++ @tagName(scope) ++ ") ";
-    const msg = std.fmt.bufPrint(&buf, prefix ++ format ++ "\n", args) catch return;
-    log_fd.?.writeStreamingAll(shim_io, msg) catch return;
+    if (@backingInt(message_level) > @backingInt(std.log.Level.warn)) return;
+    std.log.defaultLog(message_level, scope, format, args);
 }
 
 pub const std_options: std.Options = .{
     .logFn = logFn,
     .log_level = .debug,
 };
+
+const CLogFn = *const fn (level: c_int, msg: [*:0]const u8, userdata: ?*anyopaque) callconv(.c) void;
+var c_log_fn: ?CLogFn = null;
+
+/// The `dve.log` sink while a C callback is set. Its context is the caller's userdata.
+fn forwardLog(level: std.log.Level, msg: [:0]const u8, ctx: ?*anyopaque) void {
+    c_log_fn.?(@backingInt(level), msg.ptr, ctx);
+}
+
+/// Not synchronized against logging, as `dve.log.setLogFn` is not, so it refuses to run
+/// while there is an engine that could be logging.
+export fn dve_set_log_callback(f: ?CLogFn, userdata: ?*anyopaque, min_level: c_int) c_int {
+    mutex.lockUncancelable(shim_io);
+    defer mutex.unlock(shim_io);
+
+    if (initialized) return @backingInt(CError.DoubleInit);
+    c_log_fn = f;
+    if (f == null) {
+        dve.log.setLogFn(null, null, .debug);
+        return @backingInt(CError.Success);
+    }
+    const max = @backingInt(std.log.Level.debug);
+    const level: std.log.Level = @enumFromInt(std.math.clamp(min_level, 0, max));
+    dve.log.setLogFn(forwardLog, userdata, level);
+    return @backingInt(CError.Success);
+}
 
 const MpnetEmbedder = embed.MpnetEmbedder;
 const NLEmbedder = embed.NLEmbedder;
@@ -84,7 +105,7 @@ export fn dve_init(
     defer if (!ok) engine_threaded.deinit();
 
     const dir = std.Io.Dir.openDirAbsolute(io, basedir_slice, .{ .iterate = true }) catch |err| {
-        std.log.err("dve_init: failed to open basedir '{s}': {}", .{ basedir_slice, err });
+        dve.log.err("dve_init: failed to open basedir '{s}': {}", .{ basedir_slice, err });
         return @backingInt(CError.GenericFail);
     };
 
@@ -96,13 +117,13 @@ export fn dve_init(
             .model_path = model_slice,
             .tokenizer_path = if (tokenizer_slice.len > 0) tokenizer_slice else null,
         }) catch |err| {
-            std.log.err("dve_init: failed to init VectorEngine: {}", .{err});
+            dve.log.err("dve_init: failed to init VectorEngine: {}", .{err});
             return @backingInt(CError.GenericFail);
         };
         active_model = .mpnet;
     } else {
         apple_db = AppleVDB.init(allocator, io, dir, .{}) catch |err| {
-            std.log.err("dve_init: failed to init VectorEngine: {}", .{err});
+            dve.log.err("dve_init: failed to init VectorEngine: {}", .{err});
             return @backingInt(CError.GenericFail);
         };
         active_model = .apple_nl;
@@ -142,11 +163,11 @@ export fn dve_embed(key: [*:0]const u8, content: [*:0]const u8) c_int {
     const content_s = std.mem.sliceTo(content, 0);
     switch (active_model) {
         .apple_nl => apple_db.?.embedText(key_s, content_s) catch |err| {
-            std.log.err("dve_embed: {}", .{err});
+            dve.log.err("dve_embed: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.embedText(key_s, content_s) catch |err| {
-            std.log.err("dve_embed: {}", .{err});
+            dve.log.err("dve_embed: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
     }
@@ -162,11 +183,11 @@ export fn dve_embed_async(key: [*:0]const u8, content: [*:0]const u8) c_int {
     const content_s = std.mem.sliceTo(content, 0);
     switch (active_model) {
         .apple_nl => apple_db.?.embedTextAsync(key_s, content_s) catch |err| {
-            std.log.err("dve_embed_async: {}", .{err});
+            dve.log.err("dve_embed_async: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.embedTextAsync(key_s, content_s) catch |err| {
-            std.log.err("dve_embed_async: {}", .{err});
+            dve.log.err("dve_embed_async: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
     }
@@ -193,11 +214,11 @@ export fn dve_search(
 
     const written: usize = switch (active_model) {
         .apple_nl => apple_db.?.search(query_s, tmp) catch |err| {
-            std.log.err("dve_search: {}", .{err});
+            dve.log.err("dve_search: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.search(query_s, tmp) catch |err| {
-            std.log.err("dve_search: {}", .{err});
+            dve.log.err("dve_search: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
     };
@@ -265,11 +286,11 @@ export fn dve_remove(key: [*:0]const u8) c_int {
     const key_s = std.mem.sliceTo(key, 0);
     switch (active_model) {
         .apple_nl => apple_db.?.removePath(key_s) catch |err| {
-            std.log.err("dve_remove: {}", .{err});
+            dve.log.err("dve_remove: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.removePath(key_s) catch |err| {
-            std.log.err("dve_remove: {}", .{err});
+            dve.log.err("dve_remove: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
     }
@@ -285,11 +306,11 @@ export fn dve_rename(old_key: [*:0]const u8, new_key: [*:0]const u8) c_int {
     const new_s = std.mem.sliceTo(new_key, 0);
     switch (active_model) {
         .apple_nl => apple_db.?.renamePath(old_s, new_s) catch |err| {
-            std.log.err("dve_rename: {}", .{err});
+            dve.log.err("dve_rename: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
         .mpnet => mpnet_db.?.renamePath(old_s, new_s) catch |err| {
-            std.log.err("dve_rename: {}", .{err});
+            dve.log.err("dve_rename: {}", .{err});
             return @backingInt(CError.GenericFail);
         },
     }

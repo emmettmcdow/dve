@@ -156,10 +156,11 @@ pub fn validateL2(comptime N: usize, comptime T: type, v: @Vector(N, T)) Validat
     // the norm of the vector the caller originally handed to the engine.
     const norm = @sqrt(storedDot(N, T, v, v));
     if (@abs(norm - 1.0) >= l2Tolerance(N, T)) {
-        std.log.warn("norm: {d:.8} (expected ~1.0)", .{norm});
+        log.warn("norm: {d:.8} (expected ~1.0)", .{norm});
         return ValidationError.NotL2;
     }
 }
 
 const config = @import("config");
 const std = @import("std");
+const log = @import("log.zig");

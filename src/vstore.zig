@@ -431,7 +431,7 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
                 h.crc32 == h.checksum();
 
             if (!ok) {
-                std.log.warn(
+                log.warn(
                     "Incompatible database: fmt_v={d} (want {d}), vec_sz={d} (want {d}), stride={d} (want {d})",
                     .{ h.fmt_v, FMT_V, h.vec_sz, vec_sz, h.stride, L.stride },
                 );
@@ -889,7 +889,7 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
             var n: usize = 0;
             while (pq.pop()) |cand| : (n += 1) {
                 if (n >= buf.len) {
-                    std.log.debug("Results capped", .{});
+                    log.debug("Results capped", .{});
                     break;
                 }
                 buf[n] = .{ .row = cand.row, .similarity = cand.sim };
@@ -970,7 +970,7 @@ pub fn VStore(comptime vec_sz: usize, comptime vec_type: type) type {
                     if (m.doc_id == 0) return Error.UninitializedDocID;
                     const vec = vecAt(chunk.bytes, i);
                     if (crcOf(vec, m.*) != m.crc32) {
-                        std.log.warn("vstore: checksum mismatch at slot {d}", .{slot});
+                        log.warn("vstore: checksum mismatch at slot {d}", .{slot});
                         return Error.Corrupt;
                     }
                     try validateL2(vec_sz, vec_type, vec.*);
@@ -2147,6 +2147,7 @@ test "cosine zero-vec" {
 }
 
 const std = @import("std");
+const log = @import("log.zig");
 const assert = std.debug.assert;
 const native_endian = @import("builtin").cpu.arch.endian();
 

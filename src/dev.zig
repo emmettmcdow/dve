@@ -11,6 +11,7 @@ pub const Error = root.Error;
 pub const embed = root.embed;
 pub const llama = root.llama;
 pub const Reroot = root.Reroot;
+pub const log = root.log;
 
 pub const vec_storage = @import("vec_storage.zig");
 pub const vstore = @import("vstore.zig");

@@ -262,7 +262,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             // the next open rather than any correctness. A caller that wants to know calls
             // `saveIndex` itself.
             self.saveIndex() catch |e| {
-                std.log.warn("could not save the code index: {t}", .{e});
+                log.warn("could not save the code index: {t}", .{e});
             };
             self.codes.deinit();
             self.vec_storage.deinit();
@@ -323,7 +323,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             // First, because it is the step that prevents wrong answers. The rest only
             // reclaims space and keeps counts honest.
             if (try map.ensureNextIdAbove(c.max_doc_id)) {
-                std.log.warn(
+                log.warn(
                     "note id counter trailed the store; moved it past doc_id {d}",
                     .{c.max_doc_id},
                 );
@@ -339,7 +339,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             for (c.hollow.items) |path| try map.removePath(path);
 
             if (c.orphans.items.len != 0 or c.hollow.items.len != 0) {
-                std.log.warn(
+                log.warn(
                     "reconciled on open: dropped {d} unnamed vectors and {d} paths with none",
                     .{ c.orphans.items.len, c.hollow.items.len },
                 );
@@ -511,7 +511,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                     };
                     found_n += 1;
                 }
-                std.log.info("Found {d} results searching with `{s}`", .{ found_n, query });
+                log.debug("Found {d} results searching with `{s}`", .{ found_n, query });
                 return found_n;
             }
         }
@@ -552,8 +552,8 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                     };
                     unique_found_n += 1;
                 }
-                std.log.info(
-                    "Condensed {d} duplicate results to {d} duplicate searching with {s}\n",
+                log.debug(
+                    "Condensed {d} duplicate results to {d} duplicate searching with {s}",
                     .{ found_n, unique_found_n, query },
                 );
                 return unique_found_n;
@@ -631,7 +631,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 defer self.allocator.free(job.contents);
                 defer self.allocator.free(job.path);
                 self.embedTextInternal(job.path, job.contents) catch |err| {
-                    std.log.err("embedText error: {}", .{err});
+                    log.err("embedText error: {}", .{err});
                 };
                 n_embedded += 1;
                 if (n_embedded >= unflushed_limit) {
@@ -711,7 +711,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             // invariant holds in both directions.
             if (embedded_sentences.len == 0) {
                 if (self.note_id_map.getId(path) != null) try self.removePath(path);
-                std.log.info("Embedded 0 sentences", .{});
+                log.info("Embedded 0 sentences", .{});
                 return;
             }
 
@@ -733,7 +733,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 // while being unsearchable, so take it back out. An id that was already there
                 // must survive: its older vectors are still in the store and still its own.
                 errdefer if (existing == null) {
-                    self.note_id_map.removePath(path) catch |e| std.log.err(
+                    self.note_id_map.removePath(path) catch |e| log.err(
                         "failed to roll back the path mapping for '{s}' after a failed write: {t}",
                         .{ path, e },
                     );
@@ -741,7 +741,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 try self.replaceVectors(allocator, note_id, embedded_sentences, existing != null);
             }
 
-            std.log.info("Embedded {d} sentences", .{embedded_sentences.len});
+            log.info("Embedded {d} sentences", .{embedded_sentences.len});
         }
 
         // Embed an entire document, a collection of sentences. And associate it with a key/path.
@@ -885,7 +885,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
             if (!c.agrees()) {
                 // Detail at info, not err: the return value is the signal, and a caller that
                 // probes with `validate` in a test should not have to tolerate a log line.
-                std.log.info(
+                log.info(
                     "manifest and store disagree: {d} unnamed vectors, {d} paths with none",
                     .{ c.orphans.items.len, c.hollow.items.len },
                 );
@@ -1092,7 +1092,7 @@ pub fn VectorEngine(embedding_model: EmbeddingModel) type {
                 found_n += 1;
             }
 
-            std.log.info("Found {d} results searching with raw vector", .{found_n});
+            log.info("Found {d} results searching with raw vector", .{found_n});
             return found_n;
         }
     };
@@ -3009,6 +3009,7 @@ test "empty inputs" {
 }
 
 const std = @import("std");
+const log = @import("log.zig");
 const builtin = @import("builtin");
 const testing_allocator = std.testing.allocator;
 const expectEqual = std.testing.expectEqual;

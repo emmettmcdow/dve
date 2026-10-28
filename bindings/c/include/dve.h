@@ -10,6 +10,34 @@ typedef enum {
     DVE_ERR_NOT_FOUND  = -4,
 } DVEError;
 
+typedef enum {
+    DVE_LOG_ERROR = 0,
+    DVE_LOG_WARN  = 1,
+    DVE_LOG_INFO  = 2,
+    DVE_LOG_DEBUG = 3,
+} DVELogLevel;
+
+/**
+ * Receives one log line, without a trailing newline. msg is only valid for the duration of
+ * the call. Called on whichever thread logged, including dve's background thread, sometimes
+ * while dve holds its locks: it must be thread-safe and must not call any dve_ function.
+ */
+typedef void (*dve_log_fn)(int level, const char *msg, void *userdata);
+
+/**
+ * Send dve's log lines to fn instead of stderr, dropping those less severe than min_level
+ * (a DVELogLevel). Without a callback, dve writes warnings and errors to stderr. DEBUG lines
+ * may contain search queries and note text.
+ *
+ * fn        - the callback, or NULL to go back to stderr.
+ * userdata  - passed to every call of fn.
+ * min_level - the least severe level delivered.
+ *
+ * Must be called before dve_init or after dve_deinit. Returns DVE_SUCCESS, or
+ * DVE_ERR_DOUBLE_INIT, changing nothing, if dve is initialized.
+ */
+int dve_set_log_callback(dve_log_fn fn, void *userdata, int min_level);
+
 /**
  * One search hit. `id` names the note; read its path with dve_path_of_result.
  */
