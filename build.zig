@@ -100,28 +100,37 @@ pub fn build(b: *std.Build) !void {
     ////////////////////
     // Public Module  //
     ////////////////////
+    const dve_imports: []const std.Build.Module.Import = &.{
+        .{ .name = "config", .module = real_options.createModule() },
+        .{ .name = "objc", .module = objc_dep.module("objc") },
+        .{ .name = "zon", .module = zon_mod },
+    };
     const dve_mod = b.addModule("dve", .{
         .root_source_file = b.path("src/root.zig"),
-        .imports = &.{
-            .{ .name = "config", .module = real_options.createModule() },
-            .{ .name = "objc", .module = objc_dep.module("objc") },
-            .{ .name = "zon", .module = zon_mod },
-        },
+        .imports = dve_imports,
     });
-    // Carried on the module itself so consumers don't link these by hand: a
-    // Compile step inherits frameworks from every module in its import graph.
-    dve_mod.linkFramework("NaturalLanguage", .{});
-    dve_mod.linkFramework("CoreML", .{});
-    dve_mod.linkFramework("Foundation", .{});
-    // Same idea for the llama bridge: carried on the module, so a consumer that
-    // builds with -Dllama gets the bridge and the libllama link for free.
+    // What the in-repo harnesses import as `dve`: the public API plus the internals they
+    // measure. Created rather than added, so it is never exported to consumers.
+    const dve_dev_mod = b.createModule(.{
+        .root_source_file = b.path("src/dev.zig"),
+        .imports = dve_imports,
+    });
+    // Same idea for the llama bridge as for the frameworks below: carried on the module, so
+    // a consumer that builds with -Dllama gets the bridge and the libllama link for free.
     const llama_bridge: ?LlamaBridge = if (llama)
         llamaBridgeLib(b, target, optimize, llama_root)
     else
         null;
-    if (llama_bridge) |bridge| bridge.link(dve_mod);
-    // vstore.zig does its file IO through pfile.zig, a thin shim onto libc.
-    dve_mod.link_libc = true;
+    for ([_]*std.Build.Module{ dve_mod, dve_dev_mod }) |m| {
+        // Carried on the module itself so consumers don't link these by hand: a
+        // Compile step inherits frameworks from every module in its import graph.
+        m.linkFramework("NaturalLanguage", .{});
+        m.linkFramework("CoreML", .{});
+        m.linkFramework("Foundation", .{});
+        if (llama_bridge) |bridge| bridge.link(m);
+        // vstore.zig does its file IO through pfile.zig, a thin shim onto libc.
+        m.link_libc = true;
+    }
     ////////////////
     // Unit Tests //
     ////////////////
@@ -358,7 +367,7 @@ pub fn build(b: *std.Build) !void {
             }),
             .filters = if (test_filter != null) filters else &.{},
         });
-        t.root_module.addImport("dve", dve_mod);
+        t.root_module.addImport("dve", dve_dev_mod);
         addDeps(t, real_options, objc_dep, zon_mod);
         const run = runTest(b, t, use_lldb);
         for (model_installs) |s| run.step.dependOn(s);
@@ -384,7 +393,7 @@ pub fn build(b: *std.Build) !void {
                 .optimize = optimize,
             }),
         });
-        exe.root_module.addImport("dve", dve_mod);
+        exe.root_module.addImport("dve", dve_dev_mod);
         addDeps(exe, real_options, objc_dep, zon_mod);
 
         // Installed by this step only, so a plain `zig build` doesn't build the
@@ -411,7 +420,7 @@ pub fn build(b: *std.Build) !void {
                 .optimize = optimize,
             }),
         });
-        exe.root_module.addImport("dve", dve_mod);
+        exe.root_module.addImport("dve", dve_dev_mod);
         addDeps(exe, real_options, objc_dep, zon_mod);
         storebench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
@@ -433,7 +442,7 @@ pub fn build(b: *std.Build) !void {
                 .optimize = optimize,
             }),
         });
-        exe.root_module.addImport("dve", dve_mod);
+        exe.root_module.addImport("dve", dve_dev_mod);
         addDeps(exe, real_options, objc_dep, zon_mod);
         binrecall_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
@@ -475,7 +484,7 @@ pub fn build(b: *std.Build) !void {
                 .optimize = optimize,
             }),
         });
-        exe.root_module.addImport("dve", dve_mod);
+        exe.root_module.addImport("dve", dve_dev_mod);
         addDeps(exe, real_options, objc_dep, zon_mod);
         codesbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
@@ -497,7 +506,7 @@ pub fn build(b: *std.Build) !void {
                 .optimize = optimize,
             }),
         });
-        exe.root_module.addImport("dve", dve_mod);
+        exe.root_module.addImport("dve", dve_dev_mod);
         addDeps(exe, real_options, objc_dep, zon_mod);
         // The CoreML backend resolves its model bundle relative to the executable.
         for (model_installs) |s| embedbench_step.dependOn(s);
@@ -522,7 +531,7 @@ pub fn build(b: *std.Build) !void {
                 .optimize = optimize,
             }),
         });
-        exe.root_module.addImport("dve", dve_mod);
+        exe.root_module.addImport("dve", dve_dev_mod);
         addDeps(exe, real_options, objc_dep, zon_mod);
         for (model_installs) |s| beirbench_step.dependOn(s);
         beirbench_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
